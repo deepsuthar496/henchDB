@@ -221,11 +221,101 @@ impl Database {
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<Output> {
         let _guard = self.epoch.pin();
         let trimmed = sql.trim();
+        if trimmed.eq_ignore_ascii_case("begin") || trimmed.eq_ignore_ascii_case("begin;") {
+            return self.execute_stmt(session, Statement::Begin);
+        }
+        if trimmed.eq_ignore_ascii_case("commit") || trimmed.eq_ignore_ascii_case("commit;") {
+            return self.execute_stmt(session, Statement::Commit);
+        }
+        if trimmed.eq_ignore_ascii_case("rollback") || trimmed.eq_ignore_ascii_case("rollback;") {
+            return self.execute_stmt(session, Statement::Rollback);
+        }
+        if let Some(out) = self.try_fast_point_select(session, trimmed)? {
+            return Ok(out);
+        }
         if let Some(out) = self.try_fast_point_update(session, trimmed)? {
             return Ok(out);
         }
         let stmt = parse_sql(trimmed)?;
         self.execute_stmt(session, stmt)
+    }
+
+    fn try_fast_point_select(&self, session: &Session, sql: &str) -> Result<Option<Output>> {
+        if session.txn.is_some() {
+            return Ok(None);
+        }
+        let s = sql.strip_suffix(';').unwrap_or(sql).trim();
+        if s.len() < 15 {
+            return Ok(None);
+        }
+        if !s.get(..7).map_or(false, |p| p.eq_ignore_ascii_case("SELECT ")) {
+            return Ok(None);
+        }
+        let rest = s[7..].trim_start();
+        let from_pos = match rest.to_ascii_lowercase().find(" from ") {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_clause = rest[..from_pos].trim();
+        let rest = rest[from_pos + 6..].trim_start();
+
+        let where_pos = match rest.to_ascii_lowercase().find(" where ") {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let table_name = rest[..where_pos].trim();
+        let where_clause = rest[where_pos + 7..].trim();
+
+        if table_name.contains(|c: char| c.is_whitespace()) || col_clause.contains(',') {
+            return Ok(None);
+        }
+
+        let (pk_col, pk_val_str) = match where_clause.split_once('=') {
+            Some((c, v)) => (c.trim(), v.trim()),
+            None => return Ok(None),
+        };
+        if pk_col.contains(|c: char| c.is_whitespace()) || pk_val_str.contains(|c: char| c.is_whitespace()) {
+            return Ok(None);
+        }
+
+        let pk_val = match parse_simple_literal(pk_val_str) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let table_arc = match self.table(table_name) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let schema = table_arc.schema();
+
+        if schema.columns[schema.pk_idx].name != pk_col {
+            return Ok(None);
+        }
+
+        let col_idx = match schema.index_of(col_clause) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let key = encode_key(&pk_val)?;
+        let raw = match table_arc.tree().get(&key) {
+            Some(r) => r,
+            None => {
+                return Ok(Some(Output {
+                    columns: vec![col_clause.to_string()],
+                    rows: vec![],
+                    message: "OK".into(),
+                }))
+            }
+        };
+        let row = table_arc.decode_stored(&raw)?;
+        let val = row[col_idx].clone();
+        Ok(Some(Output {
+            columns: vec![col_clause.to_string()],
+            rows: vec![vec![val]],
+            message: "OK".into(),
+        }))
     }
 
     fn execute_stmt(&self, session: &mut Session, stmt: Statement) -> Result<Output> {

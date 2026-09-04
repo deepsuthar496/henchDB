@@ -581,6 +581,7 @@ fn print_output(out: &Output) {
 /// MySQL clients wait for the server handshake.
 fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     banner();
+    std::fs::create_dir_all(dir)?;
     // Fail closed when the auth store cannot bootstrap.
     let auth_path = dir.join("auth.bin");
     auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;

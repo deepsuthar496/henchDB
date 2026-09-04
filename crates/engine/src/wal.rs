@@ -249,7 +249,7 @@ impl Wal {
 
 /// How long the syncer collects concurrent appends before issuing one
 /// fsync.
-const GROUP_COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_micros(300);
+const GROUP_COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// One fsync covers every commit appended since the previous iteration.
 fn syncer_loop(shared: Arc<WalShared>) {

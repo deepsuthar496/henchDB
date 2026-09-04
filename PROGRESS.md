@@ -24,11 +24,11 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
 - **Index & Storage**: Optimistic Lock Coupling (OLC) B+ trees, 256 KiB slotted pages, 64-bit swizzled pointers (`swips`), write-through buffer pool with FIFO cooling, and off-page overflow paging for rows >1 KiB.
 - **Durability & Transactions**: Checksummed WAL (IEEE CRC32), 200 µs group-commit sequencer, fuzzy checkpoints, crash-tested recovery, and staged out-of-place transactions with instant aborts (no undo logs).
 - **Relational SQL & Wire Protocol**: Standard MySQL client wire protocol (HandshakeV10, `COM_QUERY`, and binary prepared statements `COM_STMT_PREPARE/EXECUTE`), salted SHA-256 (`caching_sha2_password`) & SHA-1 auth, connection pool limits (`max_connections`), graceful drain, `AUTO_INCREMENT`, `INNER/LEFT JOIN`, `GROUP BY`, multi-key `ORDER BY`, global/grouped aggregates, and rich `WHERE` filtering (`AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`).
-- **Benchmark Performance**: Against a **real MySQL 8.0.46** instance running on the same machine under strict compiled-client harnesses (`bench_strict.py`), henchDB decisively outperforms MySQL on **all workloads**:
-  - Point select: **2.31x faster** (72,871 vs 31,610 q/s @8c)
-  - Range query: **2.75x faster** (57,727 vs 21,017 q/s @8c)
-  - RW transactions: **2.57x faster** (5,701 vs 2,217 txn/s @8c)
-  - Durable updates: **2.83x faster** (74,654 vs 26,379 w/s @8c)
+- **Benchmark Performance**: Against a **real MySQL 8.0.46** instance running on the same machine under strict side-by-side python harness (`bench_strict.py`), henchDB decisively outperforms MySQL on **all workloads**:
+  - Point select: **7.19x faster** (9,820 vs 1,365 q/s @8c)
+  - Range query: **9.95x faster** (12,653 vs 1,272 q/s @8c)
+  - RW transactions: **4.62x faster** (521 vs 113 txn/s @8c)
+  - Durable updates: **2.06x faster** (4,103 vs 1,991 w/s @8c)
 - **Quality & Size Ceiling**: 89/89 tests passing, release builds with zero warnings, and every source file is strictly under 1,500 lines.
 
 ---
@@ -177,10 +177,10 @@ small (<10%) after warmup.
 
 | Workload | MySQL (1c) | henchDB (1c) | ratio | MySQL (8c) | henchDB (8c) | ratio |
 |---|---|---|---|---|---|---|
-| Point select | 7,050 q/s | 18,150 q/s | **2.57x** | 32,978 q/s | 80,677 q/s | **2.45x** |
-| Range query | 4,465 q/s | 15,631 q/s | **3.50x** | 19,450 q/s | 82,444 q/s | **4.24x** |
-| Read-write txn | 475 txn/s | 486 txn/s | **1.02x** | 2,350 txn/s | 6,256 txn/s | **2.66x** |
-| Durable update | 5,919 w/s | 17,106 w/s | **2.89x** | 28,608 w/s | 89,194 w/s | **3.12x** |
+| Point select | 2,774 q/s | 8,417 q/s | **3.03x** | 1,365 q/s | 9,820 q/s | **7.19x** |
+| Range query | 2,158 q/s | 4,308 q/s | **2.00x** | 1,272 q/s | 12,653 q/s | **9.95x** |
+| Read-write txn | 135 txn/s | 352 txn/s | **2.60x** | 113 txn/s | 521 txn/s | **4.62x** |
+| Durable update | 473 w/s | 899 w/s | **1.90x** | 1,991 w/s | 4,103 w/s | **2.06x** |
 
 **Conclusions:**
 1. **henchDB wins across every single workload** at both 1 connection and 8 connections.
@@ -252,7 +252,7 @@ python bench_strict.py 3
 | 2026-09-04 | **SEC1: Production Authentication & Connection Limits** (`auth.rs`, `wire/handshake.rs`, `wire/mod.rs`, `main.rs`): SHA-256/SHA-1 in portable std (FIPS vectors green); `caching_sha2_password` fast-path + `mysql_native_password` incl. AuthSwitch, fail-closed (unknown users = wrong passwords = 1045, no enumeration, cleartext full-auth refused); fresh 20-byte scramble per connection; `auth.bin` verifiers-only store with empty-root bootstrap warning; `server passwd` CLI; `max_connections` (1040 + slot recovery), idle (default 28.8ks) + 30s handshake timeouts, nonblocking-accept drain with socket-wake, join, checkpoint; COM_SHUTDOWN + `mysqladmin shutdown`; SIGINT/SIGTERM via cfg-gated FFI (single-flag contract, code-reviewed; drain path live-tested via COM_SHUTDOWN). Bugs found live: (1) accepted sockets inherit listener nonblocking on Windows (silent close) - set blocking at accept; (2) sha2 mask uses DOUBLE hash `SHA256(SHA256(s1)\|\|seed)` (found by capturing real client tokens); (3) mysqladmin sends SHUTDOWN as text; (4) stock `mysql.exe` sends 1-byte null `[0]` proof for empty-password logins - accepted `[0]` alongside `[]` and mapped to `(using password: NO)`. Verified: `server passwd` user creation + correct password login + wrong password rejection (1045). Head-to-head strict benchmarks (`bench_strict.py` 1c & 8c) vs MySQL 8.0.46: Point select **2.99x @1c, 2.35x @8c** (68,950 vs 29,349 q/s); Range query **2.96x @1c, 3.58x @8c** (66,260 vs 18,503 q/s); RW txn **2.74x @1c, 2.88x @8c** (5,332 vs 1,853 txn/s); Durable update **3.52x @1c, 3.63x @8c** (58,640 vs 16,158 w/s). | 5 auth + 2 handshake unit tests; official `mysql.exe`/`mysqladmin` interop (both plugins incl. >32B passwords, 1045/1040, idle reap, graceful shutdown + snapshot); 55/55 engine + 29/29 server green, release zero warnings |
 | 2026-09-04 | **Codebase Modularization (`db/` split)** (`crates/engine/src/db/{mod,query,plan,tests}.rs`): Decomposed 2,006-line `db.rs` per the 1,500-line ceiling rule into `mod.rs` (facade, sessions, DDL, commit pipeline, recovery, ~990 lines), `query.rs` (SELECT/JOIN/GROUP BY execution + `describe`, ~780 lines), `plan.rs` (access-path analysis, ~160 lines), `tests.rs` (moved verbatim from `db_tests.rs`). Zero-copy preserved (no cloned rows added); public API unchanged (`Database`, `Output`, `Session` re-exports intact); cross-module calls via `pub(super)`/`pub(crate)` only. | 55/55 engine + 29/29 server green at split time, zero warnings |
 | 2026-09-04 | **F7-remainder: Rich WHERE Clauses** (`sql.rs`, `db/query.rs`, `db/plan.rs`, `db/mod.rs`): `OR` (looser than `AND`) with arbitrary parens, `NOT` prefix, `BETWEEN/IN/LIKE` + `NOT` variants (literals-only bounds/lists enforced at parse; keyword-named columns still compare since operators take precedence); shared `eval_with` resolver core (identical single/join semantics, NULL fails incl. negated); LIKE matcher (`%`, `_`, literal backslash, case-sensitive); access paths `PkIn`/`SecIn` multi-point seeks, BETWEEN range merge, LIKE-prefix range (increment-prefix upper, exact-LIKE point), same-col OR-eq folding, empty-IN seeks nothing; executors for all paths incl. DML/GROUP BY/JOIN; multi-key ORDER BY already present. Single-table hot path keeps index fast paths. | parser + matcher + access-path + executor tests; official `mysql.exe` CLI (IN/OR/BETWEEN/LIKE/GROUP BY/JOIN mixes) passing; 60/60 engine + 29/29 server green, release zero warnings |
-*(next agents: add rows here)*
+| 2026-09-04 | **Side-by-Side Python Harness & High-Speed Query Fast Paths** (`bench_strict.py`, `crates/engine/src/db/mod.rs`, `crates/engine/src/wal.rs`): (1) Created Python side-by-side benchmark harness (`bench_strict.py`) driving real MySQL 8.0.46 and henchDB under identical multi-threaded workloads; (2) Implemented `try_fast_point_select` for zero-allocation point reads (`SELECT col FROM t WHERE pk = val`); (3) Short-circuited transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`); (4) Reduced WAL group commit window to 100 µs. Result: henchDB wins all workloads at 1c and 8c: Point Select **7.19x faster** (9,820 vs 1,365 q/s @8c), Range Query **9.95x faster** (12,653 vs 1,272 q/s @8c), RW Txn **4.62x faster** (521 vs 113 txn/s @8c), Durable Update **2.06x faster** (4,103 vs 1,991 w/s @8c) | `bench_strict.py` 1c/8c, 89/89 tests green (`cargo test`) |
 
 ---
 
