@@ -55,13 +55,26 @@ impl Output {
     }
 }
 
-/// A client session: at most one active transaction.
-#[derive(Default)]
+/// A client session: at most one active transaction and active database context.
+use std::time::Duration;
+
 pub struct Session {
-    txn: Option<ActiveTxn>,
+    pub(crate) txn: Option<ActiveTxn>,
+    pub current_db: String,
+    pub max_execution_time: Option<Duration>,
 }
 
-struct ActiveTxn {
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            txn: None,
+            current_db: "default".to_string(),
+            max_execution_time: None,
+        }
+    }
+}
+
+pub(crate) struct ActiveTxn {
     id: u64,
     /// Staged write set: (table, encoded pk) -> write. `row: None` = delete.
     staged: HashMap<(String, Vec<u8>), StagedWrite>,
@@ -74,6 +87,7 @@ struct StagedWrite {
 }
 
 pub struct Database {
+    databases: RwLock<HashSet<String>>,
     tables: RwLock<HashMap<String, Arc<Table>>>,
     wal: Wal,
     dir: PathBuf,
@@ -109,6 +123,8 @@ impl Database {
         let epoch = crate::epoch::EpochManager::new();
         let pool = Arc::new(BufferPool::open(&dir.join("pages.bin"), DEFAULT_POOL_FRAMES, epoch.clone())?);
         let wal = Wal::open(&dir.join("wal.log"))?;
+        let mut databases: HashSet<String> = HashSet::new();
+        databases.insert("default".to_string());
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
 
         let snap = dir.join("snapshot.bin");
@@ -135,7 +151,7 @@ impl Database {
             match rec {
                 Record::Commit { txn } => {
                     if let Some(batch) = pending.remove(&txn) {
-                        apply_records(&mut tables, &pool, batch)?;
+                        apply_records(&mut databases, &mut tables, &pool, batch)?;
                     }
                 }
                 other => {
@@ -153,6 +169,7 @@ impl Database {
 
         let install_frontier = wal.next_offset();
         Ok(Database {
+            databases: RwLock::new(databases),
             tables: RwLock::new(tables),
             wal,
             dir: dir.to_path_buf(),
@@ -283,7 +300,7 @@ impl Database {
             None => return Ok(None),
         };
 
-        let table_arc = match self.table(table_name) {
+        let table_arc = match self.table(session, table_name) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
@@ -354,8 +371,45 @@ impl Database {
                 self.checkpoint()?;
                 Ok(Output::ok("checkpoint complete"))
             }
-            Statement::CreateTable { name, columns } => self.exec_create_table(name, columns),
-            Statement::DropTable { name } => self.exec_drop_table(&name),
+            Statement::SetVariable { name, value } => {
+                if name.eq_ignore_ascii_case("max_execution_time") {
+                    match value {
+                        Datum::Int(ms) if ms > 0 => {
+                            session.max_execution_time = Some(Duration::from_millis(ms as u64));
+                        }
+                        Datum::Int(_) => {
+                            session.max_execution_time = None;
+                        }
+                        _ => {
+                            return Err(Error::ParseError(
+                                "max_execution_time must be an integer (milliseconds)".into(),
+                            ))
+                        }
+                    }
+                }
+                Ok(Output::ok("variable set"))
+            }
+            Statement::CreateDatabase { name, if_not_exists } => {
+                self.exec_create_database(&name, if_not_exists)
+            }
+            Statement::DropDatabase { name, if_exists } => {
+                self.exec_drop_database(&name, if_exists)
+            }
+            Statement::UseDatabase { name } => {
+                self.exec_use_database(session, &name)
+            }
+            Statement::ShowDatabases => {
+                let dbs = self.databases.read().unwrap();
+                let mut names: Vec<String> = dbs.iter().cloned().collect();
+                names.sort();
+                Ok(Output {
+                    columns: vec!["Database".into()],
+                    rows: names.into_iter().map(|n| vec![Datum::Text(n)]).collect(),
+                    message: "OK".into(),
+                })
+            }
+            Statement::CreateTable { name, columns } => self.exec_create_table(session, name, columns),
+            Statement::DropTable { name } => self.exec_drop_table(session, &name),
             Statement::Insert { table, rows } => self.exec_insert(session, &table, rows),
             Statement::Select {
                 items,
@@ -375,26 +429,105 @@ impl Database {
                 self.exec_delete(session, &table, selection)
             }
             Statement::CreateIndex { name, table, column } => {
-                self.exec_create_index(name, table, column)
+                self.exec_create_index(session, name, table, column)
             }
             Statement::DropIndex { name, table } => {
-                self.exec_drop_index(name, table)
+                self.exec_drop_index(session, name, table)
             }
         }
     }
 
-    fn table(&self, name: &str) -> Result<Arc<Table>> {
+    fn resolve_table_key(&self, session: &Session, table_name: &str) -> String {
+        if table_name.contains('.') {
+            table_name.to_string()
+        } else {
+            let qual = format!("{}.{table_name}", session.current_db);
+            let guard = self.tables.read().unwrap();
+            if guard.contains_key(&qual) {
+                qual
+            } else if guard.contains_key(table_name) {
+                table_name.to_string()
+            } else {
+                qual
+            }
+        }
+    }
+
+    fn table(&self, session: &Session, name: &str) -> Result<Arc<Table>> {
+        let key = self.resolve_table_key(session, name);
         self.tables
             .read()
             .unwrap()
-            .get(name)
+            .get(&key)
             .cloned()
             .ok_or_else(|| Error::TableNotFound(name.to_string()))
     }
 
+    // -- Database DDL ---------------------------------------------------
+
+    fn exec_create_database(&self, name: &str, if_not_exists: bool) -> Result<Output> {
+        let mut dbs = self.databases.write().unwrap();
+        if dbs.contains(name) {
+            if if_not_exists {
+                return Ok(Output::ok(format!("database '{name}' exists")));
+            }
+            return Err(Error::DatabaseExists(name.to_string()));
+        }
+        dbs.insert(name.to_string());
+        drop(dbs);
+
+        let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
+        self.wal_commit(vec![
+            Record::CreateDatabase {
+                txn,
+                name: name.to_string(),
+            },
+            Record::Commit { txn },
+        ])?;
+        Ok(Output::ok(format!("database '{name}' created")))
+    }
+
+    fn exec_drop_database(&self, name: &str, if_exists: bool) -> Result<Output> {
+        let mut dbs = self.databases.write().unwrap();
+        if !dbs.contains(name) {
+            if if_exists {
+                return Ok(Output::ok(format!("database '{name}' does not exist")));
+            }
+            return Err(Error::DatabaseNotFound(name.to_string()));
+        }
+        dbs.remove(name);
+        drop(dbs);
+
+        let prefix = format!("{name}.");
+        {
+            let mut tables = self.tables.write().unwrap();
+            tables.retain(|k, _| !k.starts_with(&prefix));
+        }
+
+        let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
+        self.wal_commit(vec![
+            Record::DropDatabase {
+                txn,
+                name: name.to_string(),
+            },
+            Record::Commit { txn },
+        ])?;
+        Ok(Output::ok(format!("database '{name}' dropped")))
+    }
+
+    fn exec_use_database(&self, session: &mut Session, name: &str) -> Result<Output> {
+        let dbs = self.databases.read().unwrap();
+        if !dbs.contains(name) {
+            return Err(Error::DatabaseNotFound(name.to_string()));
+        }
+        session.current_db = name.to_string();
+        Ok(Output::ok("Database changed"))
+    }
+
     // -- DDL (autocommit) ------------------------------------------------
 
-    fn exec_create_table(&self, name: String, columns: Vec<crate::sql::ColumnSpec>) -> Result<Output> {
+    fn exec_create_table(&self, session: &Session, name: String, columns: Vec<crate::sql::ColumnSpec>) -> Result<Output> {
+        let key = if name.contains('.') { name.clone() } else { format!("{}.{name}", session.current_db) };
         let mut pk_count = 0usize;
         let mut pk_idx = None;
         let mut auto_inc_count = 0usize;
@@ -420,6 +553,7 @@ impl Database {
                 ctype,
                 nullable: !c.not_null,
                 auto_increment: c.auto_increment,
+                default_value: c.default_value,
             });
         }
         if pk_count > 1 {
@@ -437,7 +571,7 @@ impl Database {
             ));
         }
         let def = TableDef {
-            name: name.clone(),
+            name: key.clone(),
             schema: Schema {
                 columns: defs,
                 pk_idx,
@@ -447,15 +581,13 @@ impl Database {
         let table = Arc::new(Table::new(def.clone()));
         {
             let mut guard = self.tables.write().unwrap();
-            if guard.contains_key(&name) {
+            if guard.contains_key(&key) {
                 return Err(Error::TableExists(name));
             }
             table.set_pool(self.pool.clone());
-            guard.insert(name.clone(), table);
+            guard.insert(key, table);
         }
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
-        // DDL is a single-record transaction: the Commit marker is what
-        // recovery keys on, so it must be part of the durable batch.
         self.wal_commit(vec![
             Record::CreateTable { txn, def },
             Record::Commit { txn },
@@ -463,16 +595,17 @@ impl Database {
         Ok(Output::ok(format!("table '{name}' created")))
     }
 
-    fn exec_drop_table(&self, name: &str) -> Result<Output> {
+    fn exec_drop_table(&self, session: &Session, name: &str) -> Result<Output> {
+        let key = self.resolve_table_key(session, name);
         {
             let mut guard = self.tables.write().unwrap();
-            guard.remove(name).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+            guard.remove(&key).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
         }
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
             Record::DropTable {
                 txn,
-                name: name.to_string(),
+                name: key,
             },
             Record::Commit { txn },
         ])?;
@@ -481,17 +614,19 @@ impl Database {
 
     fn exec_create_index(
         &self,
+        session: &Session,
         name: String,
         table_name: String,
         column: String,
     ) -> Result<Output> {
-        let table = self.table(&table_name)?;
+        let table = self.table(session, &table_name)?;
+        let key = self.resolve_table_key(session, &table_name);
         table.add_index(name.clone(), column.clone())?;
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
             Record::CreateIndex {
                 txn,
-                table: table_name.clone(),
+                table: key,
                 name: name.clone(),
                 column,
             },
@@ -500,14 +635,15 @@ impl Database {
         Ok(Output::ok(format!("index '{name}' created on '{table_name}'")))
     }
 
-    fn exec_drop_index(&self, name: String, table_name: String) -> Result<Output> {
-        let table = self.table(&table_name)?;
+    fn exec_drop_index(&self, session: &Session, name: String, table_name: String) -> Result<Output> {
+        let table = self.table(session, &table_name)?;
+        let key = self.resolve_table_key(session, &table_name);
         table.drop_index(&name)?;
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
             Record::DropIndex {
                 txn,
-                table: table_name.clone(),
+                table: key,
                 name: name.clone(),
             },
             Record::Commit { txn },
@@ -523,7 +659,8 @@ impl Database {
         table: &str,
         rows: Vec<Vec<Expr>>,
     ) -> Result<Output> {
-        let table_arc = self.table(table)?;
+        let table_arc = self.table(session, table)?;
+        let table_key = self.resolve_table_key(session, table);
         let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
         for row_exprs in rows {
             let mut row = Vec::with_capacity(row_exprs.len());
@@ -549,7 +686,7 @@ impl Database {
                 return Err(Error::DuplicateKey(pk.to_string()));
             }
             staged.insert(
-                (table.to_string(), key),
+                (table_key.clone(), key),
                 StagedWrite {
                     row: Some(row),
                     is_insert: true,
@@ -622,10 +759,11 @@ impl Database {
             None => return Ok(None),
         };
 
-        let table_arc = match self.table(table) {
+        let table_arc = match self.table(session, table) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
+        let key_name = self.resolve_table_key(session, table);
         let schema = table_arc.schema();
 
         if schema.columns[schema.pk_idx].name != pk_col {
@@ -649,7 +787,7 @@ impl Database {
         row[col_idx] = val;
         let row = table_arc.validate_row(row)?;
         let enc = Table::encode_row(&row);
-        self.commit_single_update(table, &table_arc, key, enc)?;
+        self.commit_single_update(&key_name, &table_arc, key, enc)?;
         Ok(Some(Output::ok("1 row(s) updated")))
     }
 
@@ -703,7 +841,8 @@ impl Database {
         assignments: Vec<(String, Expr)>,
         selection: Option<Expr>,
     ) -> Result<Output> {
-        let table_arc = self.table(table)?;
+        let table_arc = self.table(session, table)?;
+        let table_key = self.resolve_table_key(session, table);
         let schema = table_arc.schema();
         let mut set_idx = Vec::with_capacity(assignments.len());
         for (col, expr) in &assignments {
@@ -739,7 +878,7 @@ impl Database {
                     }
                     let row = table_arc.validate_row(row)?;
                     let enc = Table::encode_row(&row);
-                    self.commit_single_update(table, &table_arc, key, enc)?;
+                    self.commit_single_update(&table_key, &table_arc, key, enc)?;
                     return Ok(Output::ok("1 row(s) updated"));
                 } else {
                     return Ok(Output::ok("0 row(s) updated"));
@@ -766,7 +905,7 @@ impl Database {
             let new_row = table_arc.validate_row(new_row)?;
             let key = encode_key(&new_row[schema.pk_idx])?;
             staged.insert(
-                (table.to_string(), key),
+                (table_key.clone(), key),
                 StagedWrite {
                     row: Some(new_row),
                     is_insert: false,
@@ -784,13 +923,14 @@ impl Database {
         table: &str,
         selection: Option<Expr>,
     ) -> Result<Output> {
-        let table_arc = self.table(table)?;
+        let table_arc = self.table(session, table)?;
+        let table_key = self.resolve_table_key(session, table);
         let rows = self.visible_rows(session, &table_arc, selection.as_ref())?;
         let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
         for row in rows {
             let key = encode_key(&row[table_arc.schema().pk_idx])?;
             staged.insert(
-                (table.to_string(), key),
+                (table_key.clone(), key),
                 StagedWrite {
                     row: None,
                     is_insert: false,
@@ -867,7 +1007,8 @@ impl Database {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         for (t, _k) in staged.keys() {
             if !tables.contains_key(t) {
-                tables.insert(t.clone(), self.table(t)?);
+                let table_arc = self.tables.read().unwrap().get(t).cloned().ok_or_else(|| Error::TableNotFound(t.clone()))?;
+                tables.insert(t.clone(), table_arc);
             }
         }
 
@@ -1129,20 +1270,36 @@ fn parse_simple_literal(s: &str) -> Option<Datum> {
     None
 }
 
-fn txn_of(rec: &Record) -> u64 {    match rec {
+fn txn_of(rec: &Record) -> u64 {
+    match rec {
         Record::Put { txn, .. }
         | Record::Delete { txn, .. }
         | Record::CreateTable { txn, .. }
         | Record::DropTable { txn, .. }
         | Record::CreateIndex { txn, .. }
         | Record::DropIndex { txn, .. }
+        | Record::CreateDatabase { txn, .. }
+        | Record::DropDatabase { txn, .. }
         | Record::Commit { txn } => *txn,
     }
 }
 
-fn apply_records(tables: &mut HashMap<String, Arc<Table>>, pool: &Arc<BufferPool>, batch: Vec<Record>) -> Result<()> {
+fn apply_records(
+    databases: &mut HashSet<String>,
+    tables: &mut HashMap<String, Arc<Table>>,
+    pool: &Arc<BufferPool>,
+    batch: Vec<Record>,
+) -> Result<()> {
     for rec in batch {
         match rec {
+            Record::CreateDatabase { name, .. } => {
+                databases.insert(name);
+            }
+            Record::DropDatabase { name, .. } => {
+                databases.remove(&name);
+                let prefix = format!("{name}.");
+                tables.retain(|k, _| !k.starts_with(&prefix));
+            }
             Record::CreateTable { def, .. } => {
                 if !tables.contains_key(&def.name) {
                     let t = Arc::new(Table::new(def));

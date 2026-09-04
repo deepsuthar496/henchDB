@@ -160,8 +160,8 @@ mod tests {
             name: "t".into(),
             schema: Schema {
                 columns: vec![
-                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false },
-                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false, default_value: None },
+                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
                 ],
                 pk_idx: 0,
             },
@@ -194,8 +194,8 @@ mod tests {
             name: "t".into(),
             schema: Schema {
                 columns: vec![
-                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false },
-                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false, default_value: None },
+                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
                 ],
                 pk_idx: 0,
             },

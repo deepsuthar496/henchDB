@@ -327,7 +327,7 @@ pub fn handle_mysql_connection(
                     continue;
                 }
                 let neutral = neutralize_placeholders(&sql, &offsets);
-                match db.describe(&neutral) {
+                match db.describe(&session, &neutral) {
                     Ok(cols) => {
                         if stmts.len() >= MAX_PREPARED_PER_CONN {
                             write_err_msg(&mut writer, &mut out_seq, 1047, "too many prepared statements")?;

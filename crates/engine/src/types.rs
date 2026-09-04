@@ -15,6 +15,7 @@ pub enum Datum {
     Float(f64),
     Text(String),
     Bool(bool),
+    DateTime(i64),
 }
 
 impl fmt::Display for Datum {
@@ -25,6 +26,7 @@ impl fmt::Display for Datum {
             Datum::Float(v) => write!(f, "{v}"),
             Datum::Text(v) => write!(f, "{v}"),
             Datum::Bool(v) => write!(f, "{v}"),
+            Datum::DateTime(v) => write!(f, "{}", format_datetime_micros(*v)),
         }
     }
 }
@@ -37,18 +39,19 @@ impl Datum {
             Datum::Float(_) => "FLOAT",
             Datum::Text(_) => "TEXT",
             Datum::Bool(_) => "BOOL",
+            Datum::DateTime(_) => "DATETIME",
         }
     }
 
     /// Total order across all datum kinds. Type rank: Null < Bool < numeric
-    /// (Int/Float compared numerically) < Text. Floats use a NaN-safe total
-    /// order. Used by ORDER BY and predicate evaluation.
+    /// (Int/Float compared numerically) < DateTime < Text.
     fn type_rank(&self) -> u8 {
         match self {
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Int(_) | Datum::Float(_) => 2,
-            Datum::Text(_) => 3,
+            Datum::DateTime(_) => 3,
+            Datum::Text(_) => 4,
         }
     }
 
@@ -74,6 +77,7 @@ impl Ord for Datum {
             (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
             (Datum::Int(a), Datum::Int(b)) => a.cmp(b),
             (Datum::Float(a), Datum::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Datum::DateTime(a), Datum::DateTime(b)) => a.cmp(b),
             (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
             _ => match (self.as_f64(), other.as_f64()) {
                 (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
@@ -111,6 +115,10 @@ impl Datum {
                 out.push(4);
                 out.push(*v as u8);
             }
+            Datum::DateTime(v) => {
+                out.push(5);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
         }
     }
 
@@ -143,6 +151,10 @@ impl Datum {
                 let b = take(buf, off, 1)?;
                 Datum::Bool(b[0] != 0)
             }
+            5 => {
+                let b = take(buf, off, 8)?;
+                Datum::DateTime(i64::from_le_bytes(b.try_into().unwrap()))
+            }
             t => return Err(Error::Corrupted(format!("unknown datum tag {t}"))),
         })
     }
@@ -167,6 +179,8 @@ pub enum ColumnType {
     Text,
     VarChar,
     Bool,
+    DateTime,
+    Timestamp,
 }
 
 impl ColumnType {
@@ -179,6 +193,8 @@ impl ColumnType {
             "TEXT" | "STRING" => ColumnType::Text,
             "VARCHAR" => ColumnType::VarChar,
             "BOOL" | "BOOLEAN" => ColumnType::Bool,
+            "DATETIME" => ColumnType::DateTime,
+            "TIMESTAMP" => ColumnType::Timestamp,
             other => return Err(Error::ParseError(format!("unknown type '{other}'"))),
         })
     }
@@ -192,6 +208,8 @@ impl ColumnType {
             ColumnType::Text => "TEXT",
             ColumnType::VarChar => "VARCHAR",
             ColumnType::Bool => "BOOL",
+            ColumnType::DateTime => "DATETIME",
+            ColumnType::Timestamp => "TIMESTAMP",
         }
     }
 
@@ -203,6 +221,9 @@ impl ColumnType {
             }
             ColumnType::Text | ColumnType::VarChar => matches!(d, Datum::Text(_) | Datum::Null),
             ColumnType::Bool => matches!(d, Datum::Bool(_) | Datum::Null),
+            ColumnType::DateTime | ColumnType::Timestamp => {
+                matches!(d, Datum::DateTime(_) | Datum::Text(_) | Datum::Int(_) | Datum::Null)
+            }
         }
     }
 }
@@ -232,6 +253,10 @@ pub fn encode_key(d: &Datum) -> Result<Vec<u8>> {
         Datum::Bool(v) => {
             out.push(4);
             out.push(*v as u8);
+        }
+        Datum::DateTime(v) => {
+            out.push(5);
+            out.extend_from_slice(&(*v ^ i64::MIN).to_be_bytes());
         }
         Datum::Null => return Err(Error::NotNullViolation("primary key".into())),
     }
@@ -263,6 +288,10 @@ pub fn decode_key(key: &[u8]) -> Result<Datum> {
             String::from_utf8(key[1..].to_vec()).map_err(|_| Error::Corrupted("utf8 key".into()))?,
         )),
         4 => Ok(Datum::Bool(key[1] != 0)),
+        5 => {
+            let b: [u8; 8] = key[1..9].try_into().unwrap();
+            Ok(Datum::DateTime(i64::from_be_bytes(b) ^ i64::MIN))
+        }
         t => Err(Error::Corrupted(format!("unknown key tag {t}"))),
     }
 }
@@ -300,6 +329,10 @@ pub fn encode_sec_key_prefix(d: &Datum) -> Result<Vec<u8>> {
         Datum::Bool(v) => {
             out.push(4);
             out.push(*v as u8);
+        }
+        Datum::DateTime(v) => {
+            out.push(5);
+            out.extend_from_slice(&(*v ^ i64::MIN).to_be_bytes());
         }
     }
     Ok(out)
@@ -377,12 +410,112 @@ pub fn decode_sec_index_key(key: &[u8]) -> Result<(Datum, Datum)> {
             }
             (Datum::Bool(key[1] != 0), 2)
         }
+        5 => {
+            if key.len() < 9 {
+                return Err(Error::Corrupted("truncated datetime secondary key".into()));
+            }
+            let b: [u8; 8] = key[1..9].try_into().unwrap();
+            (Datum::DateTime(i64::from_be_bytes(b) ^ i64::MIN), 9)
+        }
         t => return Err(Error::Corrupted(format!("unknown secondary key tag {t}"))),
     };
     let pk = decode_key(&key[off..])?;
     Ok((sec, pk))
 }
 
+pub fn parse_datetime_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return None;
+    }
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let year: i32 = date_parts[0].parse().ok()?;
+    let month: u32 = date_parts[1].parse().ok()?;
+    let day: u32 = date_parts[2].parse().ok()?;
+
+    let (hour, min, sec, micros) = if parts.len() == 2 {
+        let time_parts: Vec<&str> = parts[1].split(':').collect();
+        if time_parts.len() != 3 {
+            return None;
+        }
+        let h: u32 = time_parts[0].parse().ok()?;
+        let m: u32 = time_parts[1].parse().ok()?;
+        let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
+        let s: u32 = sec_parts[0].parse().ok()?;
+        let ms: u32 = if sec_parts.len() == 2 {
+            let p = sec_parts[1];
+            let mut val: u32 = p.parse().ok()?;
+            let mut len = p.len();
+            while len < 6 {
+                val *= 10;
+                len += 1;
+            }
+            while len > 6 {
+                val /= 10;
+                len -= 1;
+            }
+            val
+        } else {
+            0
+        };
+        (h, m, s, ms)
+    } else {
+        (0, 0, 0, 0)
+    };
+
+    if month == 0 || month > 12 || day == 0 || day > 31 || hour >= 24 || min >= 60 || sec >= 60 {
+        return None;
+    }
+
+    let days = ymd_to_days(year, month, day);
+    let secs = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64);
+    Some(secs * 1_000_000 + (micros as i64))
+}
+
+fn ymd_to_days(y: i32, m: u32, d: u32) -> i64 {
+    let y = y as i64 - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let m = m + if m > 2 { 0 } else { 12 };
+    let doy = (153 * (m - 3) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+pub fn format_datetime_micros(micros: i64) -> String {
+    let secs = micros.div_euclid(1_000_000);
+    let micro_part = micros.rem_euclid(1_000_000);
+    let days = secs.div_euclid(86400);
+    let tod = secs.rem_euclid(86400);
+    let hour = tod / 3600;
+    let min = (tod % 3600) / 60;
+    let sec = tod % 60;
+
+    let (y, m, d) = days_to_ymd(days);
+    if micro_part > 0 {
+        format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}.{micro_part:06}")
+    } else {
+        format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
+    }
+}
+
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y as i32, m as u32, d as u32)
+}
 
 #[cfg(test)]
 mod tests {

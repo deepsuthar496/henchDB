@@ -35,6 +35,7 @@ pub fn result_column_types(out: &Output) -> Vec<u8> {
                         break;
                     }
                     Datum::Int(_) | Datum::Bool(_) => has_int = true,
+                    Datum::DateTime(_) => return TYPE_DATETIME,
                     Datum::Text(_) => return TYPE_VAR_STRING,
                 }
             }
@@ -55,6 +56,8 @@ pub fn schema_col_type(t: ColumnType) -> u8 {
         ColumnType::Float | ColumnType::Double => TYPE_DOUBLE,
         ColumnType::Text | ColumnType::VarChar => TYPE_VAR_STRING,
         ColumnType::Bool => TYPE_TINY,
+        ColumnType::DateTime => TYPE_DATETIME,
+        ColumnType::Timestamp => TYPE_TIMESTAMP,
     }
 }
 
@@ -311,6 +314,7 @@ pub fn datum_literal(d: &Datum) -> String {
             }
         }
         Datum::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Datum::DateTime(v) => format!("'{}'", engine::types::format_datetime_micros(*v)),
     }
 }
 

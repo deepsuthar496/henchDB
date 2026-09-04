@@ -25,11 +25,11 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
 - **Durability & Transactions**: Checksummed WAL (IEEE CRC32), 200 µs group-commit sequencer, fuzzy checkpoints, crash-tested recovery, and staged out-of-place transactions with instant aborts (no undo logs).
 - **Relational SQL & Wire Protocol**: Standard MySQL client wire protocol (HandshakeV10, `COM_QUERY`, and binary prepared statements `COM_STMT_PREPARE/EXECUTE`), salted SHA-256 (`caching_sha2_password`) & SHA-1 auth, connection pool limits (`max_connections`), graceful drain, `AUTO_INCREMENT`, `INNER/LEFT JOIN`, `GROUP BY`, multi-key `ORDER BY`, global/grouped aggregates, and rich `WHERE` filtering (`AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`).
 - **Benchmark Performance**: Against a **real MySQL 8.0.46** instance running on the same machine under strict side-by-side python harness (`bench_strict.py`), henchDB decisively outperforms MySQL on **all workloads**:
-  - Point select: **7.19x faster** (9,820 vs 1,365 q/s @8c)
-  - Range query: **9.95x faster** (12,653 vs 1,272 q/s @8c)
-  - RW transactions: **4.62x faster** (521 vs 113 txn/s @8c)
-  - Durable updates: **2.06x faster** (4,103 vs 1,991 w/s @8c)
-- **Quality & Size Ceiling**: 89/89 tests passing, release builds with zero warnings, and every source file is strictly under 1,500 lines.
+  - Point select: **7.17x faster** (10,184 vs 1,420 q/s @8c)
+  - Range query: **8.95x faster** (13,455 vs 1,503 q/s @8c)
+  - RW transactions: **6.77x faster** (863 vs 127 txn/s @8c)
+  - Durable updates: **2.16x faster** (3,673 vs 1,698 w/s @8c)
+- **Quality & Size Ceiling**: 93/93 tests passing, release builds with zero warnings, and every source file is strictly under 1,500 lines.
 
 ---
 
@@ -177,10 +177,10 @@ small (<10%) after warmup.
 
 | Workload | MySQL (1c) | henchDB (1c) | ratio | MySQL (8c) | henchDB (8c) | ratio |
 |---|---|---|---|---|---|---|
-| Point select | 2,774 q/s | 8,417 q/s | **3.03x** | 1,365 q/s | 9,820 q/s | **7.19x** |
-| Range query | 2,158 q/s | 4,308 q/s | **2.00x** | 1,272 q/s | 12,653 q/s | **9.95x** |
-| Read-write txn | 135 txn/s | 352 txn/s | **2.60x** | 113 txn/s | 521 txn/s | **4.62x** |
-| Durable update | 473 w/s | 899 w/s | **1.90x** | 1,991 w/s | 4,103 w/s | **2.06x** |
+| Point select | 2,503 q/s | 11,885 q/s | **4.75x** | 1,420 q/s | 10,184 q/s | **7.17x** |
+| Range query | 2,014 q/s | 4,683 q/s | **2.32x** | 1,503 q/s | 13,455 q/s | **8.95x** |
+| Read-write txn | 130 txn/s | 395 txn/s | **3.05x** | 127 txn/s | 863 txn/s | **6.77x** |
+| Durable update | 426 w/s | 900 w/s | **2.11x** | 1,698 w/s | 3,673 w/s | **2.16x** |
 
 **Conclusions:**
 1. **henchDB wins across every single workload** at both 1 connection and 8 connections.

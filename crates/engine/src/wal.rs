@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::table::TableDef;
-use crate::types::ColumnType;
+use crate::types::{ColumnType, Datum};
 use std::io::Seek;
 
 pub const WAL_MAGIC: &[u8; 4] = b"HDBW";
@@ -36,6 +36,8 @@ const KIND_CREATE_TABLE: u8 = 4;
 const KIND_DROP_TABLE: u8 = 5;
 const KIND_CREATE_INDEX: u8 = 6;
 const KIND_DROP_INDEX: u8 = 7;
+const KIND_CREATE_DB: u8 = 8;
+const KIND_DROP_DB: u8 = 9;
 
 /// Every record carries its transaction id so recovery can buffer uncommitted
 /// work and only redo transactions whose Commit marker reached the log.
@@ -72,6 +74,14 @@ pub enum Record {
     DropIndex {
         txn: u64,
         table: String,
+        name: String,
+    },
+    CreateDatabase {
+        txn: u64,
+        name: String,
+    },
+    DropDatabase {
+        txn: u64,
         name: String,
     },
 }
@@ -445,6 +455,16 @@ fn encode_record(rec: &Record, out: &mut Vec<u8>) {
             put_str(out, table);
             put_str(out, name);
         }
+        Record::CreateDatabase { txn, name } => {
+            out.push(KIND_CREATE_DB);
+            out.extend_from_slice(&txn.to_le_bytes());
+            put_str(out, name);
+        }
+        Record::DropDatabase { txn, name } => {
+            out.push(KIND_DROP_DB);
+            out.extend_from_slice(&txn.to_le_bytes());
+            put_str(out, name);
+        }
     }
     let payload_len = (out.len() - payload_start) as u32;
     let crc = crc32(&out[payload_start..]);
@@ -502,6 +522,14 @@ fn decode_record(buf: &[u8], off: &mut usize, legacy_cols: bool) -> Result<Recor
             let name = take_str(buf, off)?;
             Record::DropIndex { txn, table, name }
         }
+        KIND_CREATE_DB => Record::CreateDatabase {
+            txn,
+            name: take_str(buf, off)?,
+        },
+        KIND_DROP_DB => Record::DropDatabase {
+            txn,
+            name: take_str(buf, off)?,
+        },
         t => return Err(Error::Corrupted(format!("unknown record kind {t}"))),
     })
 }
@@ -559,6 +587,13 @@ pub(crate) fn encode_table_def_pub(def: &TableDef, out: &mut Vec<u8>) {
         out.push(col.ctype.name().as_bytes()[0]);
         out.push(col.nullable as u8);
         out.push(col.auto_increment as u8);
+        match &col.default_value {
+            Some(d) => {
+                out.push(1);
+                d.encode(out);
+            }
+            None => out.push(0),
+        }
     }
     out.extend_from_slice(&(def.indexes.len() as u32).to_le_bytes());
     for idx in &def.indexes {
@@ -608,13 +643,28 @@ pub(crate) fn decode_table_def_pub(buf: &[u8], off: &mut usize, legacy_cols: boo
             b'T' => ColumnType::Text,
             b'V' => ColumnType::VarChar,
             b'L' => ColumnType::Bool,
+            b'E' | b'M' => ColumnType::DateTime,
+            b'P' | b'S' => ColumnType::Timestamp,
             b => return Err(Error::Corrupted(format!("unknown col type {b}"))),
+        };
+        let default_value = if legacy_cols {
+            None
+        } else if let Some(&has_def) = buf.get(*off) {
+            *off += 1;
+            if has_def != 0 {
+                Some(Datum::decode(buf, off)?)
+            } else {
+                None
+            }
+        } else {
+            None
         };
         columns.push(crate::table::ColumnDef {
             name: cname,
             ctype,
             nullable,
             auto_increment,
+            default_value,
         });
     }
     let mut indexes = Vec::new();
@@ -681,8 +731,8 @@ mod tests {
             name: "t".into(),
             schema: Schema {
                 columns: vec![
-                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: true },
-                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: true, default_value: None },
+                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
                 ],
                 pk_idx: 0,
             },
@@ -728,6 +778,7 @@ mod tests {
                     ctype: ColumnType::Int,
                     nullable: false,
                     auto_increment: false,
+                    default_value: None,
                 }],
                 pk_idx: 0,
             },
@@ -770,6 +821,7 @@ mod tests {
                     ctype: ColumnType::Int,
                     nullable: false,
                     auto_increment: false,
+                    default_value: None,
                 }],
                 pk_idx: 0,
             },
