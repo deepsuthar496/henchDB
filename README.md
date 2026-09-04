@@ -1,7 +1,7 @@
 # henchDB
 
 <div align="center">
-  <img src="benchmark_chart.png" alt="henchDB vs MySQL 8.0.46 — strict compiled-client benchmark" width="820">
+  <img src="benchmarks.jpg" alt="henchDB vs MySQL 8.0.46 — strict compiled-client benchmark" width="820">
   <p><em>A high-throughput, ACID-compliant relational database engine written <strong>from scratch in Rust</strong> with zero external dependencies.</em></p>
 </div>
 
