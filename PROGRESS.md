@@ -29,7 +29,7 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **145/145 tests passing** (94 engine + 51 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
+- **Quality & Size Ceiling**: **151/151 tests passing** (95 engine + 56 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
 
 ---
 
@@ -269,6 +269,7 @@ python bench_strict.py 3
 | 2026-09-05 | **Ceiling Maintenance: `db/ddl.rs` + `db/tests/` Split** (`db/mod.rs`, `db/ddl.rs`, `db/tests/{mod,joins,fk,txn}.rs`): (1) **DDL extraction**: all 7 DDL methods (`exec_create/drop_database`, `exec_use_database`, `exec_create/drop_table`, `exec_create/drop_index`) moved verbatim into new `db/ddl.rs` (212 lines) as `pub(super)` methods on the same `impl Database` — `db/mod.rs` drops 1,411 → 1,216 lines; only import lines changed in `mod.rs` (dropped now-unused `Schema`/`TableDef`/`ColumnType`); (2) **Test suites**: `db/tests.rs` (1,571) dissolved into `db/tests/` — `mod.rs` (483: helpers + CRUD/schemas/aggregates/access-path) + `joins.rs` (401: nested-loop/hash/ordering) + `fk.rs` (315: constraints/auto-index) + `txn.rs` (284: txns/recovery/MVCC); cross-file paths fixed (`super::super::plan` in suites, shared `Schema`/`TableDef`/`ColumnType` imports in `tests/mod.rs`); `#[cfg(test)] mod tests;` unchanged (directory auto-resolves); (3) **Result**: every repo file ≤ 1,216 lines, all suites < 500; zero behavior change (pure move). | 145/145 tests green (94 engine + 51 server), `cargo check --release` + `cargo build --release` zero warnings |
 | 2026-09-05 | **Tri-Engine Benchmark Suite: MySQL 8 vs PostgreSQL 18 vs henchDB** (`bench_compare_tri.py`): Automated 3-engine TCP localhost benchmark harness across 50,000-row sysbench workloads with automated process supervision (`pg_ctl`, `mysqld`, `server serve`). At 4 concurrent client threads: henchDB RW txns reach **1,287 txn/s (1.56x vs PostgreSQL 18, 12.10x vs MySQL 8)**; Point selects reach **16,060 q/s (1.68x vs PostgreSQL 18, 3.93x vs MySQL 8)**; Range scans reach **16,869 q/s (2.38x vs PostgreSQL 18, 4.92x vs MySQL 8)**; Bulk load reaches **64,258 rows/s (1.51x vs PostgreSQL 18, 4.60x vs MySQL 8)**. Full durability (`fsync` / `WALWriteLock` / `sync_binlog`) on all engines. | `python bench_compare_tri.py 4` verified, 145/145 tests green |
 | 2026-09-05 | **Storage Optimization: In-Place Value Updates (`BTree::update_in_place`)** (`btree.rs`, `table.rs`): (1) **Zero-Split In-Place Descent**: `BTree::update_in_place` replaces existing values in a single lock-coupled root→leaf descent; eliminates eager leaf splits, root wrapping, and parent mutations for updates on full leaves; (2) **Zero-Allocation Value Overwrites**: when updated row length matches existing storage, bytes are overwritten in-place via `copy_from_slice`; (3) **Table Integration**: `Table::apply_raw`, `Table::upsert_row`, and `Table::update_row` attempt in-place update first before falling back to upsert; (4) **Results**: 1c durable updates jump +31% (593 → **776 w/s** vs MySQL 339 w/s), point selects reach **36,711 q/s @4c** (2.17x vs PostgreSQL 18, 4.91x vs MySQL 8), range scans reach **33,790 q/s @4c** (2.09x vs PostgreSQL 18, 4.53x vs MySQL 8), and RW transactions achieve **1,230 txn/s @4c** (1.26x vs PostgreSQL 18, 2.94x vs MySQL 8). | 146/146 tests green (95 engine + 51 server), release zero warnings |
+| 2026-09-05 | **PG COPY: Streaming Bulk Ingestion (`COPY FROM STDIN`)** (`wire/pg/copy.rs`, `wire/pg/{mod,codec,tests}.rs`): (1) **Syntax**: `COPY [ONLY] tbl [(cols)] FROM STDIN [WITH (FORMAT text/csv, DELIMITER 'x', NULL 'x', HEADER)]` plus legacy bare options; `BINARY` rejected; sole-statement enforced; (2) **Streaming**: `CopyInResponse` then `CopyData` chunks with cross-chunk line buffering (text) and cross-chunk quote state (CSV: quoted newlines, `""` escapes, quoted-empty vs NULL); text escapes (`\\ \t \n \r \b \f \v`, octal, `\xhh`) with pre-unescape `\N` matching; per-type coercion with row-numbered errors; (3) **Atomicity**: rows buffer as literal tuples and insert in 2,000-row statements inside one implicit txn (staged when the client holds a txn, so `CopyFail` writes nothing in both modes); `CopyDone` → `COPY n` + `ReadyForQuery`, `CopyFail` → `ROLLBACK` + `57014` + `ReadyForQuery`; mid-stream aborts drain in-flight client bytes to the terminator before responding (fixes a real client/server desync found live with `psql`); stray d/c/f outside COPY ignored; (4) **Tests**: 5 new (spec parsing incl. legacy/quoted/HEADER, text streaming incl. escapes/NULLs/field errors, CSV incl. embedded newlines/quotes/unterminated-quote, abort + explicit-txn staging/rollback, raw-socket d/c roundtrip); (5) **Verified live**: `psql \copy` CSV 5,000 rows in 0.25s (~20k rows/s end-to-end incl. protocol + commit), text 2,000 rows in 0.11s, quoted/NULL/bool fidelity spot-checked, failed COPY rolls back to zero rows with the same connection reusable. Limits: no `COPY TO`, single-char delimiters, whole-input buffering (memory ~2x input). | 151/151 tests green (95 engine + 56 server), `cargo check --release` + `cargo build --release` zero warnings |
 *(next agents: add rows here)*
 
 ---
@@ -308,7 +309,10 @@ The engine has achieved core relational and performance superiority over MySQL 8
   - Dedicated `--pg-port` listener (5432 + fallback); SSLRequest/TLS upgrade reuse rustls; cleartext-password auth against `auth.bin`; `RowDescription`/text `DataRow`/`CommandComplete`/SQLSTATE errors via the shared engine executor; verified live with stock `psql.exe` (plaintext + `sslmode=require`).
 
 * ✅ **Milestone PG2: PostgreSQL Extended Query Protocol & Parameters**
-  - Parse/Bind/Describe/Execute/Close/Sync/Flush with `$n`→`?` reuse of the MySQL substitution pipeline; text + binary params/results; named + unnamed statements/portals; error barrier until Sync; verified live with Python `pg8000`. Follow-ups: COPY, SCRAM, cursors.
+  - Parse/Bind/Describe/Execute/Close/Sync/Flush with `$n`→`?` reuse of the MySQL substitution pipeline; text + binary params/results; named + unnamed statements/portals; error barrier until Sync; verified live with Python `pg8000`.
+
+* ✅ **PG COPY: Streaming Bulk Ingestion (`COPY FROM STDIN`)**
+  - Text + CSV streaming with cross-chunk state, per-type coercion, implicit-txn atomicity, `CopyFail` rollback, mid-stream abort draining; verified live (`\copy` 5k CSV rows in 0.25s). Follow-ups: `COPY TO`, SCRAM, cursors.
 
 ---
 
@@ -375,7 +379,7 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**145 tests: 94 engine + 51 server** as of this writing).
+1. `cargo test` — all green (**151 tests: 95 engine + 56 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

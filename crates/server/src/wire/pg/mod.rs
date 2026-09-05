@@ -14,6 +14,7 @@
 //! socket as-is (same exposure class as the legacy framed protocol).
 
 pub mod codec;
+pub mod copy;
 pub mod exec;
 #[cfg(test)]
 mod tests;
@@ -298,7 +299,11 @@ fn pg_session(
                 pg.stmts.remove("");
                 pg.portals.remove("");
                 let sql = read_cstring(&payload).unwrap_or_default();
-                run_simple(&db, &mut session, &sql, reader)?;
+                if copy::is_copy_from_stdin(&sql) {
+                    run_copy_in(&db, &mut session, &sql, reader, ctx)?;
+                } else {
+                    run_simple(&db, &mut session, &sql, reader)?;
+                }
             }
             MSG_PARSE => {
                 let w = reader.get_mut();
@@ -414,6 +419,9 @@ fn pg_session(
             MSG_FLUSH => {
                 reader.get_mut().flush()?;
             }
+            // Stray COPY messages outside a copy (e.g. a client's CopyFail
+            // racing our own abort): ignore to stay message-aligned.
+            MSG_COPY_DATA | MSG_COPY_DONE | MSG_COPY_FAIL => {}
             _ => {
                 // Anything else (COPY, replication, SASL) is a documented
                 // follow-up; fail per-message without killing the connection.
@@ -509,5 +517,121 @@ fn run_simple(
     let w = reader.get_mut();
     w.write_all(&out)?;
     w.flush()?;
+    Ok(())
+}
+
+/// Discard in-flight CopyData until the client's CopyDone/CopyFail (or
+/// disconnect). Returns the terminator message type when clean.
+fn drain_copy_in(reader: &mut BufReader<ConnStream>) -> Option<u8> {
+    loop {
+        match read_message(reader) {
+            Ok((MSG_COPY_DATA, _)) => continue,
+            Ok((t, _)) => return Some(t),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Run one `COPY ... FROM STDIN` statement: CopyInResponse, then the
+/// CopyData/CopyDone/CopyFail ingestion loop.
+fn run_copy_in(
+    db: &Arc<Database>,
+    session: &mut engine::Session,
+    sql: &str,
+    reader: &mut BufReader<ConnStream>,
+    ctx: &ConnCtx,
+) -> std::io::Result<()> {
+    let fail = |w: &mut ConnStream, code: &str, msg: &str, txn: bool| -> std::io::Result<()> {
+        w.write_all(&error_response(code, msg))?;
+        w.write_all(&ready_for_query(if txn { b'T' } else { b'I' }))?;
+        w.flush()?;
+        Ok(())
+    };
+    // COPY must travel alone: trailing statements would be eaten as data.
+    let parts: Vec<String> = split_statements(sql)
+        .into_iter()
+        .map(|s| normalize_dialect(s.trim()).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() != 1 {
+        let w = reader.get_mut();
+        return fail(w, "42601", "COPY must be the only statement in the query", session.in_transaction());
+    }
+    let spec = match copy::parse_copy(&parts[0]) {
+        Ok(s) => s,
+        Err(m) => {
+            let w = reader.get_mut();
+            return fail(w, "42601", &m, session.in_transaction());
+        }
+    };
+    let (mut runner, resp) = match copy::CopyRunner::begin(db, session, spec) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            let w = reader.get_mut();
+            return fail(w, &code, &msg, session.in_transaction());
+        }
+    };
+    {
+        let w = reader.get_mut();
+        w.write_all(&resp)?;
+        w.flush()?;
+    }
+    loop {
+        if ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            runner.rollback(db, session);
+            break;
+        }
+        match read_message(reader) {
+            Ok((MSG_COPY_DATA, chunk)) => {
+                if let Err((code, msg)) = runner.feed(&chunk) {
+                    // The client already sent more data + CopyDone behind
+                    // this chunk: drain to the terminator so both sides
+                    // agree on the message boundary before ErrorResponse.
+                    drain_copy_in(reader);
+                    runner.rollback(db, session);
+                    let txn = session.in_transaction();
+                    let w = reader.get_mut();
+                    fail(w, &code, &format!("COPY failed: {msg}"), txn)?;
+                    return Ok(());
+                }
+            }
+            Ok((MSG_COPY_DONE, _)) => {
+                match runner.finish(db, session) {
+                    Ok(bytes) => {
+                        let w = reader.get_mut();
+                        w.write_all(&bytes)?;
+                        w.flush()?;
+                    }
+                    Err((code, msg)) => {
+                        // finish() already rolled back the implicit txn.
+                        let txn = session.in_transaction();
+                        let w = reader.get_mut();
+                        fail(w, &code, &format!("COPY failed: {msg}"), txn)?;
+                    }
+                }
+                return Ok(());
+            }
+            Ok((MSG_COPY_FAIL, payload)) => {
+                let msg = read_cstring(&payload).unwrap_or_default();
+                let out = runner.abort(db, session, &msg);
+                let w = reader.get_mut();
+                w.write_all(&out)?;
+                w.flush()?;
+                return Ok(());
+            }
+            Ok(_) => {
+                runner.rollback(db, session);
+                let txn = session.in_transaction();
+                let w = reader.get_mut();
+                fail(w, "08P04", "unexpected message during COPY, aborting", txn)?;
+                return Ok(());
+            }
+            Err(_) => {
+                // Dead connection (or idle timeout): roll back silently.
+                runner.rollback(db, session);
+                break;
+            }
+        }
+    }
     Ok(())
 }

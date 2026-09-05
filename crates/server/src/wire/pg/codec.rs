@@ -35,6 +35,12 @@ pub const MSG_EXECUTE: u8 = b'E';
 pub const MSG_CLOSE: u8 = b'C';
 pub const MSG_SYNC: u8 = b'S';
 pub const MSG_FLUSH: u8 = b'H';
+// COPY subprotocol frontend messages.
+pub const MSG_COPY_DATA: u8 = b'd';
+pub const MSG_COPY_DONE: u8 = b'c';
+pub const MSG_COPY_FAIL: u8 = b'f';
+// Backend COPY message.
+pub const MSG_COPY_IN: u8 = b'G';
 
 // Authentication codes.
 pub const AUTH_OK: i32 = 0;

@@ -446,3 +446,209 @@ fn extended_errors_and_close() {
         .is_ok();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- COPY ... FROM STDIN -----------------------------------------------------
+
+use super::copy::{is_copy_from_stdin, parse_copy, CopyFormat, CopyRunner};
+
+fn copy_test_db(dir: &std::path::Path) -> engine::Database {
+    let _ = std::fs::remove_dir_all(dir);
+    let db = engine::Database::open(dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(
+        &mut s,
+        "CREATE TABLE t (id INT PRIMARY KEY, v TEXT, n INT, b BOOL)",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn copy_spec_parsing() {
+    // Minimal + full modern syntax.
+    let s = parse_copy("COPY t FROM STDIN").unwrap();
+    assert_eq!((s.table.as_str(), s.format, s.delimiter), ("t", CopyFormat::Text, b'\t'));
+    assert_eq!(s.null, b"\\N");
+    assert!(!s.header);
+    let s = parse_copy("COPY sch.t (id, v) FROM STDIN WITH (FORMAT csv, DELIMITER ';', NULL 'NULL', HEADER)").unwrap();
+    assert_eq!(s.table, "sch.t");
+    assert_eq!(s.columns, vec!["id", "v"]);
+    assert_eq!(s.format, CopyFormat::Csv);
+    assert_eq!(s.delimiter, b';');
+    assert_eq!(s.null, b"NULL");
+    assert!(s.header);
+    // Legacy bare options.
+    let s = parse_copy("COPY t FROM STDIN CSV DELIMITER ',' NULL ''").unwrap();
+    assert_eq!(s.format, CopyFormat::Csv);
+    assert_eq!(s.delimiter, b',');
+    assert!(s.null.is_empty());
+    // Quoted identifiers + case-insensitive keywords.
+    let s = parse_copy("copy \"My Table\" (\"a b\") from stdin with (format csv)").unwrap();
+    assert_eq!(s.table, "My Table");
+    assert_eq!(s.columns, vec!["a b"]);
+    // Rejections.
+    assert!(parse_copy("COPY t TO STDOUT").is_err());
+    assert!(parse_copy("COPY t FROM STDIN WITH (FORMAT binary)").is_err());
+    assert!(parse_copy("COPY t FROM STDIN WITH (FORMAT xml)").is_err());
+    assert!(parse_copy("COPY t FROM STDIN WITH (DELIMITER 'xx')").is_err());
+    assert!(parse_copy("COPY t FROM STDIN WITH (BOGUS)").is_err());
+    assert!(parse_copy("COPY t FROM STDIN WITH (FORMAT csv").is_err());
+    assert!(parse_copy("SELECT 1").is_err());
+    // Detection pre-check.
+    assert!(is_copy_from_stdin("COPY t FROM STDIN"));
+    assert!(is_copy_from_stdin("  copy t (a) from stdin with (format csv); "));
+    assert!(!is_copy_from_stdin("SELECT * FROM t"));
+    assert!(!is_copy_from_stdin("COPY t TO STDOUT"));
+}
+
+#[test]
+fn copy_text_streaming() {
+    let dir = std::env::temp_dir().join(format!("hdbcopyt_{}", std::process::id()));
+    let db = copy_test_db(&dir);
+    let mut s = db.new_session();
+    let spec = parse_copy("COPY t FROM STDIN").unwrap();
+    let (mut runner, resp) = CopyRunner::begin(&db, &mut s, spec).unwrap();
+    // CopyInResponse: 'G', 4 columns, all text.
+    assert_eq!(resp[0], MSG_COPY_IN);
+    assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 4);
+    // Split chunks mid-line, mid-escape, mid-value.
+    runner.feed(b"1\thello\\tworld\t\\N\tt\n2\tline2\t5\tf\r\n3\ta\\\\b\t\\N\tt\n").unwrap();
+    // Bad row: field count mismatch + bad integer.
+    assert!(runner.feed(b"4\tonly-two\n").is_err());
+    assert!(runner.feed(b"4\tx\tnan-int\tf\n").is_err());
+    let out = runner.finish(&db, &mut s).unwrap();
+    assert!(out.windows(7).any(|w| w == b"COPY 3\x00"));
+    let out = db.execute(&mut s, "SELECT id, v, n, b FROM t ORDER BY id").unwrap();
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows[0][1], engine::Datum::Text("hello\tworld".into()));
+    assert_eq!(out.rows[0][2], engine::Datum::Null);
+    assert_eq!(out.rows[1][3], engine::Datum::Bool(false));
+    assert_eq!(out.rows[2][1], engine::Datum::Text("a\\b".into()));
+    assert_eq!(out.rows[2][2], engine::Datum::Null);
+    assert_eq!(out.rows[2][3], engine::Datum::Bool(true));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn copy_csv_streaming() {
+    let dir = std::env::temp_dir().join(format!("hdbcopyc_{}", std::process::id()));
+    let db = copy_test_db(&dir);
+    let mut s = db.new_session();
+    let spec = parse_copy("COPY t (id, v, n, b) FROM STDIN WITH (FORMAT csv, HEADER)").unwrap();
+    let (mut runner, _) = CopyRunner::begin(&db, &mut s, spec).unwrap();
+    // Header skipped; embedded newline + split quote across chunks; quoted
+    // empty is '' (not NULL); unquoted empty is NULL.
+    runner.feed(b"id,v,n,b\n1,\"a,b\",7,t\n2,\"multi\nline\",,\"f\"\n3,\"\"\"q\"\"\",,\"T\"\n").unwrap();
+    runner.feed(b"4,plain,,TRUE\n").unwrap();
+    let out = runner.finish(&db, &mut s).unwrap();
+    assert!(out.windows(7).any(|w| w == b"COPY 4\x00"));
+    let out = db.execute(&mut s, "SELECT id, v, n, b FROM t ORDER BY id").unwrap();
+    assert_eq!(out.rows.len(), 4);
+    assert_eq!(out.rows[0][1], engine::Datum::Text("a,b".into()));
+    assert_eq!(out.rows[1][1], engine::Datum::Text("multi\nline".into()));
+    assert_eq!(out.rows[1][2], engine::Datum::Null);
+    assert_eq!(out.rows[2][1], engine::Datum::Text("\"q\"".into()));
+    assert_eq!(out.rows[2][2], engine::Datum::Null);
+    assert_eq!(out.rows[3][1], engine::Datum::Text("plain".into()));
+    assert_eq!(out.rows[3][3], engine::Datum::Bool(true));
+    // Unterminated quote at finish is corrupt.
+    let spec = parse_copy("COPY t FROM STDIN WITH (FORMAT csv)").unwrap();
+    let (mut runner, _) = CopyRunner::begin(&db, &mut s, spec).unwrap();
+    runner.feed(b"1,\"oops\n").unwrap();
+    assert!(runner.finish(&db, &mut s).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn copy_abort_and_explicit_txn() {
+    let dir = std::env::temp_dir().join(format!("hdbcopya_{}", std::process::id()));
+    let db = copy_test_db(&dir);
+    let mut s = db.new_session();
+    // Implicit txn: abort writes nothing.
+    let spec = parse_copy("COPY t FROM STDIN").unwrap();
+    let (mut runner, _) = CopyRunner::begin(&db, &mut s, spec).unwrap();
+    runner.feed(b"10\ta\t1\tt\n11\tb\t2\tf\n").unwrap();
+    let out = runner.abort(&db, &mut s, "client gave up");
+    assert_eq!(out[0], MSG_ERROR);
+    assert!(out.windows(5).any(|w| w == b"57014"));
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], engine::Datum::Int(0));
+    // Explicit txn: finish stages (visible in-txn), user rollback discards.
+    db.execute(&mut s, "BEGIN").unwrap();
+    let spec = parse_copy("COPY t FROM STDIN").unwrap();
+    let (mut runner, _) = CopyRunner::begin(&db, &mut s, spec).unwrap();
+    runner.feed(b"20\ta\t1\tt\n").unwrap();
+    let out = runner.finish(&db, &mut s).unwrap();
+    assert!(out.windows(7).any(|w| w == b"COPY 1\x00"));
+    // ReadyForQuery says in-transaction after an explicit-txn COPY.
+    assert_eq!(out[out.len() - 1], b'T');
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], engine::Datum::Int(1));
+    db.execute(&mut s, "ROLLBACK").unwrap();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], engine::Datum::Int(0));
+    // Unknown table / column fail at begin.
+    assert!(CopyRunner::begin(&db, &mut s, parse_copy("COPY nosuch FROM STDIN").unwrap()).is_err());
+    assert!(CopyRunner::begin(&db, &mut s, parse_copy("COPY t (nosuch) FROM STDIN").unwrap()).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn copy_socket_roundtrip() {
+    use super::{run_copy_in, ConnCtx};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    // Full wire loop: a raw client speaks CopyData/CopyDone frames while the
+    // server runs run_copy_in over the same reader path as the live loop.
+    let dir = std::env::temp_dir().join(format!("hdbcopys_{}", std::process::id()));
+    let db = Arc::new(copy_test_db(&dir));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir_srv = dir.clone();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut reader = std::io::BufReader::new(super::super::tls::ConnStream::Plain(sock));
+        let mut s = db.new_session();
+        let ctx = ConnCtx {
+            auth_path: dir_srv.join("auth.bin"),
+            idle_timeout: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            admitted: true,
+            tls: None,
+        };
+        run_copy_in(&db, &mut s, "COPY t FROM STDIN", &mut reader, &ctx).unwrap();
+    });
+    fn frame(t: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![t];
+        v.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    // Split the rows awkwardly across frames (mid-row, mid-field).
+    client.write_all(&frame(MSG_COPY_DATA, b"1\ta\t1\tt\n2\tb")).unwrap();
+    client.write_all(&frame(MSG_COPY_DATA, b"\t2\tf\n")).unwrap();
+    client.write_all(&frame(MSG_COPY_DONE, b"")).unwrap();
+    // Drain server frames until close.
+    let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match client.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => all.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    server.join().unwrap();
+    assert_eq!(all[0], MSG_COPY_IN);
+    assert!(all.windows(7).any(|w| w == b"COPY 2\x00"));
+    assert_eq!(all[all.len() - 1], b'I'); // ReadyForQuery idle
+    let db2 = engine::Database::open(&dir).unwrap();
+    let mut s2 = db2.new_session();
+    let out = db2.execute(&mut s2, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], engine::Datum::Int(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
