@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::table::FkAction;
 use crate::types::Datum;
 
 use super::ast::*;
@@ -92,6 +93,23 @@ impl Parser {
         }
     }
 
+    /// Parse `RESTRICT`, `CASCADE`, or `SET NULL` after ON DELETE / ON UPDATE.
+    fn parse_fk_action(&mut self) -> Result<FkAction> {
+        if self.eat_kw("RESTRICT") {
+            Ok(FkAction::Restrict)
+        } else if self.eat_kw("CASCADE") {
+            Ok(FkAction::Cascade)
+        } else if self.eat_kw("SET") {
+            self.expect_kw("NULL")?;
+            Ok(FkAction::SetNull)
+        } else {
+            Err(Error::ParseError(format!(
+                "expected RESTRICT, CASCADE, or SET NULL, got {:?}",
+                self.peek()
+            )))
+        }
+    }
+
     fn parse_statement(&mut self) -> Result<Statement> {
         match kw(self.peek()).as_deref() {
             Some("CREATE") => self.parse_create(),
@@ -164,7 +182,68 @@ impl Parser {
             let name = self.expect_ident()?;
             self.expect_sym('(')?;
             let mut columns = Vec::new();
+            let mut foreign_keys = Vec::new();
             loop {
+                // Table constraint: [CONSTRAINT [name]] FOREIGN KEY (col)
+                // REFERENCES reftable(refcol) [ON DELETE action]
+                // [ON UPDATE action].
+                let mut constraint_name: Option<String> = None;
+                if self.eat_kw("CONSTRAINT") {
+                    if kw(self.peek()).as_deref() != Some("FOREIGN") {
+                        constraint_name = Some(self.expect_ident()?);
+                    }
+                }
+                if self.eat_kw("FOREIGN") {
+                    self.expect_kw("KEY")?;
+                    self.expect_sym('(')?;
+                    let column = self.expect_ident()?;
+                    self.expect_sym(')')?;
+                    self.expect_kw("REFERENCES")?;
+                    let ref_table = self.expect_ident()?;
+                    self.expect_sym('(')?;
+                    let ref_column = self.expect_ident()?;
+                    self.expect_sym(')')?;
+                    let mut on_delete = FkAction::Restrict;
+                    loop {
+                        if self.eat_kw("ON") {
+                            if self.eat_kw("DELETE") {
+                                on_delete = self.parse_fk_action()?;
+                            } else if self.eat_kw("UPDATE") {
+                                match self.parse_fk_action()? {
+                                    FkAction::Restrict => {}
+                                    _ => {
+                                        return Err(Error::NotSupported(
+                                            "ON UPDATE CASCADE/SET NULL is not supported".into(),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                return Err(Error::ParseError(format!(
+                                    "expected DELETE or UPDATE after ON, got {:?}",
+                                    self.peek()
+                                )));
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    foreign_keys.push(ForeignKeySpec {
+                        name: constraint_name,
+                        column,
+                        ref_table,
+                        ref_column,
+                        on_delete,
+                    });
+                    if !self.eat_sym(',') {
+                        break;
+                    }
+                    continue;
+                }
+                if constraint_name.is_some() {
+                    return Err(Error::ParseError(
+                        "CONSTRAINT must precede FOREIGN KEY".into(),
+                    ));
+                }
                 let cname = self.expect_ident()?;
                 let ctype = self.expect_ident()?;
                 if self.eat_sym('(') {
@@ -208,7 +287,7 @@ impl Parser {
                 }
             }
             self.expect_sym(')')?;
-            Ok(Statement::CreateTable { name, columns })
+            Ok(Statement::CreateTable { name, columns, foreign_keys })
         } else if self.eat_kw("INDEX") {
             let name = self.expect_ident()?;
             self.expect_kw("ON")?;

@@ -58,7 +58,7 @@ cd henchDB
 cargo build --release
 ```
 
-Run test suite (100 unit and integration tests):
+Run test suite (113 unit and integration tests):
 ```bash
 cargo test
 ```

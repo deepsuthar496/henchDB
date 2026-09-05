@@ -2,7 +2,7 @@
 //! secondary-index bounds) plus literal coercion helpers.
 
 use crate::error::Result;
-use crate::sql::{CmpOp, Expr};
+use crate::sql::{CmpOp, Expr, JoinClause, JoinKind};
 use crate::table::Table;
 use crate::types::{ColumnType, Datum};
 
@@ -382,5 +382,92 @@ pub(crate) fn equi_join(
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Greedy join ordering (left-deep, INNER runs only)
+// ---------------------------------------------------------------------------
+
+/// Tables an ON clause touches, as scope positions. `None` when a column
+/// does not resolve (validated separately — the executor rejects those).
+fn on_tables(on: &Expr, resolve: &dyn Fn(&str) -> Result<usize>) -> Option<Vec<usize>> {
+    let mut cols = Vec::new();
+    crate::sql::collect_columns(on, &mut cols);
+    let mut out = Vec::new();
+    for c in cols {
+        out.push(resolve(c).ok()?);
+    }
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
+/// Greedy left-deep order as a permutation of table indices (`0` = FROM).
+/// `sizes[i]` estimates relation `i` (input row count). Rules:
+/// - table 0 stays first; each LEFT JOIN is a barrier (its left side must
+///   be fully accumulated before it);
+/// - inside an INNER run, repeatedly take the ready join (ON touches only
+///   placed tables + itself) with the smallest input;
+/// - when nothing is ready, the rest keep written order (always valid).
+/// The executor re-validates every ON against its scope prefix, so an
+/// ordering bug degrades to an error, never a wrong answer.
+pub(crate) fn order_joins(
+    joins: &[JoinClause],
+    sizes: &[usize],
+    resolve: &dyn Fn(&str) -> Result<usize>,
+) -> Vec<usize> {
+    let n = joins.len() + 1;
+    let mut order = vec![0usize];
+    let mut placed = vec![false; n];
+    placed[0] = true;
+    // Remaining tables in written order; table ti is added by joins[ti - 1].
+    let mut remaining: Vec<usize> = (1..n).collect();
+    while !remaining.is_empty() {
+        // Original-first remaining table goes next untouched when it is a
+        // LEFT join (barrier): everything before it is its left side.
+        if joins[remaining[0] - 1].kind == JoinKind::Left {
+            let ti = remaining.remove(0);
+            order.push(ti);
+            placed[ti] = true;
+            continue;
+        }
+        // INNER run: smallest ready candidate wins.
+        let mut best: Option<(usize, usize)> = None; // (pos, table)
+        for (pos, &ti) in remaining.iter().enumerate() {
+            if joins[ti - 1].kind == JoinKind::Left {
+                continue;
+            }
+            let deps = match on_tables(&joins[ti - 1].on, resolve) {
+                Some(d) => d,
+                None => continue,
+            };
+            if !deps.iter().all(|d| placed[*d] || *d == ti) {
+                continue;
+            }
+            let size = sizes.get(ti).copied().unwrap_or(usize::MAX);
+            let better = match best {
+                None => true,
+                Some((bpos, _)) => {
+                    size < sizes.get(remaining[bpos]).copied().unwrap_or(usize::MAX)
+                }
+            };
+            if better {
+                best = Some((pos, ti));
+            }
+        }
+        match best {
+            Some((pos, ti)) => {
+                order.push(ti);
+                placed[ti] = true;
+                remaining.remove(pos);
+            }
+            // Nothing ready: written order for the rest is always valid.
+            None => {
+                order.extend(remaining.iter().copied());
+                break;
+            }
+        }
+    }
+    order
 }
 

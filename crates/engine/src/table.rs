@@ -46,11 +46,42 @@ pub struct IndexDef {
     pub column: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    Restrict,
+    Cascade,
+    SetNull,
+}
+
+impl FkAction {
+    pub fn parse(s: &str) -> Option<FkAction> {
+        match s {
+            "RESTRICT" => Some(FkAction::Restrict),
+            "CASCADE" => Some(FkAction::Cascade),
+            "SET NULL" => Some(FkAction::SetNull),
+            _ => None,
+        }
+    }
+}
+
+/// Foreign key: `child.column` references `ref_table.ref_column`.
+/// `ref_table` is stored as the fully qualified catalog key
+/// (`db.table`), resolved once at CREATE time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyDef {
+    pub name: String,
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+    pub on_delete: FkAction,
+}
+
 #[derive(Debug, Clone)]
 pub struct TableDef {
     pub name: String,
     pub schema: Schema,
     pub indexes: Vec<IndexDef>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
 }
 
 impl TableDef {
@@ -59,6 +90,7 @@ impl TableDef {
             name: name.into(),
             schema,
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 }

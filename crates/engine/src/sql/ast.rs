@@ -1,3 +1,4 @@
+use crate::table::FkAction;
 use crate::types::Datum;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +116,15 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeySpec {
+    pub name: Option<String>,
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+    pub on_delete: FkAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateDatabase {
         name: String,
@@ -131,6 +141,7 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<ColumnSpec>,
+        foreign_keys: Vec<ForeignKeySpec>,
     },
     DropTable {
         name: String,

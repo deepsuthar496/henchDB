@@ -32,6 +32,7 @@ use crate::wal::{Record, Wal};
 
 use plan::{access_path, AccessPath};
 
+pub(crate) mod fk;
 pub(crate) mod plan;
 pub(crate) mod query;
 
@@ -81,7 +82,7 @@ pub(crate) struct ActiveTxn {
 }
 
 #[derive(Clone)]
-struct StagedWrite {
+pub(crate) struct StagedWrite {
     row: Option<Vec<Datum>>,
     is_insert: bool,
 }
@@ -171,6 +172,8 @@ impl Database {
         for table in tables.values() {
             table.refresh_auto_inc()?;
         }
+        // Create-before-auto-index tables gain their FK indexes now.
+        Self::fk_ensure_all_auto_indexes(&tables)?;
 
         let install_frontier = wal.next_offset();
         Ok(Database {
@@ -425,7 +428,9 @@ impl Database {
                     message: "OK".into(),
                 })
             }
-            Statement::CreateTable { name, columns } => self.exec_create_table(session, name, columns),
+            Statement::CreateTable { name, columns, foreign_keys } => {
+                self.exec_create_table(session, name, columns, foreign_keys)
+            }
             Statement::DropTable { name } => self.exec_drop_table(session, &name),
             Statement::Insert { table, rows } => self.exec_insert(session, &table, rows),
             Statement::Select {
@@ -543,7 +548,13 @@ impl Database {
 
     // -- DDL (autocommit) ------------------------------------------------
 
-    fn exec_create_table(&self, session: &Session, name: String, columns: Vec<crate::sql::ColumnSpec>) -> Result<Output> {
+    fn exec_create_table(
+        &self,
+        session: &Session,
+        name: String,
+        columns: Vec<crate::sql::ColumnSpec>,
+        foreign_keys: Vec<crate::sql::ForeignKeySpec>,
+    ) -> Result<Output> {
         let key = if name.contains('.') { name.clone() } else { format!("{}.{name}", session.current_db) };
         let mut pk_count = 0usize;
         let mut pk_idx = None;
@@ -587,15 +598,23 @@ impl Database {
                 "AUTO_INCREMENT must be the primary key".into(),
             ));
         }
-        let def = TableDef {
+        // Validate FKs (parent must exist unless self-ref), then auto-index
+        // every FK column MySQL-style before the table becomes visible.
+        let bare = TableDef {
             name: key.clone(),
             schema: Schema {
                 columns: defs,
                 pk_idx,
             },
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
         };
+        let fks = self.fk_build_defs(session, &key, &name, &bare, foreign_keys)?;
+        let mut def = bare;
+        def.foreign_keys = fks;
         let table = Arc::new(Table::new(def.clone()));
+        Self::fk_ensure_auto_indexes(&table)?;
+        def.indexes = table.secondary_indexes();
         {
             let mut guard = self.tables.write().unwrap();
             if guard.contains_key(&key) {
@@ -614,6 +633,8 @@ impl Database {
 
     fn exec_drop_table(&self, session: &Session, name: &str) -> Result<Output> {
         let key = self.resolve_table_key(session, name);
+        // A referenced parent cannot be dropped (schema-level RESTRICT).
+        self.fk_check_drop(&key, name)?;
         {
             let mut guard = self.tables.write().unwrap();
             guard.remove(&key).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
@@ -655,6 +676,8 @@ impl Database {
     fn exec_drop_index(&self, session: &Session, name: String, table_name: String) -> Result<Output> {
         let table = self.table(session, &table_name)?;
         let key = self.resolve_table_key(session, &table_name);
+        // FK columns keep their last covering index.
+        self.fk_check_drop_index(&table, &name)?;
         table.drop_index(&name)?;
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
@@ -711,6 +734,11 @@ impl Database {
             );
         }
         let n = staged.len();
+        // FK child check: every inserted row must reference an existing
+        // parent key (statement-staged parents included).
+        if !table_arc.def.foreign_keys.is_empty() {
+            self.fk_check_insert_rows(session, &staged)?;
+        }
         self.commit_staged_or_stage(session, table, staged)?;
         Ok(Output::ok(format!("{n} row(s) inserted")))
     }
@@ -782,6 +810,11 @@ impl Database {
         };
         let key_name = self.resolve_table_key(session, table);
         let schema = table_arc.schema();
+
+        // FK-involved tables take the slow path (statement-level checks).
+        if !table_arc.def.foreign_keys.is_empty() || self.fk_is_referenced(&key_name) {
+            return Ok(None);
+        }
 
         if schema.columns[schema.pk_idx].name != pk_col {
             return Ok(None);
@@ -875,8 +908,11 @@ impl Database {
             set_idx.push((idx, expr.clone()));
         }
 
-        // Fast path for point update on PK when autocommit
-        if session.txn.is_none() {
+        // Fast path for point update on PK when autocommit (skipped for
+        // FK-involved tables: those need statement-level checks below).
+        let fk_involved =
+            !table_arc.def.foreign_keys.is_empty() || self.fk_is_referenced(&table_key);
+        if session.txn.is_none() && !fk_involved {
             if let Ok(AccessPath::Point(lit)) = access_path(&table_arc, selection.as_ref()) {
                 let key = encode_key(&lit)?;
                 if let Some(raw) = table_arc.tree().get(&key) {
@@ -905,6 +941,8 @@ impl Database {
 
         let rows = self.visible_rows(session, &table_arc, selection.as_ref())?;
         let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
+        // (new key, old row) per updated row for FK checks.
+        let mut pairs: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
         for row in rows {
             let mut new_row = row.clone();
             let mut changed = false;
@@ -922,12 +960,23 @@ impl Database {
             let new_row = table_arc.validate_row(new_row)?;
             let key = encode_key(&new_row[schema.pk_idx])?;
             staged.insert(
-                (table_key.clone(), key),
+                (table_key.clone(), key.clone()),
                 StagedWrite {
                     row: Some(new_row),
                     is_insert: false,
                 },
             );
+            // Pair new key with the old row (keys match unless SET touched
+            // the PK; PK changes compare old vs new PK datums directly).
+            pairs.push((key, row));
+        }
+        // FK: re-validate rows whose FK columns changed; propagate
+        // parent-PK changes to referencing children (cascade actions extend
+        // the staged set in place).
+        if !pairs.is_empty()
+            && (!table_arc.def.foreign_keys.is_empty() || self.fk_is_referenced(&table_key))
+        {
+            self.fk_check_updated(session, &table_key, &table_arc, &pairs, &mut staged)?;
         }
         let n = staged.len();
         self.commit_staged_or_stage(session, table, staged)?;
@@ -944,7 +993,7 @@ impl Database {
         let table_key = self.resolve_table_key(session, table);
         let rows = self.visible_rows(session, &table_arc, selection.as_ref())?;
         let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
-        for row in rows {
+        for row in &rows {
             let key = encode_key(&row[table_arc.schema().pk_idx])?;
             staged.insert(
                 (table_key.clone(), key),
@@ -954,7 +1003,10 @@ impl Database {
                 },
             );
         }
-        let n = staged.len();
+        // FK parent actions: RESTRICT rejects, CASCADE/SET NULL extend the
+        // staged set (transitively, cycle-safe). The reported count stays
+        // the directly matched rows.
+        let n = self.fk_check_deleted(session, &table_arc, &rows, &mut staged)?;
         self.commit_staged_or_stage(session, table, staged)?;
         Ok(Output::ok(format!("{n} row(s) deleted")))
     }

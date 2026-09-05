@@ -19,6 +19,7 @@ pub enum Error {
     NotSupported(String),
     IndexNotFound(String),
     IndexExists(String),
+    ForeignKeyViolation(String),
     InvalidSchema(String),
     DatabaseNotFound(String),
     DatabaseExists(String),
@@ -52,6 +53,7 @@ impl fmt::Display for Error {
             Error::NotSupported(m) => write!(f, "not supported: {m}"),
             Error::IndexNotFound(i) => write!(f, "index '{i}' does not exist"),
             Error::IndexExists(i) => write!(f, "index '{i}' already exists"),
+            Error::ForeignKeyViolation(m) => write!(f, "foreign key constraint fails: {m}"),
             Error::InvalidSchema(m) => write!(f, "invalid schema: {m}"),
         }
     }

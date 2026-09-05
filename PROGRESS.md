@@ -23,13 +23,13 @@ numbers changed, and keep `agents.md` in sync. Never delete history — add to i
 The project is **henchDB** (working title), an ACID-compliant relational database engine written from scratch in Rust with **zero external dependencies** (standard library only). It provides:
 - **Index & Storage**: Optimistic Lock Coupling (OLC) B+ trees, 256 KiB slotted pages, 64-bit swizzled pointers (`swips`), write-through buffer pool with FIFO cooling, off-page overflow paging for rows >1 KiB, and secondary B+ tree indexes on non-PK columns.
 - **Durability & Transactions**: Checksummed WAL (IEEE CRC32), 100–200 µs group-commit sequencer, fuzzy checkpoints, crash-tested recovery, staged out-of-place transactions with instant aborts (no undo logs), and multi-database namespaces (`CREATE DATABASE`, `USE`, `DROP DATABASE`) persisted across restarts.
-- **Relational SQL & Wire Protocol**: Standard MySQL client wire protocol (HandshakeV10, `COM_QUERY`, and binary prepared statements `COM_STMT_PREPARE/EXECUTE`), salted SHA-256 (`caching_sha2_password`) & SHA-1 auth, connection pool limits (`max_connections`), query execution timeouts (`statement_timeout`), graceful drain, `AUTO_INCREMENT`, native temporal types (`DATE`, `DATETIME`, `TIMESTAMP`, `TIME`), `INNER/LEFT JOIN`, `GROUP BY`, multi-key `ORDER BY`, global/grouped aggregates, and rich `WHERE` filtering (`AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`).
+- **Relational SQL & Wire Protocol**: Standard MySQL client wire protocol (HandshakeV10, `COM_QUERY`, and binary prepared statements `COM_STMT_PREPARE/EXECUTE`), salted SHA-256 (`caching_sha2_password`) & SHA-1 auth, connection pool limits (`max_connections`), query execution timeouts (`statement_timeout`), graceful drain, `AUTO_INCREMENT`, `FOREIGN KEY` (`RESTRICT`/`CASCADE`/`SET NULL`), native temporal types (`DATE`, `DATETIME`, `TIMESTAMP`, `TIME`), `INNER/LEFT JOIN` (hash join), `GROUP BY`, multi-key `ORDER BY`, global/grouped aggregates, and rich `WHERE` filtering (`AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `LIKE`).
 - **Benchmark Performance**: Against a **real MySQL 8.0.46** instance running on the same machine under strict compiled-client harnesses (`bench_strict.py`), henchDB decisively outperforms MySQL across **all workloads**:
   - Point select: **2.45x–2.65x faster** (up to 81,693 vs 30,848 q/s @8c; in-process fast-path reaches **565,198 q/s**)
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **100/100 tests passing** (71 engine + 29 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
+- **Quality & Size Ceiling**: **113/113 tests passing** (84 engine + 29 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
 
 ---
 
@@ -142,6 +142,8 @@ comment in git history and in README.
 | Eager splits + wrap-the-root (readers never see torn structure) | ✅ done | `btree.rs` |
 | Epoch-Based Reclamation | ✅ done (thread-local participants, horizon tracking, zero-invalidation retirement) | `epoch.rs`, `db/` |
 | Secondary Indexes (OLC B+ trees on non-PK columns, point/range access-paths) | ✅ done | `table.rs`, `sql/`, `db/` |
+| Foreign Keys (RESTRICT/CASCADE/SET NULL, auto-indexed columns, DROP guards) | ✅ done | `table.rs`, `sql/`, `db/fk.rs` |
+| Greedy join ordering (smallest-ready INNER first, LEFT barriers) | ✅ done | `db/plan.rs`, `db/query.rs` |
 | Codec Corruption Robustness & Fuzzing (SEC6) | ✅ done (OOM guards, truncation safety, zero panics) | `wal.rs`, `catalog.rs` |
 | Slotted Pages, Swips & Cooling Pool | ✅ done (256 KiB slotted pages, 64-bit swips, write-through buffer pool, FIFO cooling) | `page.rs`, `table.rs`, `catalog.rs` |
 | Staged out-of-place writes, instant abort | ✅ simplified form | `db/mod.rs` |
@@ -257,6 +259,8 @@ python bench_strict.py 3
 | 2026-09-05 | **Real-Time Visual Terminal Benchmark Harness** (`becnhmarks.py` / `bench_live.py`): Interactive real-time visual harness displaying side-by-side dynamic progress bars, throughput gauges (QPS/TPS speedometer), running latency, and speedup advantage badges against live MySQL 8.0 (port 3307) and henchDB (port 3308) over TCP. Supports 4-stage race tournament and continuous live gauge modes with ANSI terminal escaping. | `python bench_live.py --quick` verified against live MySQL 8.0.46 |
 | 2026-09-05 | **Enterprise Milestones 1–3 & Codebase Ceiling Modularization** (`crates/engine/src/sql/`, `catalog.rs`, `db/`, `wire/stmt.rs`): (1) **Milestone 1**: Multi-database namespace isolation (`CREATE DATABASE`, `USE <db>`, `DROP DATABASE`, `COM_INIT_DB`, `SHOW DATABASES`, table namespace routing, catalog and snapshot v3 persistence across restarts); (2) **Milestone 2**: Native temporal types (`DATE`, `DATETIME`, `TIMESTAMP`, `TIME`) with total-ordering key codec and binary wire protocol encoding; (3) **Milestone 3**: Cooperative statement execution timeouts (`statement_timeout` deadline enforcement in table scans and nested-loop joins); (4) **Ceiling Enforcement**: Decomposed monolithic 1,439-line `sql.rs` into `sql/` directory modules (`ast.rs`, `eval.rs`, `lexer.rs`, `parser.rs`, `tests.rs`, `mod.rs`) strictly under 1,000 lines; (5) In-process point select throughput accelerated to **565,198 q/s** (+126% speedup). Head-to-head strict benchmarks confirm clean victories across all workloads on both 1c and 8c (Point Select 2.64x–2.65x, Range Query 2.61x–3.59x, RW Txn 1.79x–2.33x, Durable Update 1.40x–2.27x). | 93/93 tests green (64 engine + 29 server), release zero warnings, 50,000-row data integrity verified |
 | 2026-09-05 | **F5: In-Memory Hash Joins** (`db/plan.rs`, `db/query.rs`, `db/tests.rs`): (1) **Planner** (`plan.rs`): `equi_join()` detects one `left.col = right.col` pair per ON conjunction (either operand order, AND-recursion), plus `JoinKey` hashable key normalization mirroring `eval_with` coercions exactly (integral floats→Int with saturating cast, parseable text→DateTime, NaN/NULL→never-match); (2) **Executor** (`query.rs`): `join_step` dispatches per join — hash path builds `HashMap<JoinKey, Vec<usize>>` on the smaller side for INNER (either side) or right side for LEFT (order + padding preserved), streams probe rows, re-filters every hit through the full ON clause (compound predicates correct), nested-loop fallback for non-equi/same-side keys; deadline checks in build + probe loops; (3) **Tests**: 7 new (multi-row INNER incl. one-to-many, LEFT padding + NULL-key never-match, 3-table chain, empty build/probe sides, compound-ON + non-equi fallback + flipped operands, key-normalization unit, 1,500×1,500 → 15,000-row scale). | 100/100 tests green (71 engine + 29 server), release zero warnings |
+| 2026-09-05 | **Foreign Key Constraints & Referential Integrity** (`sql/ast.rs`, `sql/parser.rs`, `sql/tests.rs`, `table.rs`, `wal.rs`, `catalog.rs`, `db/fk.rs`, `db/mod.rs`, `db/tests.rs`): (1) **DDL**: `[CONSTRAINT [name]] FOREIGN KEY (col) REFERENCES tbl(col) [ON DELETE RESTRICT/CASCADE/SET NULL]` (non-RESTRICT `ON UPDATE` rejected); parent table/column must exist (self-reference allowed); `ForeignKeyDef` stored on `TableDef` with db-qualified `ref_table`; (2) **Persistence**: trailing FK section in the table-def codec (same tolerant `off < len` pattern as indexes — old images decode to zero FKs, no version bump), so WAL replay + snapshot recovery carry FKs; (3) **Enforcement** (new `db/fk.rs`, keeps `db/mod.rs` under ceiling): INSERT/UPDATE validate child rows (NULL skips; parent seek prefers PK point → secondary index → scan, with Int/Float + DateTime/Text coercion mirrors and statement-staged + txn overlay visibility); DELETE on parents RESTRICTs/CASCADEs (transitive, cycle-safe via visited set)/SET NULLs (NOT NULL → violation) inside the same atomic staged set; UPDATE fast paths bail to the slow path for FK-involved tables; DROP TABLE of a referenced parent rejected; (4) **Tests**: 9 new (parser incl. actions + named constraints, valid/orphan/NULL insert, RESTRICT flow, transitive 3-level CASCADE, SET NULL incl. NOT NULL rejection, UPDATE child/parent paths, self-ref + txn visibility/rollback, DROP guard, CHECKPOINT + WAL recovery). | 109/109 tests green (80 engine + 29 server), release zero warnings; `db/mod.rs` at 1,436 lines (next split candidate when it nears 1,500) |
+| 2026-09-05 | **FK Auto-Indexing, Greedy Join Ordering & `db/mod.rs` Ceiling Refactor** (`db/fk.rs`, `db/mod.rs`, `db/plan.rs`, `db/query.rs`, `db/tests.rs`): (1) **Auto-index** (`fk.rs`): every FK column gains a secondary index at CREATE (`fk_{col}`, suffixed on name clash; PK columns need none) unless already covered — persisted via `def.indexes` so WAL/snapshot carry them; open-time migration (`fk_ensure_all_auto_indexes`) backfills pre-existing tables; dropping a column's last covering index is rejected with `ForeignKeyViolation`; parent CASCADE/RESTRICT lookups now hit the secondary-seek path in `fk.rs` instead of scans; (2) **Greedy ordering** (`plan.rs` `order_joins` + `query.rs` wiring): table-0 first, LEFT joins as barriers, smallest ready INNER join next (ready = ON touches only placed tables + itself; fallback keeps written order, always valid); executor runs the permuted layout while `SELECT *` expansion keeps written-order names (positions re-resolved); hash build side already smallest-side so ordering + hashing compose; (3) **Refactor**: all FK statement wiring moved from `db/mod.rs` into `db/fk.rs` (`fk_build_defs`, `fk_check_drop`, `fk_check_insert_rows`, `fk_check_updated`, `fk_check_deleted`) — `mod.rs` drops 1,531 → 1,327 lines; (4) **Tests**: 4 new (auto-index create/guard/drop rules, recovery + CASCADE via auto-index, `order_joins` unit incl. barriers/chains, 3-table skewed execution with star-order stability + LEFT mix). Fixed one real planner bug found by the suite (table ordinals vs scope positions in `order_joins`). | 113/113 tests green (84 engine + 29 server), release zero warnings |
 *(next agents: add rows here)*
 
 ---
@@ -282,6 +286,10 @@ The engine has achieved core relational and performance superiority over MySQL 8
 * ✅ **Frontier Milestone F5 (part 1): In-Memory Hash Joins (`INNER` + `LEFT`)**
   - Equi-key build/probe per join step (smaller-side build for `INNER`, right-build for `LEFT`); full ON clause re-filters matches; NULL/NaN keys never match; non-equi falls back to nested loop. Remaining F5: Cascades memo optimizer + join ordering.
 
+* ✅ **Referential Integrity: Foreign Key Constraints**
+  - `FOREIGN KEY (col) REFERENCES tbl(col) [ON DELETE RESTRICT/CASCADE/SET NULL]` in `CREATE TABLE`; child INSERT/UPDATE validation, parent DELETE actions in the same atomic commit, DROP guard, WAL + snapshot persistence.
+  - FK columns auto-indexed (`fk_{col}`) at CREATE + open-time backfill; last-covering-index DROP rejected; greedy join ordering (smallest-ready INNER first, LEFT barriers, written-order `*` output).
+
 ---
 
 ### 🎯 Active Priorities for Enterprise Production (v1.0)
@@ -297,11 +305,11 @@ The engine has achieved core relational and performance superiority over MySQL 8
 
 ---
 
-### 2. ⚡ Enterprise Priority 2 (F5-remainder): Cascades Memo Optimizer & Join Ordering
-* **Status**: 🎯 **HIGH ENGINE PRIORITY**
-* **Why it matters**: Hash joins now execute per-step in O(N + M), but join order is still the written order. Multi-table queries need cost-based ordering.
+### 2. ⚡ Enterprise Priority 2 (F5-remainder): Cascades Memo Optimizer
+* **Status**: 🟡 **FUTURE WORK**
+* **Why it matters**: Greedy ordering + smallest-side hash builds already cover the common multi-table shapes. Full Cascades (costed memo, bushy plans) is incremental from here.
 * **Architecture**:
-  - Cascades memo: order the accumulated left-deep chain by estimated relation sizes (already have row counts at plan time).
+  - Memoize alternative orderings with estimated cardinalities; allow bushy (non-left-deep) shapes for 4+ table joins.
 * **Effort**: Medium.
 
 ---
@@ -335,7 +343,7 @@ The engine has achieved core relational and performance superiority over MySQL 8
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**100 tests: 71 engine + 29 server** as of this writing).
+1. `cargo test` — all green (**113 tests: 84 engine + 29 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

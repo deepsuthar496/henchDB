@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use super::plan::{equi_join, join_key, JoinKey};
+use super::plan::{equi_join, join_key, order_joins, JoinKey};
 use super::{Database, Output, Session};
 use crate::error::{Error, Result};
 use crate::sql::{parse_sql, AggFunc, Expr, JoinClause, JoinKind, SelectItem, Statement};
@@ -387,6 +387,35 @@ impl Database {
         hit.ok_or_else(|| Error::ColumnNotFound(name.into()))
     }
 
+    /// Owning table ordinal (0-based over `tables`) for `col` or
+    /// `table.col`. Join ordering permutes whole tables, so it needs table
+    /// ordinals where the rest of the executor needs scope positions.
+    fn scope_table_idx(tables: &[Arc<Table>], name: &str) -> Result<usize> {
+        if let Some((t, c)) = name.split_once('.') {
+            for (ord, table) in tables.iter().enumerate() {
+                let simple_name = table.def.name.split('.').last().unwrap_or(&table.def.name);
+                if table.def.name == t || simple_name == t {
+                    table
+                        .schema()
+                        .index_of(c)
+                        .ok_or_else(|| Error::ColumnNotFound(name.into()))?;
+                    return Ok(ord);
+                }
+            }
+            return Err(Error::TableNotFound(t.into()));
+        }
+        let mut hit: Option<usize> = None;
+        for (ord, table) in tables.iter().enumerate() {
+            if table.schema().index_of(name).is_some() {
+                if hit.is_some() {
+                    return Err(Error::NotSupported(format!("ambiguous column '{name}'")));
+                }
+                hit = Some(ord);
+            }
+        }
+        hit.ok_or_else(|| Error::ColumnNotFound(name.into()))
+    }
+
     /// Predicate evaluation over a joined row: same core as single-table
     /// `eval_expr` (shared via resolver), with scope-based resolution.
     fn eval_scoped(expr: &Expr, tables: &[Arc<Table>], row: &[Datum]) -> Result<bool> {
@@ -440,30 +469,44 @@ impl Database {
         for t in &tables {
             inputs.push(self.visible_rows(session, t, None)?);
         }
-        // 3. Left-deep joins (hash on equi-keys, nested loop otherwise).
-        let mut rows = inputs[0].clone();
-        for (ji, j) in joins.iter().enumerate() {
-            Self::validate_scoped(&j.on, &tables[..ji + 2])?;
-            let scope: &[Arc<Table>] = &tables[..ji + 2];
-            rows = Self::join_step(scope, &j.on, j.kind, rows, &inputs[ji + 1], deadline)?;
+        // 3. Greedy order: smallest ready INNER join first (LEFT = barrier).
+        //    `tables` keeps written order for output naming (SELECT * star
+        //    expansion below); `exec_*` is the execution layout and owns all
+        //    row positions from here on.
+        let sizes: Vec<usize> = inputs.iter().map(|r| r.len()).collect();
+        let exec_order = order_joins(&joins, &sizes, &|n| Self::scope_table_idx(&tables, n));
+        let exec_tables: Vec<Arc<Table>> =
+            exec_order.iter().map(|&i| tables[i].clone()).collect();
+        let exec_joins: Vec<JoinClause> =
+            exec_order.iter().skip(1).map(|&ti| joins[ti - 1].clone()).collect();
+        let mut exec_inputs: Vec<Vec<Vec<Datum>>> = exec_order
+            .iter()
+            .map(|&i| std::mem::take(&mut inputs[i]))
+            .collect();
+        // 4. Left-deep joins (hash on equi-keys, nested loop otherwise).
+        let mut rows = std::mem::take(&mut exec_inputs[0]);
+        for (ji, j) in exec_joins.iter().enumerate() {
+            Self::validate_scoped(&j.on, &exec_tables[..ji + 2])?;
+            let scope: &[Arc<Table>] = &exec_tables[..ji + 2];
+            rows = Self::join_step(scope, &j.on, j.kind, rows, &exec_inputs[ji + 1], deadline)?;
         }
-        // 4. WHERE over joined rows.
+        // 5. WHERE over joined rows.
         if let Some(sel) = selection.as_ref() {
-            Self::validate_scoped(sel, &tables)?;
+            Self::validate_scoped(sel, &exec_tables)?;
             let mut kept = Vec::with_capacity(rows.len());
             for r in rows {
-                if Self::eval_scoped(sel, &tables, &r)? {
+                if Self::eval_scoped(sel, &exec_tables, &r)? {
                     kept.push(r);
                 }
             }
             rows = kept;
         }
-        // 5. Project or group.
+        // 6. Project or group.
         let has_agg = items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::CountStar));
         let all_agg = !items.is_empty()
             && items.iter().all(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::CountStar));
         if !group_by.is_empty() {
-            return self.exec_grouped(&items, &tables, rows, &group_by, order_by, limit);
+            return self.exec_grouped(&items, &exec_tables, rows, &group_by, order_by, limit);
         }
         if has_agg && !all_agg {
             return Err(Error::NotSupported(
@@ -476,7 +519,7 @@ impl Database {
                 match item {
                     SelectItem::CountStar => aggs.push((None, "COUNT(*)".into())),
                     SelectItem::Aggregate { func, column } => {
-                        let idx = Self::resolve_scope(&tables, column)?;
+                        let idx = Self::resolve_scope(&exec_tables, column)?;
                         aggs.push((Some((*func, idx)), format!("{}({column})", func.name())));
                     }
                     _ => unreachable!(),
@@ -492,7 +535,7 @@ impl Database {
         if !order_by.is_empty() {
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
-                keys.push(Self::resolve_scope(&tables, col)?);
+                keys.push(Self::resolve_scope(&exec_tables, col)?);
             }
             rows.sort_by(|a, b| {
                 for (i, (_, desc)) in order_by.iter().enumerate() {
@@ -509,13 +552,16 @@ impl Database {
         for item in &items {
             match item {
                 SelectItem::Star => {
-                    for (name, idx) in Self::star_columns(&tables) {
+                    // Names follow written order; positions resolve in the
+                    // execution layout (identical row content either way).
+                    for (name, _) in Self::star_columns(&tables) {
+                        let idx = Self::resolve_scope(&exec_tables, &name)?;
                         out_columns.push(name);
                         proj.push(idx);
                     }
                 }
                 SelectItem::Column(c) => {
-                    let idx = Self::resolve_scope(&tables, c)?;
+                    let idx = Self::resolve_scope(&exec_tables, c)?;
                     out_columns.push(Self::proj_output_name(item));
                     proj.push(idx);
                 }

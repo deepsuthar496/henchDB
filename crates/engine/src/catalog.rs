@@ -205,7 +205,8 @@ mod tests {
                 ],
                 pk_idx: 0,
             },
-            indexes: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
         };
         let dbs = vec!["default".to_string()];
         let tables = vec![(def, vec![(vec![9u8], vec![1, 9, 3, 0, 0, 0, 0, 0, 0, 1, 2])])];
@@ -242,7 +243,8 @@ mod tests {
                 ],
                 pk_idx: 0,
             },
-            indexes: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
         };
         let dbs = vec!["default".to_string()];
         let tables = vec![(def, vec![(vec![9u8], vec![1, 9, 3, 0, 0, 0, 0, 0, 0, 1, 2])])];

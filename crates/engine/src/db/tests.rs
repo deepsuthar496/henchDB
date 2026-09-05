@@ -972,3 +972,447 @@ fn hash_join_large_scale() {
     assert_eq!(out.rows[0][0], Datum::Int(15_000));
     let _ = fs::remove_dir_all(&dir);
 }
+
+// -- foreign keys ------------------------------------------------------------
+
+fn fk_setup(dir: &Path) -> Database {
+    let db = Database::open(dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE dept (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute(
+        &mut s,
+        "CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, \
+         FOREIGN KEY (dept_id) REFERENCES dept(id))",
+    )
+    .unwrap();
+    db.execute(&mut s, "INSERT INTO dept VALUES (1, 'eng'), (2, 'ops')")
+        .unwrap();
+    db
+}
+
+fn fk_err_is_violation(r: crate::error::Result<Output>) -> bool {
+    matches!(r, Err(Error::ForeignKeyViolation(_)))
+}
+
+#[test]
+fn fk_valid_insert_and_orphan_rejected() {
+    let dir = std::env::temp_dir().join(format!("hdbfk1_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = fk_setup(&dir);
+    let mut s = db.new_session();
+    // Valid reference + NULL (references nothing) both pass.
+    db.execute(&mut s, "INSERT INTO emp VALUES (10, 1), (11, NULL)")
+        .unwrap();
+    // Orphan fails; failed statement inserts nothing.
+    assert!(fk_err_is_violation(
+        db.execute(&mut s, "INSERT INTO emp VALUES (12, 99)")
+    ));
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM emp").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(2));
+    // Unknown parent table / column rejected at CREATE.
+    assert!(db
+        .execute(
+            &mut s,
+            "CREATE TABLE bad1 (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES nosuch(id))"
+        )
+        .is_err());
+    assert!(db
+        .execute(
+            &mut s,
+            "CREATE TABLE bad2 (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES dept(nosuch))"
+        )
+        .is_err());
+    assert!(db
+        .execute(
+            &mut s,
+            "CREATE TABLE bad3 (id INT PRIMARY KEY, x INT, FOREIGN KEY (nosuch) REFERENCES dept(id))"
+        )
+        .is_err());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_restrict_on_delete() {
+    let dir = std::env::temp_dir().join(format!("hdbfk2_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = fk_setup(&dir);
+    let mut s = db.new_session();
+    db.execute(&mut s, "INSERT INTO emp VALUES (10, 1)").unwrap();
+    // Referenced parent cannot go.
+    assert!(fk_err_is_violation(
+        db.execute(&mut s, "DELETE FROM dept WHERE id = 1")
+    ));
+    // Unreferenced parent can.
+    db.execute(&mut s, "DELETE FROM dept WHERE id = 2").unwrap();
+    // After the child goes, the parent can too.
+    db.execute(&mut s, "DELETE FROM emp WHERE id = 10").unwrap();
+    db.execute(&mut s, "DELETE FROM dept WHERE id = 1").unwrap();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM dept").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(0));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_cascade_on_delete_transitive() {
+    let dir = std::env::temp_dir().join(format!("hdbfk3_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        &mut s,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, \
+         FOREIGN KEY (a_id) REFERENCES a(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    db.execute(
+        &mut s,
+        "CREATE TABLE c (id INT PRIMARY KEY, b_id INT, \
+         FOREIGN KEY (b_id) REFERENCES b(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    db.execute(&mut s, "INSERT INTO a VALUES (1), (2)").unwrap();
+    db.execute(&mut s, "INSERT INTO b VALUES (10, 1), (11, 1), (12, 2)")
+        .unwrap();
+    db.execute(&mut s, "INSERT INTO c VALUES (20, 10), (21, 12)")
+        .unwrap();
+    db.execute(&mut s, "DELETE FROM a WHERE id = 1").unwrap();
+    // b(10, 11) gone transitively with c(20); b(12)/c(21) survive.
+    let out = db.execute(&mut s, "SELECT id FROM b ORDER BY id").unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Datum::Int(12));
+    let out = db.execute(&mut s, "SELECT id FROM c ORDER BY id").unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Datum::Int(21));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_set_null_on_delete() {
+    let dir = std::env::temp_dir().join(format!("hdbfk4_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        &mut s,
+        "CREATE TABLE k (id INT PRIMARY KEY, p_id INT, \
+         FOREIGN KEY (p_id) REFERENCES p(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    db.execute(&mut s, "INSERT INTO p VALUES (1)").unwrap();
+    db.execute(&mut s, "INSERT INTO k VALUES (10, 1)").unwrap();
+    db.execute(&mut s, "DELETE FROM p WHERE id = 1").unwrap();
+    let out = db.execute(&mut s, "SELECT p_id FROM k").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Null);
+    // SET NULL into NOT NULL fails instead of corrupting.
+    let dir2 = std::env::temp_dir().join(format!("hdbfk4b_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir2);
+    let db2 = Database::open(&dir2).unwrap();
+    let mut s2 = db2.new_session();
+    db2.execute(&mut s2, "CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+    db2.execute(
+        &mut s2,
+        "CREATE TABLE n (id INT PRIMARY KEY, p_id INT NOT NULL, \
+         FOREIGN KEY (p_id) REFERENCES p(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    db2.execute(&mut s2, "INSERT INTO p VALUES (1)").unwrap();
+    db2.execute(&mut s2, "INSERT INTO n VALUES (20, 1)").unwrap();
+    assert!(fk_err_is_violation(
+        db2.execute(&mut s2, "DELETE FROM p WHERE id = 1")
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn fk_update_paths() {
+    let dir = std::env::temp_dir().join(format!("hdbfk5_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = fk_setup(&dir);
+    let mut s = db.new_session();
+    db.execute(&mut s, "INSERT INTO emp VALUES (10, 1)").unwrap();
+    // Child FK -> orphan rejected; -> valid parent ok (slow path).
+    assert!(fk_err_is_violation(
+        db.execute(&mut s, "UPDATE emp SET dept_id = 99 WHERE id = 10")
+    ));
+    db.execute(&mut s, "UPDATE emp SET dept_id = 2 WHERE id = 10")
+        .unwrap();
+    // Parent PK change with referencing children rejected (RESTRICT).
+    assert!(fk_err_is_violation(
+        db.execute(&mut s, "UPDATE dept SET id = 7 WHERE id = 2")
+    ));
+    let out = db.execute(&mut s, "SELECT dept_id FROM emp").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(2));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_self_reference_and_txn_visibility() {
+    let dir = std::env::temp_dir().join(format!("hdbfk6_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(
+        &mut s,
+        "CREATE TABLE emp (id INT PRIMARY KEY, mgr INT, \
+         FOREIGN KEY (mgr) REFERENCES emp(id))",
+    )
+    .unwrap();
+    db.execute(&mut s, "INSERT INTO emp VALUES (1, NULL)").unwrap();
+    db.execute(&mut s, "INSERT INTO emp VALUES (2, 1)").unwrap();
+    assert!(fk_err_is_violation(
+        db.execute(&mut s, "INSERT INTO emp VALUES (3, 99)")
+    ));
+    // Explicit txn: parent staged in-txn satisfies the child check.
+    db.execute(&mut s, "BEGIN").unwrap();
+    db.execute(&mut s, "INSERT INTO emp VALUES (4, NULL)").unwrap();
+    db.execute(&mut s, "INSERT INTO emp VALUES (5, 4)").unwrap();
+    db.execute(&mut s, "COMMIT").unwrap();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM emp").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(4));
+    // Rollback discards both sides together.
+    db.execute(&mut s, "BEGIN").unwrap();
+    db.execute(&mut s, "INSERT INTO emp VALUES (6, NULL)").unwrap();
+    db.execute(&mut s, "ROLLBACK").unwrap();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM emp").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(4));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_drop_table_guarded() {
+    let dir = std::env::temp_dir().join(format!("hdbfk7_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = fk_setup(&dir);
+    let mut s = db.new_session();
+    assert!(fk_err_is_violation(db.execute(&mut s, "DROP TABLE dept")));
+    db.execute(&mut s, "DROP TABLE emp").unwrap();
+    db.execute(&mut s, "DROP TABLE dept").unwrap();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_recovery_snapshot_and_wal() {
+    let dir = std::env::temp_dir().join(format!("hdbfk8_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    {
+        let db = fk_setup(&dir);
+        let mut s = db.new_session();
+        db.execute(&mut s, "INSERT INTO emp VALUES (10, 1)").unwrap();
+        db.execute(&mut s, "CHECKPOINT").unwrap();
+    }
+    // Snapshot path: FKs survive the checkpoint.
+    {
+        let db = Database::open(&dir).unwrap();
+        let mut s = db.new_session();
+        assert!(fk_err_is_violation(
+            db.execute(&mut s, "INSERT INTO emp VALUES (11, 99)")
+        ));
+        assert!(fk_err_is_violation(
+            db.execute(&mut s, "DELETE FROM dept WHERE id = 1")
+        ));
+        db.execute(&mut s, "INSERT INTO emp VALUES (11, 2)").unwrap();
+    }
+    // WAL path: post-checkpoint DDL + rows replay too.
+    {
+        let db = Database::open(&dir).unwrap();
+        let mut s = db.new_session();
+        let out = db.execute(&mut s, "SELECT COUNT(*) FROM emp").unwrap();
+        assert_eq!(out.rows[0][0], Datum::Int(2));
+        assert!(fk_err_is_violation(
+            db.execute(&mut s, "INSERT INTO emp VALUES (12, 99)")
+        ));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// -- FK auto-index + greedy join ordering ------------------------------------
+
+fn fk_index_names(db: &Database, s: &mut Session, table: &str) -> Vec<String> {
+    let key = format!("{}.{}", s.current_db, table);
+    let guard = db.tables.read().unwrap();
+    let t = guard.get(&key).unwrap();
+    let mut names: Vec<String> = t.secondary_indexes().iter().map(|d| d.name.clone()).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn fk_auto_index_created_and_guarded() {
+    let dir = std::env::temp_dir().join(format!("hdbfki_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+    // Bare FK column gains an automatic index.
+    db.execute(
+        &mut s,
+        "CREATE TABLE c (id INT PRIMARY KEY, p_id INT, \
+         FOREIGN KEY (p_id) REFERENCES p(id))",
+    )
+    .unwrap();
+    assert_eq!(fk_index_names(&db, &mut s, "c"), vec!["fk_p_id".to_string()]);
+    // Pre-indexed column: no duplicate auto index.
+    db.execute(&mut s, "CREATE INDEX cov ON c (p_id)").unwrap();
+    db.execute(
+        &mut s,
+        "CREATE TABLE c2 (id INT PRIMARY KEY, p_id INT, \
+         FOREIGN KEY (p_id) REFERENCES p(id))",
+    )
+    .unwrap();
+    // c2 gets its own auto index; a second covering index allows dropping
+    // either one, but the last covering index stays protected.
+    assert_eq!(fk_index_names(&db, &mut s, "c2"), vec!["fk_p_id".to_string()]);
+    db.execute(&mut s, "DROP INDEX cov ON c").unwrap();
+    assert_eq!(fk_index_names(&db, &mut s, "c"), vec!["fk_p_id".to_string()]);
+    assert!(fk_err_is_violation(db.execute(&mut s, "DROP INDEX fk_p_id ON c")));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fk_auto_index_recovery_and_seeks() {
+    let dir = std::env::temp_dir().join(format!("hdbfkr_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    {
+        let db = Database::open(&dir).unwrap();
+        let mut s = db.new_session();
+        db.execute(&mut s, "CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+        db.execute(
+            &mut s,
+            "CREATE TABLE c (id INT PRIMARY KEY, p_id INT, \
+             FOREIGN KEY (p_id) REFERENCES p(id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+        db.execute(&mut s, "INSERT INTO p VALUES (1), (2)").unwrap();
+        db.execute(&mut s, "INSERT INTO c VALUES (10, 1), (11, 2)").unwrap();
+        db.execute(&mut s, "CHECKPOINT").unwrap();
+    }
+    // Auto index survives the snapshot and CASCADE still works.
+    {
+        let db = Database::open(&dir).unwrap();
+        let mut s = db.new_session();
+        assert_eq!(fk_index_names(&db, &mut s, "c"), vec!["fk_p_id".to_string()]);
+        db.execute(&mut s, "DELETE FROM p WHERE id = 1").unwrap();
+        let out = db.execute(&mut s, "SELECT id FROM c ORDER BY id").unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], Datum::Int(11));
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn ord_join(table: &str, left: &str, right: &str) -> crate::sql::JoinClause {
+    use crate::sql::{CmpOp, Expr};
+    crate::sql::JoinClause {
+        kind: crate::sql::JoinKind::Inner,
+        table: table.into(),
+        on: Expr::Cmp {
+            left: Box::new(Expr::Column(left.into())),
+            op: CmpOp::Eq,
+            right: Box::new(Expr::Column(right.into())),
+        },
+    }
+}
+
+#[test]
+fn join_order_smallest_ready_first() {
+    use super::plan::order_joins;
+    // a(0) <- b(1), a(0) <- c(2): both ready, smallest (c) wins.
+    let joins = vec![ord_join("b", "a.id", "b.a_id"), ord_join("c", "a.id", "c.a_id")];
+    let resolve = |n: &str| match n {
+        "a.id" => Ok(0),
+        "b.a_id" => Ok(1),
+        "c.a_id" => Ok(2),
+        _ => Err(Error::ColumnNotFound(n.into())),
+    };
+    assert_eq!(order_joins(&joins, &[1000, 800, 5], &resolve), vec![0, 2, 1]);
+    assert_eq!(order_joins(&joins, &[1000, 5, 800], &resolve), vec![0, 1, 2]);
+    // Chained dep (c needs b): b first regardless of size.
+    let chained = vec![ord_join("b", "a.id", "b.a_id"), ord_join("c", "b.id", "c.b_id")];
+    let resolve2 = |n: &str| match n {
+        "a.id" => Ok(0),
+        "b.a_id" | "b.id" => Ok(1),
+        "c.b_id" => Ok(2),
+        _ => Err(Error::ColumnNotFound(n.into())),
+    };
+    assert_eq!(order_joins(&chained, &[1000, 800, 5], &resolve2), vec![0, 1, 2]);
+    // LEFT is a barrier: stays ahead of later INNER joins.
+    let mut left_first = vec![ord_join("b", "a.id", "b.a_id"), ord_join("c", "a.id", "c.a_id")];
+    left_first[0].kind = crate::sql::JoinKind::Left;
+    assert_eq!(order_joins(&left_first, &[1000, 5, 800], &resolve), vec![0, 1, 2]);
+    // INNER joins after the barrier still reorder among themselves.
+    let mut after = vec![
+        ord_join("b", "a.id", "b.a_id"),
+        ord_join("c", "a.id", "c.a_id"),
+        ord_join("d", "a.id", "d.a_id"),
+    ];
+    after[0].kind = crate::sql::JoinKind::Left;
+    let resolve3 = |n: &str| match n {
+        "a.id" => Ok(0),
+        "b.a_id" => Ok(1),
+        "c.a_id" => Ok(2),
+        "d.a_id" => Ok(3),
+        _ => Err(Error::ColumnNotFound(n.into())),
+    };
+    assert_eq!(
+        order_joins(&after, &[1000, 900, 700, 5], &resolve3),
+        vec![0, 1, 3, 2]
+    );
+}
+
+#[test]
+fn join_order_executes_correctly_star_stable() {
+    let dir = std::env::temp_dir().join(format!("hdbjo_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    // Skewed sizes: written order joins mid (50) before tiny (5); greedy
+    // flips them. Star column order must still follow written order.
+    db.execute(&mut s, "CREATE TABLE big (id INT PRIMARY KEY, m INT, t INT)")
+        .unwrap();
+    db.execute(&mut s, "CREATE TABLE mid (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute(&mut s, "CREATE TABLE tiny (id INT PRIMARY KEY, w INT)").unwrap();
+    let mut vals = Vec::new();
+    for i in 0..500 {
+        vals.push(format!("({i}, {}, {})", i % 50, i % 5));
+    }
+    db.execute(&mut s, &format!("INSERT INTO big VALUES {}", vals.join(", ")))
+        .unwrap();
+    let mut vals = Vec::new();
+    for i in 0..50 {
+        vals.push(format!("({i}, {i})"));
+    }
+    db.execute(&mut s, &format!("INSERT INTO mid VALUES {}", vals.join(", ")))
+        .unwrap();
+    db.execute(&mut s, "INSERT INTO tiny VALUES (0, 100), (1, 101), (2, 102), (3, 103), (4, 104)")
+        .unwrap();
+    let out = db
+        .execute(
+            &mut s,
+            "SELECT * FROM big JOIN mid ON big.m = mid.id JOIN tiny ON big.t = tiny.id ORDER BY big.id",
+        )
+        .unwrap();
+    // Written order columns, not execution order (`id` collides in all
+    // three tables, so all three qualify).
+    assert_eq!(
+        out.columns,
+        vec!["big.id", "m", "t", "mid.id", "v", "tiny.id", "w"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(out.rows.len(), 500);
+    assert_eq!(out.rows[0][0], Datum::Int(0));
+    assert_eq!(out.rows[499][0], Datum::Int(499));
+    // LEFT + reorder mix stays correct.
+    let out = db
+        .execute(
+            &mut s,
+            "SELECT COUNT(*) FROM tiny LEFT JOIN big ON tiny.id = big.t JOIN mid ON big.m = mid.id",
+        )
+        .unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(500));
+    let _ = fs::remove_dir_all(&dir);
+}

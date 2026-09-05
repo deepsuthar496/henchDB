@@ -36,12 +36,13 @@ fn parse_create_and_insert() {
     )
     .unwrap();
     match s {
-        Statement::CreateTable { name, columns } => {
+        Statement::CreateTable { name, columns, foreign_keys } => {
             assert_eq!(name, "users");
             assert_eq!(columns.len(), 3);
             assert!(columns[0].primary_key);
             assert!(columns[1].not_null);
             assert!(!columns[2].not_null);
+            assert!(foreign_keys.is_empty());
         }
         other => panic!("wrong stmt {other:?}"),
     }
@@ -287,4 +288,47 @@ fn parse_join_and_group_by() {
         }
         other => panic!("wrong stmt {other:?}"),
     }
+}
+
+#[test]
+fn parse_foreign_keys() {
+    let s = parse_sql(
+        "CREATE TABLE o (oid INT PRIMARY KEY, uid INT, \
+         CONSTRAINT fk_user FOREIGN KEY (uid) REFERENCES users(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    match s {
+        Statement::CreateTable { foreign_keys, .. } => {
+            assert_eq!(foreign_keys.len(), 1);
+            let fk = &foreign_keys[0];
+            assert_eq!(fk.name.as_deref(), Some("fk_user"));
+            assert_eq!(fk.column, "uid");
+            assert_eq!(fk.ref_table, "users");
+            assert_eq!(fk.ref_column, "id");
+            assert_eq!(fk.on_delete, crate::table::FkAction::Cascade);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Defaults to RESTRICT; unnamed; SET NULL parses.
+    let s = parse_sql(
+        "CREATE TABLE o (oid INT PRIMARY KEY, a INT, b INT, \
+         FOREIGN KEY (a) REFERENCES p(id), \
+         FOREIGN KEY (b) REFERENCES p(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    match s {
+        Statement::CreateTable { foreign_keys, .. } => {
+            assert_eq!(foreign_keys.len(), 2);
+            assert_eq!(foreign_keys[0].on_delete, crate::table::FkAction::Restrict);
+            assert!(foreign_keys[0].name.is_none());
+            assert_eq!(foreign_keys[1].on_delete, crate::table::FkAction::SetNull);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Non-RESTRICT ON UPDATE is rejected.
+    assert!(parse_sql(
+        "CREATE TABLE o (oid INT PRIMARY KEY, a INT, \
+         FOREIGN KEY (a) REFERENCES p(id) ON UPDATE CASCADE)"
+    )
+    .is_err());
 }

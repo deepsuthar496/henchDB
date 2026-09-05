@@ -600,6 +600,21 @@ pub(crate) fn encode_table_def_pub(def: &TableDef, out: &mut Vec<u8>) {
         put_str(out, &idx.name);
         put_str(out, &idx.column);
     }
+    // Trailing FK section (same tolerant pattern as indexes above): older
+    // images simply end here and decode to zero FKs; older readers stop
+    // before these bytes (def blobs are length-prefixed). No version bump.
+    out.extend_from_slice(&(def.foreign_keys.len() as u32).to_le_bytes());
+    for fk in &def.foreign_keys {
+        put_str(out, &fk.name);
+        put_str(out, &fk.column);
+        put_str(out, &fk.ref_table);
+        put_str(out, &fk.ref_column);
+        out.push(match fk.on_delete {
+            crate::table::FkAction::Restrict => 0,
+            crate::table::FkAction::Cascade => 1,
+            crate::table::FkAction::SetNull => 2,
+        });
+    }
 }
 
 fn decode_table_def(buf: &[u8], off: &mut usize, legacy_cols: bool) -> Result<TableDef> {
@@ -682,11 +697,46 @@ pub(crate) fn decode_table_def_pub(buf: &[u8], off: &mut usize, legacy_cols: boo
             });
         }
     }
+    let mut foreign_keys = Vec::new();
+    if *off < buf.len() {
+        let nfk = take_u32(buf, off)? as usize;
+        if nfk > 10_000 {
+            return Err(Error::Corrupted("too many FKs in table def".into()));
+        }
+        for _ in 0..nfk {
+            let name = take_str(buf, off)?;
+            let column = take_str(buf, off)?;
+            let ref_table = take_str(buf, off)?;
+            let ref_column = take_str(buf, off)?;
+            let on_delete = take_fk_action(buf, off)?;
+            foreign_keys.push(crate::table::ForeignKeyDef {
+                name,
+                column,
+                ref_table,
+                ref_column,
+                on_delete,
+            });
+        }
+    }
     Ok(TableDef {
         name,
         schema: crate::table::Schema { columns, pk_idx },
         indexes,
+        foreign_keys,
     })
+}
+
+fn take_fk_action(buf: &[u8], off: &mut usize) -> Result<crate::table::FkAction> {
+    let b = *buf
+        .get(*off)
+        .ok_or_else(|| Error::Corrupted("fk: EOF".into()))?;
+    *off += 1;
+    match b {
+        0 => Ok(crate::table::FkAction::Restrict),
+        1 => Ok(crate::table::FkAction::Cascade),
+        2 => Ok(crate::table::FkAction::SetNull),
+        v => Err(Error::Corrupted(format!("unknown FK action {v}"))),
+    }
 }
 
 /// CRC-32 (IEEE, reflected, table-driven). Small, dependency-free, and fast
@@ -737,6 +787,7 @@ mod tests {
                 pk_idx: 0,
             },
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         let mut buf = Vec::new();
         encode_table_def_pub(&def, &mut buf);
@@ -783,6 +834,7 @@ mod tests {
                 pk_idx: 0,
             },
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         wal.append_batch(&[
             Record::CreateTable { txn: 1, def: def.clone() },
@@ -826,6 +878,7 @@ mod tests {
                 pk_idx: 0,
             },
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         wal.append_batch(&[
             Record::CreateTable { txn: 1, def },
