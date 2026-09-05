@@ -33,6 +33,7 @@ pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 struct ServerOpts {
     port: u16,
     max_connections: usize,
+    max_conn_per_sec: u32,
     idle_timeout: Option<Duration>,
     allow_legacy: bool,
     /// PEM certificate chain for TLS (SEC2). Both must be set to enable.
@@ -46,6 +47,9 @@ impl ServerOpts {
         let max_connections: usize = arg_value(args, "--max-connections")
             .and_then(|m| m.parse().ok())
             .unwrap_or(200);
+        let max_conn_per_sec: u32 = arg_value(args, "--max-conn-per-sec")
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(500);
         let idle_timeout: Option<Duration> = match arg_value(args, "--idle-timeout") {
             Some(s) => s.parse::<u64>().ok().map(Duration::from_secs),
             None => Some(Duration::from_secs(28_800)), // MySQL wait_timeout default
@@ -54,6 +58,7 @@ impl ServerOpts {
         ServerOpts {
             port,
             max_connections,
+            max_conn_per_sec,
             idle_timeout,
             allow_legacy,
             tls_cert: arg_value(args, "--tls-cert"),
@@ -624,6 +629,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     println!("connect: mysql -h 127.0.0.1 -P {} -u root", opts.port);
     let active = Arc::new(Mutex::new(0usize));
     let registry = ConnRegistry::default();
+    let rate_limiter = Arc::new(wire::RateLimiter::new(opts.max_conn_per_sec));
     // One process-wide drain flag shared by every connection: COM_SHUTDOWN
     // sets it from any wire thread; signals set the static below, which the
     // accept loop merges in.
@@ -659,6 +665,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                 let auth_path = auth_path.clone();
                 let registry = registry.clone();
                 let draining = draining.clone();
+                let rate_limiter = rate_limiter.clone();
                 handles.push(std::thread::spawn(move || {
                     let _guard = guard; // slot released when the thread ends
                     let ctx = wire::ConnCtx {
@@ -667,6 +674,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                         shutdown: draining,
                         admitted,
                         tls,
+                        rate_limiter: Some(rate_limiter),
                     };
                     let r = handle_auto(db, stream, &opts, &ctx);
                     registry.remove(reg_id);

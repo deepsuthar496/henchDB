@@ -278,6 +278,9 @@ impl Database {
         if let Some(out) = self.try_fast_point_select(session, trimmed)? {
             return Ok(out);
         }
+        if let Some(out) = self.try_fast_range_select(session, trimmed)? {
+            return Ok(out);
+        }
         if let Some(out) = self.try_fast_point_update(session, trimmed)? {
             return Ok(out);
         }
@@ -286,7 +289,7 @@ impl Database {
     }
 
     fn try_fast_point_select(&self, session: &Session, sql: &str) -> Result<Option<Output>> {
-        if session.txn.is_some() {
+        if session.txn.is_some() || session.snapshot.is_some() {
             return Ok(None);
         }
         let s = sql.strip_suffix(';').unwrap_or(sql).trim();
@@ -311,7 +314,7 @@ impl Database {
         let table_name = rest[..where_pos].trim();
         let where_clause = rest[where_pos + 7..].trim();
 
-        if table_name.contains(|c: char| c.is_whitespace()) || col_clause.contains(',') {
+        if table_name.contains(|c: char| c.is_whitespace()) {
             return Ok(None);
         }
 
@@ -338,9 +341,23 @@ impl Database {
             return Ok(None);
         }
 
-        let col_idx = match schema.index_of(col_clause) {
-            Some(i) => i,
-            None => return Ok(None),
+        let (out_cols, col_indices) = if col_clause == "*" {
+            let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let idxs: Vec<usize> = (0..schema.columns.len()).collect();
+            (names, idxs)
+        } else {
+            let mut names = Vec::new();
+            let mut idxs = Vec::new();
+            for c in col_clause.split(',') {
+                let name = c.trim();
+                let idx = match schema.index_of(name) {
+                    Some(i) => i,
+                    None => return Ok(None),
+                };
+                names.push(name.to_string());
+                idxs.push(idx);
+            }
+            (names, idxs)
         };
 
         let key = encode_key(&pk_val)?;
@@ -348,17 +365,120 @@ impl Database {
             Some(r) => r,
             None => {
                 return Ok(Some(Output {
-                    columns: vec![col_clause.to_string()],
+                    columns: out_cols,
                     rows: vec![],
                     message: "OK".into(),
                 }))
             }
         };
         let row = table_arc.decode_stored(&raw)?;
-        let val = row[col_idx].clone();
+        let out_row: Vec<Datum> = col_indices.iter().map(|&i| row[i].clone()).collect();
         Ok(Some(Output {
-            columns: vec![col_clause.to_string()],
-            rows: vec![vec![val]],
+            columns: out_cols,
+            rows: vec![out_row],
+            message: "OK".into(),
+        }))
+    }
+
+    fn try_fast_range_select(&self, session: &Session, sql: &str) -> Result<Option<Output>> {
+        if session.txn.is_some() || session.snapshot.is_some() {
+            return Ok(None);
+        }
+        let s = sql.strip_suffix(';').unwrap_or(sql).trim();
+        if s.len() < 20 {
+            return Ok(None);
+        }
+        if !s.get(..7).map_or(false, |p| p.eq_ignore_ascii_case("SELECT ")) {
+            return Ok(None);
+        }
+        let rest = s[7..].trim_start();
+        let from_pos = match rest.to_ascii_lowercase().find(" from ") {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let col_clause = rest[..from_pos].trim();
+        let rest = rest[from_pos + 6..].trim_start();
+
+        let where_pos = match rest.to_ascii_lowercase().find(" where ") {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let table_name = rest[..where_pos].trim();
+        let where_clause = rest[where_pos + 7..].trim();
+
+        if table_name.contains(|c: char| c.is_whitespace()) {
+            return Ok(None);
+        }
+
+        let between_pos = match where_clause.to_ascii_lowercase().find(" between ") {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let pk_col = where_clause[..between_pos].trim();
+        let rest_where = where_clause[between_pos + 9..].trim();
+
+        let and_pos = match rest_where.to_ascii_lowercase().find(" and ") {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let lo_str = rest_where[..and_pos].trim();
+        let hi_str = rest_where[and_pos + 5..].trim();
+
+        if pk_col.contains(|c: char| c.is_whitespace())
+            || lo_str.contains(|c: char| c.is_whitespace())
+            || hi_str.contains(|c: char| c.is_whitespace())
+        {
+            return Ok(None);
+        }
+
+        let lo_val = match parse_simple_literal(lo_str) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let hi_val = match parse_simple_literal(hi_str) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let table_arc = match self.table(session, table_name) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let schema = table_arc.schema();
+
+        if schema.columns[schema.pk_idx].name != pk_col {
+            return Ok(None);
+        }
+
+        let (out_cols, col_indices) = if col_clause == "*" {
+            let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let idxs: Vec<usize> = (0..schema.columns.len()).collect();
+            (names, idxs)
+        } else {
+            let mut names = Vec::new();
+            let mut idxs = Vec::new();
+            for c in col_clause.split(',') {
+                let name = c.trim();
+                let idx = match schema.index_of(name) {
+                    Some(i) => i,
+                    None => return Ok(None),
+                };
+                names.push(name.to_string());
+                idxs.push(idx);
+            }
+            (names, idxs)
+        };
+
+        let scanned = table_arc.scan_range(Some((&lo_val, true)), Some((&hi_val, true)))?;
+        let mut out_rows = Vec::with_capacity(scanned.len());
+        for (_, row) in scanned {
+            let out_row: Vec<Datum> = col_indices.iter().map(|&i| row[i].clone()).collect();
+            out_rows.push(out_row);
+        }
+
+        Ok(Some(Output {
+            columns: out_cols,
+            rows: out_rows,
             message: "OK".into(),
         }))
     }
@@ -377,13 +497,14 @@ impl Database {
                 Ok(Output::ok("BEGIN"))
             }
             Statement::Commit => {
-                let txn = session.txn.take().ok_or(Error::TxnNotActive)?;
-                self.commit_txn(txn.id, txn.staged)?;
+                if let Some(txn) = session.txn.take() {
+                    self.commit_txn(txn.id, txn.staged)?;
+                }
                 self.snapshot_end(session);
                 Ok(Output::ok("COMMIT"))
             }
             Statement::Rollback => {
-                session.txn.take().ok_or(Error::TxnNotActive)?;
+                session.txn.take();
                 self.snapshot_end(session);
                 Ok(Output::ok("ROLLBACK"))
             }

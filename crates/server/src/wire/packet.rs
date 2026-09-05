@@ -168,8 +168,17 @@ pub fn write_packet<W: Write>(writer: &mut W, payload: &[u8], seq: &mut u8) -> s
             ((chunk >> 16) & 0xFF) as u8,
             *seq,
         ];
-        writer.write_all(&h)?;
-        writer.write_all(&payload[off..off + chunk])?;
+        if chunk <= 1024 {
+            let mut buf = [0u8; 1028];
+            buf[..4].copy_from_slice(&h);
+            buf[4..4 + chunk].copy_from_slice(&payload[off..off + chunk]);
+            writer.write_all(&buf[..4 + chunk])?;
+        } else {
+            let mut buf = Vec::with_capacity(4 + chunk);
+            buf.extend_from_slice(&h);
+            buf.extend_from_slice(&payload[off..off + chunk]);
+            writer.write_all(&buf)?;
+        }
         *seq = seq.wrapping_add(1);
         off += chunk;
         if chunk == MAX_PACKET && off >= payload.len() {

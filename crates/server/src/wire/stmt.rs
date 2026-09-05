@@ -141,15 +141,16 @@ pub fn parse_affected(message: &str) -> u64 {
 }
 
 pub fn write_output<W: Write>(
-    writer: &mut W,
+    raw_writer: &mut W,
     seq: &mut u8,
     out: &Output,
     deprecate_eof: bool,
     binary: bool,
 ) -> std::io::Result<()> {
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, raw_writer);
     if out.columns.is_empty() {
         let p = ok_payload(parse_affected(&out.message), &out.message);
-        write_packet(writer, &p, seq)?;
+        write_packet(&mut writer, &p, seq)?;
         writer.flush()?;
         return Ok(());
     }
@@ -179,46 +180,46 @@ pub fn write_output<W: Write>(
         let rows = match bin_rows.unwrap() {
             Ok(r) => r,
             Err(msg) => {
-                write_packet(writer, &err_payload(1047, "HY000", &msg), seq)?;
+                write_packet(&mut writer, &err_payload(1047, "HY000", &msg), seq)?;
                 writer.flush()?;
                 return Ok(());
             }
         };
-        write_packet(writer, &c, seq)?;
+        write_packet(&mut writer, &c, seq)?;
         for d in &defs {
-            write_packet(writer, d, seq)?;
+            write_packet(&mut writer, d, seq)?;
         }
         if !deprecate_eof {
-            write_packet(writer, &eof_payload(), seq)?;
+            write_packet(&mut writer, &eof_payload(), seq)?;
         }
         for r in &rows {
-            write_packet(writer, r, seq)?;
+            write_packet(&mut writer, r, seq)?;
         }
         if deprecate_eof {
-            write_packet(writer, &ok_payload(0, ""), seq)?;
+            write_packet(&mut writer, &ok_payload(0, ""), seq)?;
         } else {
-            write_packet(writer, &eof_payload(), seq)?;
+            write_packet(&mut writer, &eof_payload(), seq)?;
         }
         writer.flush()?;
         return Ok(());
     }
-    write_packet(writer, &c, seq)?;
+    write_packet(&mut writer, &c, seq)?;
     for d in &defs {
-        write_packet(writer, d, seq)?;
+        write_packet(&mut writer, d, seq)?;
     }
     if !deprecate_eof {
-        write_packet(writer, &eof_payload(), seq)?;
+        write_packet(&mut writer, &eof_payload(), seq)?;
     }
     for row in &out.rows {
-        write_packet(writer, &row_payload(row), seq)?;
+        write_packet(&mut writer, &row_payload(row), seq)?;
     }
     if deprecate_eof {
         let p = ok_payload(0, "");
         // OK-as-EOF: server must set 0xFE semantics via caps; minimal OK works
         // for clients that skip the trailing EOF.
-        write_packet(writer, &p, seq)?;
+        write_packet(&mut writer, &p, seq)?;
     } else {
-        write_packet(writer, &eof_payload(), seq)?;
+        write_packet(&mut writer, &eof_payload(), seq)?;
     }
     writer.flush()?;
     Ok(())

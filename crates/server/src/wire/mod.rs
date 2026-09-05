@@ -27,11 +27,11 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use engine::Database;
 
@@ -93,6 +93,40 @@ fn execute_statements<W: std::io::Write>(
     Ok(())
 }
 
+/// Connection rate limiter for IP flood protection (DoS protection).
+pub struct RateLimiter {
+    per_ip: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    max_per_sec: u32,
+}
+
+impl RateLimiter {
+    pub fn new(max_per_sec: u32) -> Self {
+        RateLimiter {
+            per_ip: Mutex::new(HashMap::new()),
+            max_per_sec,
+        }
+    }
+
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut guard = self.per_ip.lock().unwrap();
+        if guard.len() > 1000 {
+            guard.retain(|_, (_, start)| now.duration_since(*start) < Duration::from_secs(5));
+        }
+        let entry = guard.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) >= Duration::from_secs(1) {
+            entry.0 = 1;
+            entry.1 = now;
+            true
+        } else if entry.0 < self.max_per_sec {
+            entry.0 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Per-connection server policy, built by `serve` in main.rs.
 pub struct ConnCtx {
     /// Path to `auth.bin` (reloaded per connection, so `passwd` applies live).
@@ -106,6 +140,8 @@ pub struct ConnCtx {
     /// TLS config when `--tls-cert`/`--tls-key` were given. `None` means
     /// plaintext only (SSLRequest fails closed with an error).
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Rate limiter for DoS / IP flood protection.
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 /// MySQL access-denied error (1045/28000), same shape for unknown users and
@@ -136,6 +172,16 @@ pub fn handle_mysql_connection(
     let mut stmts: HashMap<u32, Prepared> = HashMap::new();
     let mut next_stmt_id: u32 = 1;
 
+    let mut sseq: u8 = 0;
+    if let Some(limiter) = &ctx.rate_limiter {
+        if !limiter.check(peer.ip()) {
+            eprintln!("connection rate limit exceeded for {peer}");
+            write_packet(&mut stream, &err_payload(1040, "HY000", "Connection rate limit exceeded"), &mut sseq)?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
+
     // -- Handshake (fresh 20-byte scramble per connection: replay across
     // sessions is impossible even though the scramble travels in clear). --
     let conn_id = std::process::id() ^ (std::time::SystemTime::now()
@@ -143,7 +189,6 @@ pub fn handle_mysql_connection(
         .map(|d| d.subsec_nanos())
         .unwrap_or(0));
     let scramble = fresh_scramble();
-    let mut sseq: u8 = 0;
     // CLIENT_SSL is advertised only when a certificate is configured.
     let caps = SERVER_CAPS | if ctx.tls.is_some() { CAP_SSL } else { 0 };
     write_packet(&mut stream, &handshake_payload(conn_id, &scramble, AUTH_PLUGIN, caps), &mut sseq)?;
