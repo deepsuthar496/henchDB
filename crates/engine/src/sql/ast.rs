@@ -171,6 +171,9 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    StartTransaction {
+        snapshot: bool,
+    },
     ShowTables,
     Checkpoint,
     CreateIndex {

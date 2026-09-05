@@ -127,6 +127,18 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Begin)
             }
+            Some("START") => {
+                // START TRANSACTION [WITH CONSISTENT SNAPSHOT]
+                self.pos += 1;
+                self.expect_kw("TRANSACTION")?;
+                let mut snapshot = false;
+                if self.eat_kw("WITH") {
+                    self.expect_kw("CONSISTENT")?;
+                    self.expect_kw("SNAPSHOT")?;
+                    snapshot = true;
+                }
+                Ok(Statement::StartTransaction { snapshot })
+            }
             Some("COMMIT") => {
                 self.pos += 1;
                 Ok(Statement::Commit)

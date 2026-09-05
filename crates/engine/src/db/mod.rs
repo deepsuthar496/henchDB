@@ -29,10 +29,12 @@ use crate::sql::{eval_expr, parse_sql, Expr, Statement};
 use crate::table::{Schema, Table, TableDef};
 use crate::types::{decode_key, encode_key, ColumnType, Datum};
 use crate::wal::{Record, Wal};
+use mvcc::SnapshotPin;
 
 use plan::{access_path, AccessPath};
 
 pub(crate) mod fk;
+pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub(crate) mod query;
 
@@ -63,6 +65,8 @@ pub struct Session {
     pub(crate) txn: Option<ActiveTxn>,
     pub current_db: String,
     pub max_execution_time: Option<Duration>,
+    /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
+    pub(crate) snapshot: Option<SnapshotPin>,
 }
 
 impl Default for Session {
@@ -71,6 +75,7 @@ impl Default for Session {
             txn: None,
             current_db: "default".to_string(),
             max_execution_time: None,
+            snapshot: None,
         }
     }
 }
@@ -107,6 +112,11 @@ pub struct Database {
     in_flight: Mutex<HashSet<(String, Vec<u8>)>>,
     next_txn: AtomicU64,
     epoch: Arc<crate::epoch::EpochManager>,
+    /// Monotonic commit epoch for MVCC (allocated under the commit lock, so
+    /// epochs follow WAL order). Starts at 1; post-open rows read as epoch 0.
+    commit_epoch: AtomicU64,
+    /// MVCC version buffer + snapshot registry (F3). Empty in plain OLTP.
+    versions: RwLock<mvcc::VersionState>,
 }
 
 /// Default overflow-pool size: 8 frames x 256 KiB = 2 MiB resident. Small
@@ -141,6 +151,7 @@ impl Database {
                 }
                 let table = Arc::new(Table::new(def));
                 table.set_pool(pool.clone());
+                table.set_epoch_manager(epoch.clone());
                 for row in rows {
                     match row.key {
                         Some(key) => table.restore_kv(&key, &row.value)?,
@@ -157,7 +168,7 @@ impl Database {
             match rec {
                 Record::Commit { txn } => {
                     if let Some(batch) = pending.remove(&txn) {
-                        apply_records(&mut databases, &mut tables, &pool, batch)?;
+                        apply_records(&mut databases, &mut tables, &pool, &epoch, batch)?;
                     }
                 }
                 other => {
@@ -188,6 +199,8 @@ impl Database {
             in_flight: Mutex::new(HashSet::new()),
             next_txn: AtomicU64::new(1),
             epoch,
+            commit_epoch: AtomicU64::new(1),
+            versions: RwLock::new(mvcc::VersionState::new()),
         })
     }
 
@@ -240,6 +253,9 @@ impl Database {
         // Re-base the install frontier: offsets restart after the truncate.
         let frontier = self.wal.next_offset();
         *self.install.lock().unwrap() = frontier;
+        // History unreachable by live readers drains here (everything, when
+        // no snapshot is active).
+        self.gc_versions();
         Ok(())
     }
 
@@ -363,11 +379,20 @@ impl Database {
             Statement::Commit => {
                 let txn = session.txn.take().ok_or(Error::TxnNotActive)?;
                 self.commit_txn(txn.id, txn.staged)?;
+                self.snapshot_end(session);
                 Ok(Output::ok("COMMIT"))
             }
             Statement::Rollback => {
                 session.txn.take().ok_or(Error::TxnNotActive)?;
+                self.snapshot_end(session);
                 Ok(Output::ok("ROLLBACK"))
+            }
+            Statement::StartTransaction { snapshot } => {
+                if snapshot {
+                    self.snapshot_begin(session)
+                } else {
+                    return self.execute_stmt(session, Statement::Begin);
+                }
             }
             Statement::ShowTables => {
                 let prefix = format!("{}.", session.current_db);
@@ -525,6 +550,7 @@ impl Database {
             let mut tables = self.tables.write().unwrap();
             tables.retain(|k, _| !k.starts_with(&prefix));
         }
+        self.purge_db_versions(&prefix);
 
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
@@ -621,6 +647,7 @@ impl Database {
                 return Err(Error::TableExists(name));
             }
             table.set_pool(self.pool.clone());
+            table.set_epoch_manager(self.epoch.clone());
             guard.insert(key, table);
         }
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
@@ -639,6 +666,7 @@ impl Database {
             let mut guard = self.tables.write().unwrap();
             guard.remove(&key).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
         }
+        self.purge_table_versions(&key);
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
             Record::DropTable {
@@ -864,9 +892,11 @@ impl Database {
             Record::Commit { txn: txn_id },
         ];
 
-        let (start, end) = {
+        let (start, end, commit_epoch) = {
             let _guard = self.commit_lock.lock().unwrap();
-            self.wal.append_records(&records)?
+            let commit_epoch = self.alloc_commit_epoch();
+            let offsets = self.wal.append_records(&records)?;
+            (offsets.0, offsets.1, commit_epoch)
         };
 
         self.wal.wait_durable(end)?;
@@ -876,6 +906,7 @@ impl Database {
             while *frontier != start {
                 frontier = self.install_cv.wait(frontier).unwrap();
             }
+            self.record_install(table, &key, Some(&enc), commit_epoch)?;
             table.apply_raw(&key, &enc)?;
             *frontier = end;
             drop(frontier);
@@ -1112,8 +1143,9 @@ impl Database {
 
         let has_inserts = staged.values().any(|w| w.is_insert);
 
-        // Phase A: validation + append under the short commit_lock.
-        let (start, end) = {
+        // Phase A: validation + append under the short commit_lock. The
+        // MVCC commit epoch is allocated here so epochs follow WAL order.
+        let (start, end, commit_epoch) = {
             let _guard = self.commit_lock.lock().unwrap();
             // Duplicate-key check covers both installed state and commits
             // that are appended-but-not-yet-installed (in flight).
@@ -1131,6 +1163,7 @@ impl Database {
                     }
                 }
             }
+            let commit_epoch = self.alloc_commit_epoch();
             let offsets = self.wal.append_records(&records)?;
             if has_inserts {
                 let mut in_flight = self.in_flight.lock().unwrap();
@@ -1140,7 +1173,7 @@ impl Database {
                     }
                 }
             }
-            offsets
+            (offsets.0, offsets.1, commit_epoch)
         };
 
         // Phase B: group commit — one fsync by the syncer covers us plus
@@ -1155,6 +1188,9 @@ impl Database {
             }
             for (((table, key), _), enc_opt) in staged.iter().zip(encoded_rows.into_iter()) {
                 let t = &tables[table];
+                // MVCC: preserve the superseded state before overwriting
+                // (skipped internally when no snapshot reader is active).
+                self.record_install(t, key, enc_opt.as_deref(), commit_epoch)?;
                 match enc_opt {
                     Some(enc) => t.apply_raw(key, &enc)?,
                     None => t.remove_raw(key),
@@ -1186,10 +1222,12 @@ impl Database {
             }
         }
         let raw = table.tree().get(key);
-        match raw {
-            Some(buf) => Ok(Some(table.decode_stored(&buf)?)),
-            None => Ok(None),
-        }
+        let current = match raw {
+            Some(buf) => Some(table.decode_stored(&buf)?),
+            None => None,
+        };
+        // Snapshot readers time-travel; everyone else sees current state.
+        self.snapshot_lookup(session, table, key, current)
     }
 
     /// All rows of a table visible to the session: committed tree state,
@@ -1216,6 +1254,14 @@ impl Database {
         });
 
         let mut rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+        // Point/secondary paths resolve per key through `visible_row`
+        // (snapshot-aware); range/full scans below read committed rows and
+        // are substituted afterwards. IN-list order is preserved (no
+        // re-sorting) on the multi-point paths.
+        let ordered_points = matches!(
+            access_path(table, selection)?,
+            AccessPath::PkIn(_) | AccessPath::SecIn { .. }
+        );
         match access_path(table, selection)? {
             AccessPath::Point(lit) => {
                 let key = encode_key(&lit)?;
@@ -1291,6 +1337,28 @@ impl Database {
                         }
                     }
                     rows.push((k, table.decode_stored(&raw)?));
+                }
+            }
+        }
+
+        // Snapshot substitution for scan paths (point paths already went
+        // through `visible_row`): rows created after the pin vanish, rows
+        // deleted after it are restored from history.
+        if session.snapshot.is_some() {
+            let mut present: HashSet<Vec<u8>> = HashSet::new();
+            let mut kept: Vec<(Vec<u8>, Vec<Datum>)> = Vec::with_capacity(rows.len());
+            for (k, r) in rows {
+                if let Some(hist) = self.snapshot_lookup(session, table, &k, Some(r))? {
+                    present.insert(k.clone());
+                    kept.push((k, hist));
+                }
+            }
+            rows = kept;
+            let extra = self.snapshot_scan_extra(session, table, &present)?;
+            if !extra.is_empty() {
+                rows.extend(extra);
+                if !ordered_points {
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
                 }
             }
         }
@@ -1372,6 +1440,7 @@ fn apply_records(
     databases: &mut HashSet<String>,
     tables: &mut HashMap<String, Arc<Table>>,
     pool: &Arc<BufferPool>,
+    epoch: &Arc<crate::epoch::EpochManager>,
     batch: Vec<Record>,
 ) -> Result<()> {
     for rec in batch {
@@ -1388,6 +1457,7 @@ fn apply_records(
                 if !tables.contains_key(&def.name) {
                     let t = Arc::new(Table::new(def));
                     t.set_pool(pool.clone());
+                    t.set_epoch_manager(epoch.clone());
                     tables.insert(t.def.name.clone(), t);
                 }
             }

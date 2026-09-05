@@ -332,3 +332,17 @@ fn parse_foreign_keys() {
     )
     .is_err());
 }
+
+#[test]
+fn parse_start_transaction() {
+    match parse_sql("START TRANSACTION").unwrap() {
+        Statement::StartTransaction { snapshot } => assert!(!snapshot),
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT").unwrap() {
+        Statement::StartTransaction { snapshot } => assert!(snapshot),
+        other => panic!("wrong stmt {other:?}"),
+    }
+    assert!(parse_sql("START TRANSACTION WITH FOO").is_err());
+    assert!(parse_sql("START FOO").is_err());
+}

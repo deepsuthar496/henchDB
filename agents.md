@@ -86,10 +86,10 @@ you upgrade a component, update the row and the module doc comment.
 
 | Area | v0.1 implementation | Roadmap (research.md) |
 |---|---|---|
-| Index | Typed OLC B+ tree, `MAX_KEYS=128`, nodes never freed | Prefix + 4-byte-head SIMD search, swizzled tree nodes (`research.md` §Storage); value overflow paging is done (see Storage row) |
+| Index | Typed OLC B+ tree, `MAX_KEYS=128`, borrow/merge on delete (`MIN_KEYS=64`) + root collapse + EBR retire | Prefix + 4-byte-head SIMD search, swizzled tree nodes (`research.md` §Storage); value overflow paging is done (see Storage row) |
 | Storage | 256 KiB slotted pages + 64-bit swips + write-through cooling pool (`page.rs`); rows >1 KiB spill off-page with epoch-quarantined reuse; snapshot v2 carries key/value pairs, WAL carries full rows | Swizzled tree nodes, page GC / free-space persistence across restart, write-back batching, io_uring `IOPOLL` (Linux-only, `cfg`-gate it) |
-| Reads | Optimistic version snapshot + validate, restart on mismatch | Same, plus EBR for node reclamation |
-| Writes | Session-staged write set; commit takes one commit lock, validates, WAL-batches, installs | MVCC version buffer, per-core WAL shards, Early Lock Release, column-granular versioning (RCC) |
+| Reads | Optimistic version snapshot + validate, restart on mismatch | Same (EBR now retires merged-away tree nodes) |
+| Writes | Session-staged write set; commit takes one commit lock, validates, WAL-batches, installs (allocating an MVCC commit epoch); installs record superseded rows while snapshot readers are active | Per-core WAL shards, Early Lock Release, column-granular versioning (RCC) |
 | Durability | Single WAL file, CRC32 per record, per-txn redo on recovery, snapshot + WAL truncate checkpoint. **Group commit implemented**: commits append under a short lock, one background syncer batches concurrent commits into one fsync (200us collection window), installs happen strictly in WAL-offset order (install frontier + condvar); DDL goes through the same sequencer via `Database::wal_commit` | Per-core WAL buffers (shard the current WAL), io_uring `IOPOLL` (Linux-only, `cfg`-gate it), parallel replay |
 | Concurrency | Single commit lock (serializes installs) | Lock-free commit pipelines; keep commit lock only as the correctness fallback |
 | SQL | Hand-written lexer/parser (`sql/` modules); SELECT/INSERT/UPDATE/DELETE/DDL/BEGIN/COMMIT/ROLLBACK/SHOW TABLES/CHECKPOINT; WHERE = AND/OR/NOT + IN/BETWEEN/LIKE over column-vs-literal ANDed (parens, precedence); index access paths on PK (point/multi-point/range) + secondary; AUTO_INCREMENT integer PKs; SUM/AVG/MIN/MAX (+COUNT); INNER/LEFT JOIN (hash join on equi-keys, nested-loop fallback, greedy smallest-ready-first ordering with LEFT barriers); FOREIGN KEY (RESTRICT/CASCADE/SET NULL, auto-indexed columns, PK/secondary/scan seeks) | sqlparser-rs MySQL dialect, Cascades memo optimizer (greedy covers common shapes), morsel-driven vectorized execution (Arrow), GROUP BY pushdown |
@@ -98,8 +98,9 @@ you upgrade a component, update the row and the module doc comment.
 Known v0.1 simplifications (intentional, do not "fix" silently — implement
 the roadmap item instead):
 
-- **No B+ tree merges**: deletes leave sparse leaves; correctness is
-  unaffected. Merge/rebalance must be designed together with EBR.
+- **Sparse-leaf residue**: deletes rebalance via borrow/merge, but branches
+  never visited by a delete path stay sparse (correct, just sparse); a
+  background defragmentation pass is the follow-up.
 - **DDL is autocommit** and serialized through the commit lock.
 - **No secondary indexes**: PK range scans only; the executor falls back to
   full scan + filter.
@@ -143,8 +144,9 @@ the roadmap item instead):
    wrapped in a fresh parent under the root mutex when full. Therefore a
    writer never meets a full node except a stale root clone (`Descend::Restart`).
 4. Readers: snapshot version → read → validate → retry from root on
-   mismatch. Nodes are never freed while the tree lives; if you introduce
-   reclamation you must introduce EBR first.
+   mismatch. Merged-away nodes unlink (parent + leaf `next`) and retire
+   through EBR (`BTree::set_epoch_manager`); the `Arc` keeps stale readers
+   memory-safe until they restart.
 5. Structural changes (children lists, separators, leaf `next`) are always
    made while holding the parent's exclusive latch so optimistic readers of
    that parent spin through the transition.

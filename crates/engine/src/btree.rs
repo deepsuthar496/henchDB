@@ -2,10 +2,7 @@
 //!
 //! Read path: fully optimistic — traverse the tree taking only version
 //! snapshots (no writes to shared memory), then validate. A mismatch means a
-//! writer raced the read; the traversal restarts from the root. Nodes are
-//! never physically freed while the tree is alive, which makes stale pointers
-//! safe to dereference; epoch-based reclamation per the research doc is the
-//! planned upgrade (see agents.md).
+//! writer raced the read; the traversal restarts from the root.
 //!
 //! Write path: top-down lock coupling — a writer locks the child while still
 //! holding the parent, then releases the parent. Deadlock-free because
@@ -20,6 +17,22 @@
 //! so concurrent readers see either the complete old tree or the complete new
 //! one. Every node on the descent is therefore guaranteed non-full when a
 //! writer arrives, and no split result ever needs to propagate upward.
+//!
+//! Deletion mirrors insertion: `remove()` deletes the key, then runs
+//! fix-up passes that borrow from (or merge with) a sibling whenever a node
+//! drops below half full. Borrow/merge mutations happen while the parent's
+//! exclusive latch is held, so optimistic readers spin through the whole
+//! transition and re-validate afterwards. Merged-away nodes are unlinked
+//! (parent pointer + leaf `next` chain) and their `Arc` is handed to the
+//! `EpochManager` for reclamation; the `Arc` itself keeps stale readers
+//! memory-safe until they restart. A root left with one child collapses
+//! under the root mutex (the reverse of wrapping).
+//!
+//! Latch discipline for the fix-up pass: a writer holds the parent latch
+//! while acquiring the child latch, then the sibling latch. This is
+//! deadlock-free: same-level latches are only ever taken while the common
+//! parent is exclusively held (serializing all such writers), and every
+//! other path acquires latches strictly root→leaf, one at a time.
 //!
 //! # Memory-model note
 //!
@@ -36,11 +49,17 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::epoch::EpochManager;
 use crate::latch::HybridLatch;
 
 /// Split threshold per node. (Future: fixed 256 KiB slotted pages with
 /// prefix compression + 4-byte-head SIMD search, per the research doc.)
 const MAX_KEYS: usize = 128;
+/// Merge threshold: a non-root node holding fewer keys (leaves) or children
+/// (internals) than this borrows from a sibling, or merges when both are
+/// sparse. Merged pairs always fit: each side holds < MIN_KEYS entries, so
+/// their sum stays under MAX_KEYS.
+const MIN_KEYS: usize = MAX_KEYS / 2;
 
 enum NodeBody {
     Leaf {
@@ -142,6 +161,10 @@ pub struct BTree {
     root: Mutex<Arc<Node>>,
     /// Monotonic structural-change counter, exposed for diagnostics.
     splits: AtomicU64,
+    /// Epoch manager for merged-away nodes. `None` keeps `BTree` usable
+    /// standalone (merges still unlink; the dropped `Arc` frees memory once
+    /// stale readers release it); `Database` always attaches one.
+    epoch: Mutex<Option<Arc<EpochManager>>>,
 }
 
 enum Descend {
@@ -157,7 +180,31 @@ impl BTree {
         BTree {
             root: Mutex::new(Node::new_leaf()),
             splits: AtomicU64::new(0),
+            epoch: Mutex::new(None),
         }
+    }
+
+    /// Attach the database's epoch manager so merged-away nodes retire
+    /// through EBR (called by `Database::open` for every table, mirroring
+    /// the page-pool attachment).
+    pub fn set_epoch_manager(&self, manager: Arc<EpochManager>) {
+        *self.epoch.lock().unwrap() = Some(manager);
+    }
+
+    /// Attached epoch manager, if any (used to propagate to new indexes).
+    pub(crate) fn epoch_manager(&self) -> Option<Arc<EpochManager>> {
+        self.epoch.lock().unwrap().clone()
+    }
+
+    /// Reclaim retired nodes whose epochs have passed (no-op without an
+    /// attached manager). Returns the reclaimed count.
+    pub fn reclaim(&self) -> usize {
+        self.epoch
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|ep| ep.try_reclaim())
+            .unwrap_or(0)
     }
 
     fn current_root(&self) -> Arc<Node> {
@@ -353,11 +400,307 @@ impl BTree {
         }
     }
 
-    /// Remove `key`, returning the removed value. (Underflow merging is not
-    /// implemented — deleted leaves may become sparse. See agents.md.)
+    /// Remove `key`, returning the removed value. Underflowing nodes are
+    /// rebalanced (borrow or merge) and empty internal roots collapse, so
+    /// heavy deletion shrinks the tree instead of leaving sparse leaves.
     pub fn remove(&self, key: &[u8]) -> Option<Vec<u8>> {
         let root = self.current_root();
-        delete_rec(&root, key)
+        let removed = delete_rec(&root, key)?;
+        // One fix-up descent per merge level; merges strictly reduce the
+        // node count, so this terminates.
+        while self.fix_pass(key) {}
+        self.collapse_root();
+        // Pump EBR so retired nodes drain instead of accumulating.
+        self.reclaim();
+        Some(removed)
+    }
+
+    /// Collapse single-child internal roots (the reverse of wrapping).
+    /// Pointer swaps happen under the root mutex, so concurrent readers see
+    /// either the old or the new root — both fully valid trees.
+    fn collapse_root(&self) {
+        loop {
+            let cur = self.current_root();
+            let single = {
+                let g = cur.lock();
+                match &*g {
+                    NodeBody::Internal { children, .. } if children.len() == 1 => {
+                        Some(children[0].clone())
+                    }
+                    _ => None,
+                }
+            };
+            let Some(child) = single else { break };
+            let mut guard = self.root.lock().unwrap();
+            if Arc::ptr_eq(&*guard, &cur) {
+                *guard = child;
+                self.bump_splits();
+            } else {
+                break; // root changed under us; owner of the new shape retries
+            }
+        }
+    }
+
+    /// One root→leaf lock-coupled descent along `key`'s path, fixing the
+    /// first underflowed node found. Returns true when a merge removed a
+    /// child (ancestors may now underflow — the caller repeats).
+    fn fix_pass(&self, key: &[u8]) -> bool {
+        let mut parent_arc = self.current_root();
+        loop {
+            let mut p_guard = parent_arc.lock();
+            // Latch the path child while holding the parent (root→leaf).
+            let idx = match &*p_guard {
+                NodeBody::Leaf { .. } => return false, // root leaf: always legal
+                NodeBody::Internal { keys, children } => {
+                    if children.len() <= 1 {
+                        // Single-child root collapses separately; a 1-child
+                        // non-root cannot arise from merges (a survivor keeps
+                        // both sides' children, so >= 2), so there is nothing
+                        // to fix here either way.
+                        return false;
+                    }
+                    lower_bound(keys, key).min(children.len() - 1)
+                }
+            };
+            let child = match &*p_guard {
+                NodeBody::Internal { children, .. } => children[idx].clone(),
+                NodeBody::Leaf { .. } => unreachable!(),
+            };
+            let c_guard = child.lock();
+            let child_is_leaf = matches!(&*c_guard, NodeBody::Leaf { .. });
+            let underflowed = if child_is_leaf {
+                match &*c_guard {
+                    NodeBody::Leaf { keys, .. } => keys.len() < MIN_KEYS,
+                    _ => unreachable!(),
+                }
+            } else {
+                match &*c_guard {
+                    NodeBody::Internal { children, .. } => children.len() < MIN_KEYS,
+                    _ => unreachable!(),
+                }
+            };
+            if !underflowed {
+                if child_is_leaf {
+                    return false; // leaf fine: bottom of the path
+                }
+                // Descend: release both latches, the child becomes parent.
+                drop(p_guard);
+                drop(c_guard);
+                parent_arc = child;
+                continue;
+            }
+            // Fix the child while the parent latch is held (invariant: no
+            // structural change without the parent's exclusive latch).
+            // Borrow cures the single-delete deficit exactly; a merge drops
+            // one child from the parent (caller repeats for ancestors).
+            return self.fix_child(&mut p_guard, idx, c_guard);
+        }
+    }
+
+    /// Borrow from a rich sibling, else merge with one. `p_guard` (parent)
+    /// and `c_guard` (child at `idx`) are latched; the sibling latch is
+    /// taken last. Returns true when a merge removed a child.
+    fn fix_child(&self, p_guard: &mut WriteGuard<'_>, idx: usize, c_guard: WriteGuard<'_>) -> bool {
+        // Locate a sibling; prefer the right one (merging into the left
+        // keeps `next`-chain edits to a single pointer).
+        let (sib_idx, merge_into_left) = match &**p_guard {
+            NodeBody::Internal { children, .. } => {
+                if idx + 1 < children.len() {
+                    (idx + 1, true)
+                } else {
+                    (idx - 1, false)
+                }
+            }
+            NodeBody::Leaf { .. } => unreachable!(),
+        };
+        let sibling = match &**p_guard {
+            NodeBody::Internal { children, .. } => children[sib_idx].clone(),
+            NodeBody::Leaf { .. } => unreachable!(),
+        };
+        let mut s_guard = sibling.lock();
+        // Sibling fullness decides borrow vs merge.
+        let sib_count = match &*s_guard {
+            NodeBody::Leaf { keys, .. } => keys.len(),
+            NodeBody::Internal { children, .. } => children.len(),
+        };
+        if sib_count > MIN_KEYS {
+            Self::borrow(p_guard, idx, sib_idx, c_guard, &mut s_guard);
+            return false;
+        }
+        Self::merge(p_guard, idx, sib_idx, merge_into_left, c_guard, s_guard, self);
+        true
+    }
+
+    /// Move one entry from the richer sibling through the parent separator.
+    /// Counts are unchanged elsewhere, so no further fix-up is needed.
+    fn borrow(
+        p_guard: &mut WriteGuard<'_>,
+        idx: usize,
+        sib_idx: usize,
+        mut c_guard: WriteGuard<'_>,
+        s_guard: &mut WriteGuard<'_>,
+    ) {
+        // Separator position between the two children (separator keys[i] is
+        // the max key of children[i], per the split convention).
+        let sep = idx.min(sib_idx);
+        match (&mut *c_guard, &mut **s_guard) {
+            (
+                NodeBody::Leaf { keys: ck, vals: cv, .. },
+                NodeBody::Leaf { keys: sk, vals: sv, .. },
+            ) => {
+                if sib_idx > idx {
+                    // First entry of the right sibling appends to the child.
+                    let k = sk.remove(0);
+                    let v = sv.remove(0);
+                    ck.push(k.clone());
+                    cv.push(v);
+                    if let NodeBody::Internal { keys, .. } = &mut **p_guard {
+                        keys[sep] = k;
+                    }
+                } else {
+                    // Last entry of the left sibling prepends to the child.
+                    let k = sk.pop().expect("rich sibling");
+                    let v = sv.pop().expect("rich sibling");
+                    ck.insert(0, k);
+                    cv.insert(0, v);
+                    if let NodeBody::Internal { keys, .. } = &mut **p_guard {
+                        keys[sep] = sk.last().cloned().unwrap_or_default();
+                    }
+                }
+            }
+            (
+                NodeBody::Internal { keys: ck, children: cc },
+                NodeBody::Internal { keys: sk, children: sc },
+            ) => {
+                if let NodeBody::Internal { keys: pk, .. } = &mut **p_guard {
+                    if sib_idx > idx {
+                        // Separator moves down as the child's new last key;
+                        // the sibling's first child moves over with it.
+                        let down = pk[sep].clone();
+                        let up = sk.remove(0);
+                        let mv = sc.remove(0);
+                        ck.push(down);
+                        cc.push(mv);
+                        pk[sep] = up;
+                    } else {
+                        let down = pk[sep].clone();
+                        let up = sk.pop().expect("rich sibling");
+                        let mv = sc.pop().expect("rich sibling");
+                        ck.insert(0, down);
+                        cc.insert(0, mv);
+                        pk[sep] = up;
+                    }
+                }
+            }
+            _ => unreachable!("borrow mixes leaf and internal nodes"),
+        }
+    }
+
+    /// Fuse two sparse siblings, unlink the loser from the parent and the
+    /// leaf chain, and retire it through the epoch manager.
+    #[allow(clippy::too_many_arguments)]
+    fn merge(
+        p_guard: &mut WriteGuard<'_>,
+        idx: usize,
+        sib_idx: usize,
+        merge_into_left: bool,
+        mut c_guard: WriteGuard<'_>,
+        mut s_guard: WriteGuard<'_>,
+        tree: &BTree,
+    ) {
+        let sep = idx.min(sib_idx);
+        // The evicted node's Arc: unlinked below, retired at the end.
+        let evicted: Arc<Node>;
+        if let NodeBody::Internal { keys: pk, children: pc } = &mut **p_guard {
+            match (&mut *c_guard, &mut *s_guard) {
+                (
+                    NodeBody::Leaf { keys: ak, vals: av, next: an },
+                    NodeBody::Leaf { keys: bk, vals: bv, next: bn },
+                ) => {
+                    if merge_into_left {
+                        // Sibling (right) folds into the child (left).
+                        ak.append(bk);
+                        av.append(bv);
+                        *an = bn.take();
+                        evicted = pc.remove(sep + 1);
+                    } else {
+                        // Child (right) folds into the sibling (left).
+                        bk.append(ak);
+                        bv.append(av);
+                        *bn = an.take();
+                        evicted = pc.remove(sep + 1);
+                        debug_assert!(sep + 1 == idx);
+                    }
+                    pk.remove(sep);
+                }
+                (
+                    NodeBody::Internal { keys: ak, children: ac },
+                    NodeBody::Internal { keys: bk, children: bc },
+                ) => {
+                    if merge_into_left {
+                        ak.push(pk[sep].clone());
+                        ak.append(bk);
+                        ac.append(bc);
+                        evicted = pc.remove(sep + 1);
+                    } else {
+                        bk.push(pk[sep].clone());
+                        bk.append(ak);
+                        bc.append(ac);
+                        evicted = pc.remove(sep + 1);
+                        debug_assert!(sep + 1 == idx);
+                    }
+                    pk.remove(sep);
+                }
+                _ => unreachable!("merge mixes leaf and internal nodes"),
+            }
+        } else {
+            unreachable!("merge parent is a leaf");
+        }
+        drop(c_guard);
+        drop(s_guard);
+        // (The parent guard lives on in the caller and releases there.)
+        // The loser leaves the tree here: no path can reach it anymore.
+        // Its Arc goes through EBR so in-flight optimistic readers (which
+        // may still hold clones) stay memory-safe; the allocation itself
+        // frees once the last clone drops.
+        if let Some(ep) = tree.epoch.lock().unwrap().as_ref() {
+            ep.retire(evicted);
+        }
+        tree.bump_splits();
+    }
+
+    /// Leftmost-descent height (root alone = 1). Test/diagnostic helper.
+    pub fn height(&self) -> usize {
+        let mut h = 0usize;
+        let mut node = self.current_root();
+        loop {
+            h += 1;
+            let next = {
+                let g = node.lock();
+                match &*g {
+                    NodeBody::Leaf { .. } => None,
+                    NodeBody::Internal { children, .. } => children.first().cloned(),
+                }
+            };
+            match next {
+                Some(n) => node = n,
+                None => return h,
+            }
+        }
+    }
+
+    /// Total node count (test/diagnostic helper; briefly latches each node).
+    pub fn node_count(&self) -> usize {
+        fn count(node: &Node) -> usize {
+            let g = node.lock();
+            match &*g {
+                NodeBody::Leaf { .. } => 1,
+                NodeBody::Internal { children, .. } => {
+                    1 + children.iter().map(|c| count(c)).sum::<usize>()
+                }
+            }
+        }
+        count(&self.current_root())
     }
 }
 
@@ -519,6 +862,7 @@ fn lower_bound(keys: &[Vec<u8>], key: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::epoch::EpochManager;
     use std::thread;
 
     #[test]
@@ -610,5 +954,142 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(t.len(), 20_000);
+    }
+
+    #[test]
+    fn heavy_delete_merges_and_shrinks() {
+        let t = BTree::new();
+        for i in 0..10_000i64 {
+            let k = i.to_be_bytes();
+            assert!(t.insert(&k, &k));
+        }
+        let nodes_before = t.node_count();
+        let height_before = t.height();
+        assert!(nodes_before > 10, "nodes={nodes_before}");
+        assert!(height_before >= 2, "height={height_before}");
+        // Delete 90% spread across the key space: every leaf underflows and
+        // must borrow or merge (no sparse-leaf residue).
+        for i in 0..9_000i64 {
+            let k = i.to_be_bytes();
+            assert_eq!(t.remove(&k), Some(k.to_vec()), "at {i}");
+        }
+        assert_eq!(t.len(), 1_000);
+        for i in 9_000..10_000i64 {
+            let k = i.to_be_bytes();
+            assert_eq!(t.get(&k), Some(k.to_vec()), "at {i}");
+        }
+        assert_eq!(t.get(&0i64.to_be_bytes()), None);
+        let nodes_after = t.node_count();
+        assert!(
+            nodes_after < nodes_before / 2,
+            "nodes {nodes_before} -> {nodes_after}"
+        );
+        assert!(t.height() <= height_before, "height={}", t.height());
+        // Delete everything: the tree empties and stays usable.
+        for i in 9_000..10_000i64 {
+            let k = i.to_be_bytes();
+            assert_eq!(t.remove(&k), Some(k.to_vec()), "at {i}");
+        }
+        assert!(t.is_empty());
+        assert_eq!(t.height(), 1);
+        assert_eq!(t.get(&42i64.to_be_bytes()), None);
+        assert!(t.insert(&42i64.to_be_bytes(), b"again"));
+        assert_eq!(t.get(&42i64.to_be_bytes()), Some(b"again".to_vec()));
+    }
+
+    #[test]
+    fn delete_collapses_root() {
+        let t = BTree::new();
+        for i in 0..300i64 {
+            let k = i.to_be_bytes();
+            t.insert(&k, &k);
+        }
+        assert!(t.height() >= 2, "height={}", t.height());
+        // Shrink to a handful of keys: merges must cascade until a single
+        // leaf root remains (height 1).
+        for i in 5..300i64 {
+            let k = i.to_be_bytes();
+            t.remove(&k);
+        }
+        assert_eq!(t.len(), 5);
+        assert_eq!(t.height(), 1, "nodes={}", t.node_count());
+        for i in 0..5i64 {
+            let k = i.to_be_bytes();
+            assert_eq!(t.get(&k), Some(k.to_vec()), "at {i}");
+        }
+        let all = t.scan_all();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].0, 0i64.to_be_bytes());
+    }
+
+    #[test]
+    fn concurrent_deletes_and_reads() {
+        let t = Arc::new(BTree::new());
+        for i in 0..20_000u64 {
+            let k = i.to_be_bytes();
+            t.insert(&k, &k);
+        }
+        let mut handles = vec![];
+        // Four deleters over disjoint quarters (merges fire throughout).
+        for w in 0..4u64 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..5_000u64 {
+                    let key = (w * 5_000 + i).to_be_bytes();
+                    let expect = key.to_vec();
+                    assert_eq!(t.remove(&key), Some(expect));
+                }
+            }));
+        }
+        // Optimistic readers must never observe torn state (only shrinking
+        // counts — validation restarts them on any race).
+        for _ in 0..2 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..500 {
+                    let n = t.scan_all().len();
+                    assert!(n <= 20_000);
+                    let _ = t.get(&19_999u64.to_be_bytes());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(t.is_empty());
+        assert_eq!(t.height(), 1);
+    }
+
+    #[test]
+    fn merged_nodes_retire_through_epoch() {
+        let epoch = EpochManager::new();
+        let t = BTree::new();
+        t.set_epoch_manager(epoch.clone());
+        for i in 0..5_000i64 {
+            let k = i.to_be_bytes();
+            t.insert(&k, &k);
+        }
+        // A pinned guard blocks reclamation: merges still unlink nodes, but
+        // their Arcs must queue instead of dropping.
+        let guard = epoch.pin();
+        for i in 0..4_000i64 {
+            let k = i.to_be_bytes();
+            t.remove(&k);
+        }
+        assert_eq!(t.len(), 1_000);
+        assert!(
+            epoch.pending_count() > 0,
+            "merges should have retired nodes"
+        );
+        drop(guard);
+        // Unpinned: the next pump drains the queue.
+        t.remove(&4_000i64.to_be_bytes());
+        assert_eq!(t.len(), 999);
+        assert_eq!(epoch.pending_count(), 0);
+        assert_eq!(t.reclaim(), 0);
+        for i in 4_001..5_000i64 {
+            let k = i.to_be_bytes();
+            assert_eq!(t.get(&k), Some(k.to_vec()), "at {i}");
+        }
     }
 }

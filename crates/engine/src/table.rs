@@ -214,6 +214,20 @@ impl Table {
         *self.pool.write().unwrap() = Some(pool);
     }
 
+    /// Attach the database's epoch manager to every B+ tree (primary and
+    /// secondary) so merged-away nodes retire through EBR. Called by
+    /// `Database::open` for every table, including ones created later.
+    pub fn set_epoch_manager(&self, epoch: Arc<crate::epoch::EpochManager>) {
+        self.tree.set_epoch_manager(epoch.clone());
+        for idx in self.indexes.read().unwrap().iter() {
+            idx.tree.set_epoch_manager(epoch.clone());
+        }
+    }
+
+    fn tree_epoch_manager(&self) -> Option<Arc<crate::epoch::EpochManager>> {
+        self.tree.epoch_manager()
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.def.schema
     }
@@ -506,6 +520,11 @@ impl Table {
             return Err(Error::IndexExists(name));
         }
         let tree = BTree::new();
+        // New index trees inherit the table's epoch attachment so their
+        // merged-away nodes retire too.
+        if let Some(ep) = self.tree_epoch_manager() {
+            tree.set_epoch_manager(ep);
+        }
         let pk_idx = self.def.schema.pk_idx;
         for (_, row) in self.scan()? {
             let sec_val = &row[col_idx];
