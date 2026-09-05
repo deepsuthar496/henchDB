@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use super::plan::{equi_join, join_key, JoinKey};
 use super::{Database, Output, Session};
 use crate::error::{Error, Result};
 use crate::sql::{parse_sql, AggFunc, Expr, JoinClause, JoinKind, SelectItem, Statement};
@@ -306,12 +307,13 @@ impl Database {
 
     // -- multi-table SELECT (JOIN + GROUP BY) -------------------------------
     //
-    // v1 execution is a left-deep nested loop over full input scans
-    // (transaction overlay included, per-table index paths not yet pushed
-    // down — the follow-up is hash join + join ordering). Correctness notes:
-    // WHERE applies post-join (so single-table predicates on either side see
-    // joined rows, exactly like the single-table filter); LEFT JOIN pads
-    // missing right sides with NULLs, which fail predicates as usual.
+    // Left-deep joins: each step hashes on an equi-key (`t1.a = t2.b`) when
+    // the ON conjunction carries one, else nested loop. The full ON clause
+    // always re-filters matches, so compound predicates stay correct.
+    // Correctness notes: WHERE applies post-join (so single-table predicates
+    // on either side see joined rows, exactly like the single-table filter);
+    // LEFT JOIN pads missing right sides with NULLs, which fail predicates
+    // as usual.
 
     /// Owning table + local column index for a concatenated-row position.
     /// Callers only pass indices from `resolve_scope`, so the fallback is
@@ -438,35 +440,12 @@ impl Database {
         for t in &tables {
             inputs.push(self.visible_rows(session, t, None)?);
         }
-        // 3. Left-deep nested loop.
+        // 3. Left-deep joins (hash on equi-keys, nested loop otherwise).
         let mut rows = inputs[0].clone();
         for (ji, j) in joins.iter().enumerate() {
             Self::validate_scoped(&j.on, &tables[..ji + 2])?;
-            let right_arity = tables[ji + 1].schema().columns.len();
-            let mut next = Vec::new();
-            for l in &rows {
-                if let Some(dl) = deadline {
-                    if std::time::Instant::now() > dl {
-                        return Err(Error::QueryTimeout);
-                    }
-                }
-                let mut matched = false;
-                for r in &inputs[ji + 1] {
-                    let mut combined = Vec::with_capacity(l.len() + r.len());
-                    combined.extend_from_slice(l);
-                    combined.extend_from_slice(r);
-                    if Self::eval_scoped(&j.on, &tables[..ji + 2], &combined)? {
-                        next.push(combined);
-                        matched = true;
-                    }
-                }
-                if !matched && j.kind == JoinKind::Left {
-                    let mut combined = l.clone();
-                    combined.extend(std::iter::repeat(Datum::Null).take(right_arity));
-                    next.push(combined);
-                }
-            }
-            rows = next;
+            let scope: &[Arc<Table>] = &tables[..ji + 2];
+            rows = Self::join_step(scope, &j.on, j.kind, rows, &inputs[ji + 1], deadline)?;
         }
         // 4. WHERE over joined rows.
         if let Some(sel) = selection.as_ref() {
@@ -555,6 +534,171 @@ impl Database {
             rows: out_rows,
             message: "OK".into(),
         })
+    }
+
+    /// One left-deep join step over accumulated `left_rows` and the next
+    /// table's `right_rows`. Equi-keys hash; everything else nested-loops.
+    /// Output rows keep canonical layout (left columns, then right).
+    fn join_step(
+        tables: &[Arc<Table>],
+        on: &Expr,
+        kind: JoinKind,
+        left_rows: Vec<Vec<Datum>>,
+        right_rows: &[Vec<Datum>],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Vec<Datum>>> {
+        let left_width: usize = tables[..tables.len() - 1]
+            .iter()
+            .map(|t| t.schema().columns.len())
+            .sum();
+        let scope = tables;
+        if let Some((lk, rk)) = equi_join(on, left_width, &|n| Self::resolve_scope(scope, n)) {
+            return Self::hash_join_step(
+                tables,
+                on,
+                kind,
+                lk,
+                rk - left_width,
+                left_rows,
+                right_rows,
+                deadline,
+            );
+        }
+        Self::nested_loop_step(tables, on, kind, &left_rows, right_rows, deadline)
+    }
+
+    /// Nested-loop fallback: full cross product filtered by ON, with LEFT
+    /// padding for unmatched left rows.
+    fn nested_loop_step(
+        tables: &[Arc<Table>],
+        on: &Expr,
+        kind: JoinKind,
+        left_rows: &[Vec<Datum>],
+        right_rows: &[Vec<Datum>],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Vec<Datum>>> {
+        let right_arity = tables[tables.len() - 1].schema().columns.len();
+        let mut next = Vec::new();
+        for l in left_rows {
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() > dl {
+                    return Err(Error::QueryTimeout);
+                }
+            }
+            let mut matched = false;
+            for r in right_rows {
+                let mut combined = Vec::with_capacity(l.len() + r.len());
+                combined.extend_from_slice(l);
+                combined.extend_from_slice(r);
+                if Self::eval_scoped(on, tables, &combined)? {
+                    next.push(combined);
+                    matched = true;
+                }
+            }
+            if !matched && kind == JoinKind::Left {
+                let mut combined = l.clone();
+                combined.extend(std::iter::repeat(Datum::Null).take(right_arity));
+                next.push(combined);
+            }
+        }
+        Ok(next)
+    }
+
+    /// In-memory hash join in O(N + M). `lk` indexes the accumulated left
+    /// rows, `rrk` the right rows (local). INNER builds the smaller side;
+    /// LEFT always builds right and streams left (order + padding). Hash
+    /// hits still pass the full ON filter (residual predicates); NULL/NaN
+    /// keys never match per SQL semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn hash_join_step(
+        tables: &[Arc<Table>],
+        on: &Expr,
+        kind: JoinKind,
+        lk: usize,
+        rrk: usize,
+        left_rows: Vec<Vec<Datum>>,
+        right_rows: &[Vec<Datum>],
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Vec<Datum>>> {
+        let right_arity = tables[tables.len() - 1].schema().columns.len();
+        // (build rows, build key idx, probe rows, probe key idx, build-is-left)
+        let build_left = kind == JoinKind::Inner && left_rows.len() < right_rows.len();
+        let mut table: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+        if build_left {
+            for (bi, b) in left_rows.iter().enumerate() {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        return Err(Error::QueryTimeout);
+                    }
+                }
+                if let Some(k) = join_key(&b[lk]) {
+                    table.entry(k).or_default().push(bi);
+                }
+            }
+        } else {
+            for (bi, b) in right_rows.iter().enumerate() {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        return Err(Error::QueryTimeout);
+                    }
+                }
+                if let Some(k) = join_key(&b[rrk]) {
+                    table.entry(k).or_default().push(bi);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if build_left {
+            for p in right_rows {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        return Err(Error::QueryTimeout);
+                    }
+                }
+                if let Some(k) = join_key(&p[rrk]) {
+                    if let Some(cands) = table.get(&k) {
+                        for &bi in cands {
+                            let b = &left_rows[bi];
+                            let mut combined = Vec::with_capacity(b.len() + p.len());
+                            combined.extend_from_slice(b);
+                            combined.extend_from_slice(p);
+                            if Self::eval_scoped(on, tables, &combined)? {
+                                out.push(combined);
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        for p in &left_rows {
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() > dl {
+                    return Err(Error::QueryTimeout);
+                }
+            }
+            let mut matched = false;
+            if let Some(k) = join_key(&p[lk]) {
+                if let Some(cands) = table.get(&k) {
+                    for &bi in cands {
+                        let b = &right_rows[bi];
+                        let mut combined = Vec::with_capacity(p.len() + b.len());
+                        combined.extend_from_slice(p);
+                        combined.extend_from_slice(b);
+                        if Self::eval_scoped(on, tables, &combined)? {
+                            out.push(combined);
+                            matched = true;
+                        }
+                    }
+                }
+            }
+            if !matched && kind == JoinKind::Left {
+                let mut combined = p.clone();
+                combined.extend(std::iter::repeat(Datum::Null).take(right_arity));
+                out.push(combined);
+            }
+        }
+        Ok(out)
     }
 
     /// GROUP BY: group rows by key values (sorted by key via BTreeMap),

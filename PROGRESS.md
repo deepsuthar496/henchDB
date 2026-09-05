@@ -29,7 +29,7 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **93/93 tests passing** (64 engine + 29 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
+- **Quality & Size Ceiling**: **100/100 tests passing** (71 engine + 29 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
 
 ---
 
@@ -155,7 +155,8 @@ comment in git history and in README.
 | Early Lock Release, column-granular versioning (RCC-C) | ❌ | backlog F3 |
 | Per-core distributed WAL | ❌ single shared WAL | backlog F6 |
 | io_uring polled I/O (`IOPOLL`, `O_DIRECT`) | ❌ Linux-only; needs `cfg` gating + portable fallback | backlog F6 |
-| Cascades memo optimizer & Hash Joins | ❌ (heuristic access-path selection only) | backlog F5 |
+| Cascades memo optimizer | ❌ (heuristic access-path selection only) | backlog F5 |
+| Hash joins (equi-key build/probe, INNER + LEFT) | ✅ done (smaller-side build, residual ON filter, NULL/NaN-safe keys) | `db/plan.rs`, `db/query.rs` |
 | Morsel-driven parallelism, Arrow columnar, SIMD filter/join | ❌ | backlog F5 |
 | Wire Encryption (TLS / SSL - SEC2) | ❌ plaintext with SHA-256 challenge auth | backlog SEC2 |
 | Thread-per-core pinned runtime | ❌ thread-per-connection | backlog F6 |
@@ -255,6 +256,7 @@ python bench_strict.py 3
 | 2026-09-04 | **Side-by-Side Python Harness & High-Speed Query Fast Paths** (`bench_strict.py`, `crates/engine/src/db/mod.rs`, `crates/engine/src/wal.rs`): (1) Created Python side-by-side benchmark harness (`bench_strict.py`) driving real MySQL 8.0.46 and henchDB under identical multi-threaded workloads; (2) Implemented `try_fast_point_select` for zero-allocation point reads (`SELECT col FROM t WHERE pk = val`); (3) Short-circuited transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`); (4) Reduced WAL group commit window to 100 µs. Result: henchDB wins all workloads at 1c and 8c: Point Select **7.19x faster** (9,820 vs 1,365 q/s @8c), Range Query **9.95x faster** (12,653 vs 1,272 q/s @8c), RW Txn **4.62x faster** (521 vs 113 txn/s @8c), Durable Update **2.06x faster** (4,103 vs 1,991 w/s @8c) | `bench_strict.py` 1c/8c, 89/89 tests green (`cargo test`) |
 | 2026-09-05 | **Real-Time Visual Terminal Benchmark Harness** (`becnhmarks.py` / `bench_live.py`): Interactive real-time visual harness displaying side-by-side dynamic progress bars, throughput gauges (QPS/TPS speedometer), running latency, and speedup advantage badges against live MySQL 8.0 (port 3307) and henchDB (port 3308) over TCP. Supports 4-stage race tournament and continuous live gauge modes with ANSI terminal escaping. | `python bench_live.py --quick` verified against live MySQL 8.0.46 |
 | 2026-09-05 | **Enterprise Milestones 1–3 & Codebase Ceiling Modularization** (`crates/engine/src/sql/`, `catalog.rs`, `db/`, `wire/stmt.rs`): (1) **Milestone 1**: Multi-database namespace isolation (`CREATE DATABASE`, `USE <db>`, `DROP DATABASE`, `COM_INIT_DB`, `SHOW DATABASES`, table namespace routing, catalog and snapshot v3 persistence across restarts); (2) **Milestone 2**: Native temporal types (`DATE`, `DATETIME`, `TIMESTAMP`, `TIME`) with total-ordering key codec and binary wire protocol encoding; (3) **Milestone 3**: Cooperative statement execution timeouts (`statement_timeout` deadline enforcement in table scans and nested-loop joins); (4) **Ceiling Enforcement**: Decomposed monolithic 1,439-line `sql.rs` into `sql/` directory modules (`ast.rs`, `eval.rs`, `lexer.rs`, `parser.rs`, `tests.rs`, `mod.rs`) strictly under 1,000 lines; (5) In-process point select throughput accelerated to **565,198 q/s** (+126% speedup). Head-to-head strict benchmarks confirm clean victories across all workloads on both 1c and 8c (Point Select 2.64x–2.65x, Range Query 2.61x–3.59x, RW Txn 1.79x–2.33x, Durable Update 1.40x–2.27x). | 93/93 tests green (64 engine + 29 server), release zero warnings, 50,000-row data integrity verified |
+| 2026-09-05 | **F5: In-Memory Hash Joins** (`db/plan.rs`, `db/query.rs`, `db/tests.rs`): (1) **Planner** (`plan.rs`): `equi_join()` detects one `left.col = right.col` pair per ON conjunction (either operand order, AND-recursion), plus `JoinKey` hashable key normalization mirroring `eval_with` coercions exactly (integral floats→Int with saturating cast, parseable text→DateTime, NaN/NULL→never-match); (2) **Executor** (`query.rs`): `join_step` dispatches per join — hash path builds `HashMap<JoinKey, Vec<usize>>` on the smaller side for INNER (either side) or right side for LEFT (order + padding preserved), streams probe rows, re-filters every hit through the full ON clause (compound predicates correct), nested-loop fallback for non-equi/same-side keys; deadline checks in build + probe loops; (3) **Tests**: 7 new (multi-row INNER incl. one-to-many, LEFT padding + NULL-key never-match, 3-table chain, empty build/probe sides, compound-ON + non-equi fallback + flipped operands, key-normalization unit, 1,500×1,500 → 15,000-row scale). | 100/100 tests green (71 engine + 29 server), release zero warnings |
 *(next agents: add rows here)*
 
 ---
@@ -275,7 +277,10 @@ The engine has achieved core relational and performance superiority over MySQL 8
   - Native temporal types with order-preserving key encoding, text parser support, and binary wire result encoding in `COM_STMT_EXECUTE`.
 
 * ✅ **Milestone 3: Statement Execution Timeouts & Query Governance**
-  - Cooperative deadline checks (`statement_timeout`) inside table scans and nested-loop join iterators.
+  - Cooperative deadline checks (`statement_timeout`) inside table scans and join iterators (nested-loop + hash build/probe).
+
+* ✅ **Frontier Milestone F5 (part 1): In-Memory Hash Joins (`INNER` + `LEFT`)**
+  - Equi-key build/probe per join step (smaller-side build for `INNER`, right-build for `LEFT`); full ON clause re-filters matches; NULL/NaN keys never match; non-equi falls back to nested loop. Remaining F5: Cascades memo optimizer + join ordering.
 
 ---
 
@@ -292,13 +297,12 @@ The engine has achieved core relational and performance superiority over MySQL 8
 
 ---
 
-### 2. ⚡ Enterprise Priority 2 (F5): Hash Joins & Cascades Memo Optimizer
+### 2. ⚡ Enterprise Priority 2 (F5-remainder): Cascades Memo Optimizer & Join Ordering
 * **Status**: 🎯 **HIGH ENGINE PRIORITY**
-* **Why it matters**: Current multi-table joins execute via left-deep nested-loop scans. While optimal for indexed PK point joins, multi-thousand-row analytical joins require hash joins.
+* **Why it matters**: Hash joins now execute per-step in O(N + M), but join order is still the written order. Multi-table queries need cost-based ordering.
 * **Architecture**:
-  - Build-phase hash table on inner relation, probe-phase streaming scan on outer relation.
-  - Basic cost-based join ordering (placing smaller table on build side).
-* **Effort**: Medium–High.
+  - Cascades memo: order the accumulated left-deep chain by estimated relation sizes (already have row counts at plan time).
+* **Effort**: Medium.
 
 ---
 
@@ -331,7 +335,7 @@ The engine has achieved core relational and performance superiority over MySQL 8
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**93 tests: 64 engine + 29 server** as of this writing).
+1. `cargo test` — all green (**100 tests: 71 engine + 29 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

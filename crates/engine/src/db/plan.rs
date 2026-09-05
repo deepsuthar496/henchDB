@@ -2,7 +2,7 @@
 //! secondary-index bounds) plus literal coercion helpers.
 
 use crate::error::Result;
-use crate::sql::Expr;
+use crate::sql::{CmpOp, Expr};
 use crate::table::Table;
 use crate::types::{ColumnType, Datum};
 
@@ -307,6 +307,80 @@ fn update_bound(slot: &mut Option<(Datum, bool)>, lit: Datum, inclusive: bool, i
     };
     if better {
         *slot = Some((lit, inclusive));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hash-join planning: equi-key detection + hashable key normalization
+// ---------------------------------------------------------------------------
+
+/// Hashable join key. `Datum` cannot derive `Hash` (float), so probe/build
+/// keys normalize through the same coercions the evaluator applies
+/// (`coerce_pair` in `sql/eval.rs`): integral floats collapse to `Int`
+/// (saturating cast, so extreme values agree with f64 comparison),
+/// parseable text collapses to `DateTime`, NaN/NULL map to `None` and
+/// therefore never match — exactly like `eval_with`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum JoinKey {
+    Int(i64),
+    Float(u64),
+    Text(String),
+    Bool(bool),
+    DateTime(i64),
+}
+
+pub(crate) fn join_key(d: &Datum) -> Option<JoinKey> {
+    match d {
+        Datum::Null => None,
+        Datum::Int(v) => Some(JoinKey::Int(*v)),
+        Datum::Float(v) => {
+            if v.is_nan() {
+                None
+            } else if v.fract() == 0.0 && *v >= i64::MIN as f64 && *v <= i64::MAX as f64 {
+                Some(JoinKey::Int(*v as i64))
+            } else {
+                Some(JoinKey::Float(v.to_bits()))
+            }
+        }
+        Datum::Text(s) => match crate::types::parse_datetime_str(s) {
+            Some(m) => Some(JoinKey::DateTime(m)),
+            None => Some(JoinKey::Text(s.clone())),
+        },
+        Datum::Bool(b) => Some(JoinKey::Bool(*b)),
+        Datum::DateTime(m) => Some(JoinKey::DateTime(*m)),
+    }
+}
+
+/// Find one equi-join pair (`left.col = right.col`) in an ON conjunction.
+/// Returns `(left_scope_idx, right_scope_idx)` where the left index is
+/// within the accumulated rows (`< left_width`) and the right index is in
+/// the new table. Anything else (non-equi, same-side, unresolvable) yields
+/// `None` and the executor falls back to nested loop. The full ON clause
+/// still filters matches afterwards, so compound predicates stay correct.
+pub(crate) fn equi_join(
+    on: &Expr,
+    left_width: usize,
+    resolve: &dyn Fn(&str) -> Result<usize>,
+) -> Option<(usize, usize)> {
+    match on {
+        Expr::And(a, b) => {
+            equi_join(a, left_width, resolve).or_else(|| equi_join(b, left_width, resolve))
+        }
+        Expr::Cmp { left, op, right } => {
+            if !matches!(op, CmpOp::Eq) {
+                return None;
+            }
+            let (Expr::Column(x), Expr::Column(y)) = (left.as_ref(), right.as_ref()) else {
+                return None;
+            };
+            let (i, k) = (resolve(x).ok()?, resolve(y).ok()?);
+            match (i < left_width, k < left_width) {
+                (true, false) => Some((i, k)),
+                (false, true) => Some((k, i)),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
