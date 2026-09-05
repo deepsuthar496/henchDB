@@ -19,6 +19,3 @@ Desktop.ini
 data/
 research.md
 *.py
-!bench_compare.py
-!bench_strict.py
-!bench_live.py
