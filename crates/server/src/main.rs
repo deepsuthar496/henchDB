@@ -35,6 +35,9 @@ struct ServerOpts {
     max_connections: usize,
     idle_timeout: Option<Duration>,
     allow_legacy: bool,
+    /// PEM certificate chain for TLS (SEC2). Both must be set to enable.
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
 }
 
 impl ServerOpts {
@@ -48,7 +51,14 @@ impl ServerOpts {
             None => Some(Duration::from_secs(28_800)), // MySQL wait_timeout default
         };
         let allow_legacy = !args.iter().any(|a| a == "--no-legacy");
-        ServerOpts { port, max_connections, idle_timeout, allow_legacy }
+        ServerOpts {
+            port,
+            max_connections,
+            idle_timeout,
+            allow_legacy,
+            tls_cert: arg_value(args, "--tls-cert"),
+            tls_key: arg_value(args, "--tls-key"),
+        }
     }
 }
 
@@ -227,7 +237,7 @@ fn main() {
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
             eprintln!("usage: server [serve|passwd|bench] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy]");
+            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             std::process::exit(2);
         }
@@ -587,10 +597,26 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;
     let db = Arc::new(Database::open(dir)?);
     install_signal_handlers();
+    // SEC2: TLS is all-or-nothing at startup — one side without the other
+    // is a misconfiguration, and unreadable files must never silently
+    // downgrade to plaintext.
+    let tls = match (&opts.tls_cert, &opts.tls_key) {
+        (Some(cert), Some(key)) => Some(
+            wire::tls::load_tls_config(Path::new(cert), Path::new(key))
+                .map_err(|e| engine::Error::Io(e.to_string()))?,
+        ),
+        (None, None) => None,
+        _ => {
+            eprintln!("tls error: --tls-cert and --tls-key must be given together");
+            std::process::exit(2);
+        }
+    };
     let listener = TcpListener::bind(("0.0.0.0", opts.port))?;
     listener.set_nonblocking(true)?;
     println!("listening on 0.0.0.0:{} (dir: {})", opts.port, dir.display());
     println!("protocols: mysql wire (HandshakeV10 + COM_QUERY + prepared statements, authenticated) + legacy framed text (auto-detect)");
+    println!("tls: {}",
+        if tls.is_some() { "enabled (CLIENT_SSL advertised)" } else { "disabled (plaintext only)" });
     println!("limits: max_connections={} idle_timeout={} legacy={}",
         opts.max_connections,
         opts.idle_timeout.map(|d| format!("{}s", d.as_secs())).unwrap_or_else(|| "off".into()),
@@ -629,6 +655,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                 let reg_id = registry.add(&stream);
                 let db = db.clone();
                 let opts = opts.clone();
+                let tls = tls.clone();
                 let auth_path = auth_path.clone();
                 let registry = registry.clone();
                 let draining = draining.clone();
@@ -639,6 +666,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                         idle_timeout: opts.idle_timeout,
                         shutdown: draining,
                         admitted,
+                        tls,
                     };
                     let r = handle_auto(db, stream, &opts, &ctx);
                     registry.remove(reg_id);

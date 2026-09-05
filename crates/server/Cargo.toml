@@ -10,3 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+# First external dependencies in the workspace (server only; `engine`
+# stays std-only per AGENTS.md §9). rustls is pure Rust; `ring` needs a C
+# compiler at build time (MSVC cl.exe works).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"

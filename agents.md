@@ -93,7 +93,7 @@ you upgrade a component, update the row and the module doc comment.
 | Durability | Single WAL file, CRC32 per record, per-txn redo on recovery, snapshot + WAL truncate checkpoint. **Group commit implemented**: commits append under a short lock, one background syncer batches concurrent commits into one fsync (200us collection window), installs happen strictly in WAL-offset order (install frontier + condvar); DDL goes through the same sequencer via `Database::wal_commit` | Per-core WAL buffers (shard the current WAL), io_uring `IOPOLL` (Linux-only, `cfg`-gate it), parallel replay |
 | Concurrency | Single commit lock (serializes installs) | Lock-free commit pipelines; keep commit lock only as the correctness fallback |
 | SQL | Hand-written lexer/parser (`sql/` modules); SELECT/INSERT/UPDATE/DELETE/DDL/BEGIN/COMMIT/ROLLBACK/SHOW TABLES/CHECKPOINT; WHERE = AND/OR/NOT + IN/BETWEEN/LIKE over column-vs-literal ANDed (parens, precedence); index access paths on PK (point/multi-point/range) + secondary; AUTO_INCREMENT integer PKs; SUM/AVG/MIN/MAX (+COUNT); INNER/LEFT JOIN (hash join on equi-keys, nested-loop fallback, greedy smallest-ready-first ordering with LEFT barriers); FOREIGN KEY (RESTRICT/CASCADE/SET NULL, auto-indexed columns, PK/secondary/scan seeks) | sqlparser-rs MySQL dialect, Cascades memo optimizer (greedy covers common shapes), morsel-driven vectorized execution (Arrow), GROUP BY pushdown |
-| Server | Thread-per-connection TCP, authenticated MySQL wire (text + binary prepares) + legacy framed text (auto-detected, `--no-legacy` to disable); max-connections + idle/handshake timeouts; COM_SHUTDOWN + signal graceful drain; `server passwd` manages `auth.bin` verifiers | Pinned thread-per-core runtime, io_uring sockets, server-side cursors, statement timeouts, per-user privileges |
+| Server | Thread-per-connection TCP, authenticated MySQL wire (text + binary prepares, `CLIENT_SSL` optional via `--tls-cert`/`--tls-key` rustls) + legacy framed text (auto-detected, `--no-legacy` to disable); max-connections + idle/handshake timeouts; COM_SHUTDOWN + signal graceful drain; `server passwd` manages `auth.bin` verifiers | Pinned thread-per-core runtime, io_uring sockets, server-side cursors, statement timeouts, per-user privileges |
 
 Known v0.1 simplifications (intentional, do not "fix" silently — implement
 the roadmap item instead):
@@ -170,7 +170,9 @@ the roadmap item instead):
 
 - **Zero external dependencies** in `engine` for now (std only). Adding the
   first dependency (e.g., `sqlparser-rs`) is a deliberate roadmap decision —
-  record it in §4 when it happens.
+  record it in §4 when it happens. Footnote: `server` took its first
+  dependencies in SEC2 (`rustls 0.23` + `rustls-pemfile 2` for TLS; pure Rust
+  at runtime, C compiler at build time for `ring`); `engine` remains std-only.
 - Every subsystem carries unit tests; concurrency bugs are found by the
   threaded tests (`concurrent_inserts_and_reads`, `concurrent_commits_all_persist`).
   When touching latch/tree/commit code, run the full suite repeatedly.

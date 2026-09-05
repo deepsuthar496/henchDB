@@ -22,6 +22,9 @@ pub const CAP_MULTI_STATEMENTS: u32 = 0x0001_0000;
 pub const CAP_MULTI_RESULTS: u32 = 0x0002_0000;
 pub const CAP_PLUGIN_AUTH: u32 = 0x0008_0000;
 pub const CAP_DEPRECATE_EOF: u32 = 0x0100_0000;
+/// Client requests a TLS upgrade (SSLRequest) before authenticating.
+/// Advertised only when the server loaded `--tls-cert`/`--tls-key`.
+pub const CAP_SSL: u32 = 0x0000_0800;
 
 pub const SERVER_CAPS: u32 = CAP_LONG_PASSWORD
     | CAP_FOUND_ROWS

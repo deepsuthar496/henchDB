@@ -1,7 +1,6 @@
 //! Binary prepared statements (COM_STMT_*) handling, parameter decoding,
 //! substitution, and binary result set serialization.
 
-use std::net::TcpStream;
 use std::io::Write;
 
 use engine::types::ColumnType;
@@ -141,8 +140,8 @@ pub fn parse_affected(message: &str) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn write_output(
-    writer: &mut TcpStream,
+pub fn write_output<W: Write>(
+    writer: &mut W,
     seq: &mut u8,
     out: &Output,
     deprecate_eof: bool,

@@ -29,7 +29,7 @@ fn frame_header_layout() {
 #[test]
 fn handshake_shape() {
     let scramble = [7u8; 20];
-    let p = super::handshake::handshake_payload(42, &scramble, AUTH_PLUGIN);
+    let p = super::handshake::handshake_payload(42, &scramble, AUTH_PLUGIN, SERVER_CAPS);
     assert_eq!(p[0], 10);
     assert!(p.windows(AUTH_PLUGIN.len()).any(|w| w == AUTH_PLUGIN.as_bytes()));
     // Scramble halves embedded verbatim (part1 + part2).
@@ -315,4 +315,194 @@ fn prepare_ok_shape() {
     assert_eq!(u32::from_le_bytes([p[1], p[2], p[3], p[4]]), 7);
     assert_eq!(u16::from_le_bytes([p[5], p[6]]), 2);
     assert_eq!(u16::from_le_bytes([p[7], p[8]]), 1);
+}
+
+// -- TLS / SSLRequest (SEC2) -------------------------------------------------
+
+/// Self-signed localhost test certificate (RSA-2048, SAN localhost +
+/// 127.0.0.1, 10y). Generated once with an isolated `cryptography`
+/// install; embedded so tests need no files or tools.
+const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIC4jCCAcqgAwIBAgIUZq6Z+PCZuvrJjZrI/HLB9hdtBS4wDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDkwNTEzMzkwN1oXDTM2MDkw
+MjEzMzkwN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAxjVrM3kbiWdgsnoWOJjP1UP7xRzIQEIa2nZzD7rr2DSU
+I49BP6Bz3WMWVpe9hsA7G9Yvx5WPJZsvHyE6N8Y4g6Irr4sQdIPuBzvimKTemmvN
+W4D+iBTChxKI+C9W8vEc4W2jjROoTiKleaABQwg5MOU72bDEw90ir1RN9T3F0mm+
+YViik4/H1EtELJyLG42Rgzxus3kYBpebXI8dF5QFawMPTH5On2k79qyED2jgj8lS
+0mQNSXTa46hahxmZUxhcLB3/R0f2hSKydFVQ5RR0zayCaZGVlrFd7pERYGJ4LQLw
+xBdWpwMV6Lrw9+/v5Tr6P/mDkTclQd8kTgHEbYL+twIDAQABoywwKjAaBgNVHREE
+EzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TAQH/BAIwADANBgkqhkiG9w0BAQsF
+AAOCAQEAN5kUGNKpEltGqARtvcRotILngC/bI/sIVoG96k1FWP9ywBRosQfr3ucA
+YSlrSQMbj05nxeYhGGnCfYjrW44tSa1new5lG9WGDPgOEHmKe002K0M34iP9kfZH
+oJeTACyS/3SyTX5UXmSMDi9Ivnp5SO6LxupFdv8EH4OI7WUn3VS+t863+3AchoR3
+meo3i0/q5FfHWKKVrV4eLwfIdtFBpM0Hkaw4eOUQpAYtc1uEs3Kbb5xImwAjJE3Z
+wQD+5A9om5Jslqrfl/lDT+9TC5WXdZTGXqdOtyQjObz8vqmXmWsNHCutm/An1SKm
+l9G018PrSh06SVccXo3ht78sLJlqng==
+-----END CERTIFICATE-----
+"#;
+
+const TEST_KEY_PEM: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAxjVrM3kbiWdgsnoWOJjP1UP7xRzIQEIa2nZzD7rr2DSUI49B
+P6Bz3WMWVpe9hsA7G9Yvx5WPJZsvHyE6N8Y4g6Irr4sQdIPuBzvimKTemmvNW4D+
+iBTChxKI+C9W8vEc4W2jjROoTiKleaABQwg5MOU72bDEw90ir1RN9T3F0mm+YVii
+k4/H1EtELJyLG42Rgzxus3kYBpebXI8dF5QFawMPTH5On2k79qyED2jgj8lS0mQN
+SXTa46hahxmZUxhcLB3/R0f2hSKydFVQ5RR0zayCaZGVlrFd7pERYGJ4LQLwxBdW
+pwMV6Lrw9+/v5Tr6P/mDkTclQd8kTgHEbYL+twIDAQABAoIBAFXiHaI/DrR568dJ
+6Uj6xctF2tjtAMP/IL2aZ37gYoLbPXkvAHm+X5YE8k/xDflOYA5Ov4M+hbkoxcE6
+V4yFQkWfRkiY/DdQVxohU60Kez30ChZlDWUPgb6fRGQttwIrgXUYWa6uXtYEYykR
+MJrH/Gf4W/eWhZvMvNO1ttXVv1rNHMMYIulRqvhPeWcWtTvjqhyAOUMYlSNgJrDe
+DyR0tDHtL8Hq6obXEzDupndz1QkatPbUNIk72diC96TkpgXkfmsdbom2z6NOxTgl
+uPdlidL8nGjXfqF+ml4J35v3uHvV4oIa+sJ/g09kyXVbMIlFuWjke5LmuaR61WbO
+8u3Mz8ECgYEA+ElI79VI7vU8CMzY2en806Fqu7HyrvuvYKZMgKDJXeHZAQhoModr
+q5YyMt7KB/AT1zuuBrcdfBk+QkskJb7ovekk9L5Nf7hxlEdziLlx5gIkXgeNpUFJ
+GWS4EdAJ3l+XVOduJrTKfK/FnAf/uDpxzBOpAPLQA61FG+6R9QdR6iECgYEAzF3Y
+/rMqPWXwP/UpHhAVn5TBbeKBdX4kzP+wnyC5+IMe6n5MpY6kFuYwtK3PQvTwfE4a
+NyrxwIdH+KoxKKi1ZgeCz+QUyOhPbRpLIW+vWR+xOFaMk1EKupyUJ1Si8+cXg3MG
+/W49Db4gqM2H9/HXDGESSxLbPW0TUnPcloQ9vdcCgYBvYLimVcBE6Z/HttTkVFHF
+QdjWYAoksuTGb3NMFFSgl8q36uSLHjKPo23bYhOxIeJUoAH+IzDH1a8XIAwUHqLb
+ZnXckG3FiKDyymaqg73zVyynPa4t3q6DBKqJ2xBCQBFr1fGUzW80Jcl4qCHvq9AW
+ow8iTMpBi/2/fPLevyzg4QKBgQCF2s4e/OCkuFjku0HEJArVrAwJWfsrJoUaFDrt
+7vR/1fnw4up24XeOXBT4soL3OxEsicdX7PPNA45bS7XJCL9PZYoDekM22Bn1vuwI
+qWszN7POz7lhYApj8dyD6kaU8/6NpVClu4eXsbkYdw4gkzEkNYxSybX5hLDMJ4EK
+wPDjnwKBgQDaYDFtks52n4YCcdc202TcQUd9u0g6WsA3QUJUVV+PlaPfjYR7YBIu
+VXYk+gM0QvXzVC1dy/mm7hbNqN1xCYezUSiou9zjTtOYo6oFEGh9QcPgp4uEwbJ7
+cVrYCCiVo0a5+v/dokRjEFcUgO5/UG08xHPLI7Xjx2tMDZQSWe4iqw==
+-----END RSA PRIVATE KEY-----
+"#;
+
+/// Build a 32-byte SSLRequest-style payload for the given caps.
+fn ssl_request_bytes(caps: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32);
+    v.extend_from_slice(&caps.to_le_bytes());
+    v.extend_from_slice(&0x0100_0000u32.to_le_bytes()); // max packet
+    v.push(255); // charset
+    v.extend_from_slice(&[0u8; 23]); // filler
+    v
+}
+
+#[test]
+fn ssl_request_detected() {
+    use super::handshake::parse_ssl_request;
+    // Minimal + full-caps requests both detect.
+    let caps = CAP_SSL;
+    assert_eq!(parse_ssl_request(&ssl_request_bytes(caps)), Some(caps));
+    let full = SERVER_CAPS | CAP_SSL | 0x0000_8000;
+    assert_eq!(parse_ssl_request(&ssl_request_bytes(full)), Some(full));
+    // Wrong length or missing SSL bit: ordinary handshake bytes.
+    assert_eq!(parse_ssl_request(&ssl_request_bytes(SERVER_CAPS)), None);
+    let mut short = ssl_request_bytes(CAP_SSL);
+    short.pop();
+    assert_eq!(parse_ssl_request(&short), None);
+    let mut long = ssl_request_bytes(CAP_SSL);
+    long.push(0);
+    assert_eq!(parse_ssl_request(&long), None);
+    assert_eq!(parse_ssl_request(&[]), None);
+    // A real (short) HandshakeResponse-shaped buffer never matches.
+    let mut hs = vec![0u8; 40];
+    hs[0..4].copy_from_slice(&SERVER_CAPS.to_le_bytes());
+    assert_eq!(parse_ssl_request(&hs), None);
+}
+
+/// Decode the two capability words out of a HandshakeV10 payload.
+fn advertised_caps(payload: &[u8]) -> u32 {
+    let mut pos = 1usize; // protocol version
+    while payload[pos] != 0 {
+        pos += 1;
+    }
+    pos += 1 + 4 + 8 + 1; // NUL + conn id + scramble1 + filler
+    let lo = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as u32;
+    pos += 2 + 1 + 2; // charset + status
+    let hi = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as u32;
+    lo | (hi << 16)
+}
+
+#[test]
+fn caps_advertise_ssl_only_with_config() {
+    let scramble = [3u8; 20];
+    let plain = super::handshake::handshake_payload(1, &scramble, AUTH_PLUGIN, SERVER_CAPS);
+    assert_eq!(advertised_caps(&plain) & CAP_SSL, 0);
+    let tls = super::handshake::handshake_payload(1, &scramble, AUTH_PLUGIN, SERVER_CAPS | CAP_SSL);
+    assert_ne!(advertised_caps(&tls) & CAP_SSL, 0);
+    // Everything else advertised identically.
+    assert_eq!(advertised_caps(&tls) & !CAP_SSL, advertised_caps(&plain));
+}
+
+fn write_test_pems(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cert = dir.join("test-cert.pem");
+    let key = dir.join("test-key.pem");
+    std::fs::write(&cert, TEST_CERT_PEM).unwrap();
+    std::fs::write(&key, TEST_KEY_PEM).unwrap();
+    (cert, key)
+}
+
+#[test]
+fn tls_config_loads_and_rejects() {
+    use super::tls::load_tls_config;
+    let dir = std::env::temp_dir().join(format!("hdbtls_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = write_test_pems(&dir);
+    assert!(load_tls_config(&cert, &key).is_ok());
+    // Missing files fail closed.
+    assert!(load_tls_config(&dir.join("nope.pem"), &key).is_err());
+    assert!(load_tls_config(&cert, &dir.join("nope.pem")).is_err());
+    // Garbage is not a certificate.
+    let bad = dir.join("bad.pem");
+    std::fs::write(&bad, "not a pem file\n").unwrap();
+    assert!(load_tls_config(&bad, &key).is_err());
+    assert!(load_tls_config(&cert, &bad).is_err());
+    // Cert/key mismatch fails (key parses, pair does not).
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tls_loopback_roundtrip() {
+    use super::tls::{accept_tls, load_tls_config};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    let dir = std::env::temp_dir().join(format!("hdbtlsrt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = write_test_pems(&dir);
+    let cfg = load_tls_config(&cert, &key).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut tls = accept_tls(&cfg, sock).unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+        tls.write_all(b"pong").unwrap();
+        tls.flush().unwrap();
+    });
+    // Client trusts exactly the test certificate.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut TEST_CERT_PEM.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    roots.add(certs.into_iter().next().unwrap()).unwrap();
+    let client_cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+    tls.write_all(b"ping").unwrap();
+    tls.flush().unwrap();
+    let mut buf = [0u8; 4];
+    tls.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"pong");
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -32,8 +32,12 @@ pub fn fresh_scramble() -> [u8; 20] {
     out
 }
 
-pub fn handshake_payload(connection_id: u32, scramble: &[u8; 20], plugin: &str) -> Vec<u8> {
-    let caps = SERVER_CAPS;
+pub fn handshake_payload(
+    connection_id: u32,
+    scramble: &[u8; 20],
+    plugin: &str,
+    caps: u32,
+) -> Vec<u8> {
     let mut p = Vec::with_capacity(80 + plugin.len());
     p.push(10); // protocol version
     p.extend_from_slice(server_version().as_bytes());
@@ -69,6 +73,22 @@ pub struct HandshakeResponse {
 /// Capability bit for length-encoded auth data (never advertised by us, but
 /// parsed when a client sets it).
 const CAP_AUTH_LENENC_DATA: u32 = 0x0020_0000;
+
+/// Detect a MySQL SSLRequest: the 32-byte capability prefix a client sends
+/// instead of HandshakeResponse41 when it wants TLS. Returns the offered
+/// caps. Payloads of any other length are ordinary handshake responses
+/// (a 32-byte HandshakeResponse41 is impossible: username alone needs a
+/// NUL-terminated string past byte 32).
+pub fn parse_ssl_request(buf: &[u8]) -> Option<u32> {
+    if buf.len() != 32 {
+        return None;
+    }
+    let caps = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if caps & CAP_SSL == 0 {
+        return None;
+    }
+    Some(caps)
+}
 
 pub fn parse_handshake_response(buf: &[u8]) -> Option<HandshakeResponse> {
     if buf.len() < 32 {

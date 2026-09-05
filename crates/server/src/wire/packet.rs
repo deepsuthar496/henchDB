@@ -1,7 +1,6 @@
 //! Packet framing, length-encoded primitive codecs, and core payload builders.
 
 use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
 
 use super::constants::{MAX_PACKET, STATUS_AUTOCOMMIT};
 
@@ -124,7 +123,7 @@ pub fn read_lenenc_bytes(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
 // Packet framing
 // ---------------------------------------------------------------------------
 
-pub fn read_packet(reader: &mut BufReader<TcpStream>, max: usize) -> std::io::Result<(u8, Vec<u8>)> {
+pub fn read_packet<R: Read>(reader: &mut BufReader<R>, max: usize) -> std::io::Result<(u8, Vec<u8>)> {
     let mut first_seq: Option<u8> = None;
     let mut out = Vec::new();
     loop {
@@ -153,7 +152,7 @@ pub fn read_packet(reader: &mut BufReader<TcpStream>, max: usize) -> std::io::Re
     }
 }
 
-pub fn write_packet(writer: &mut TcpStream, payload: &[u8], seq: &mut u8) -> std::io::Result<()> {
+pub fn write_packet<W: Write>(writer: &mut W, payload: &[u8], seq: &mut u8) -> std::io::Result<()> {
     let mut off = 0usize;
     if payload.is_empty() {
         let hdr = [0u8, 0u8, 0u8, *seq];
@@ -241,14 +240,14 @@ pub fn mysql_error_for(e: &engine::Error) -> (u16, &'static str) {
     }
 }
 
-pub fn write_err(writer: &mut TcpStream, seq: &mut u8, e: &engine::Error) -> std::io::Result<()> {
+pub fn write_err<W: Write>(writer: &mut W, seq: &mut u8, e: &engine::Error) -> std::io::Result<()> {
     let (code, state) = mysql_error_for(e);
     write_packet(writer, &err_payload(code, state, &e.to_string()), seq)?;
     writer.flush()?;
     Ok(())
 }
 
-pub fn write_err_msg(writer: &mut TcpStream, seq: &mut u8, code: u16, msg: &str) -> std::io::Result<()> {
+pub fn write_err_msg<W: Write>(writer: &mut W, seq: &mut u8, code: u16, msg: &str) -> std::io::Result<()> {
     write_packet(writer, &err_payload(code, "HY000", msg), seq)?;
     writer.flush()?;
     Ok(())
