@@ -38,6 +38,9 @@ struct ServerOpts {
     /// PEM certificate chain for TLS (SEC2). Both must be set to enable.
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    /// PostgreSQL wire port (PG1, 0 = disabled).
+    pg_port: u16,
+    allow_pg: bool,
 }
 
 impl ServerOpts {
@@ -51,6 +54,7 @@ impl ServerOpts {
             None => Some(Duration::from_secs(28_800)), // MySQL wait_timeout default
         };
         let allow_legacy = !args.iter().any(|a| a == "--no-legacy");
+        let allow_pg = !args.iter().any(|a| a == "--no-pg");
         ServerOpts {
             port,
             max_connections,
@@ -58,6 +62,10 @@ impl ServerOpts {
             allow_legacy,
             tls_cert: arg_value(args, "--tls-cert"),
             tls_key: arg_value(args, "--tls-key"),
+            pg_port: arg_value(args, "--pg-port")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            allow_pg,
         }
     }
 }
@@ -237,7 +245,7 @@ fn main() {
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
             eprintln!("usage: server [serve|passwd|bench] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem]");
+            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             std::process::exit(2);
         }
@@ -629,6 +637,93 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     // accept loop merges in.
     let draining = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
+    // PG1: dedicated PostgreSQL listener (own port, no sniffing). Tries the
+    // configured port, then +1..+8 (a local Postgres often owns 5432);
+    // giving up only disables PG, never the MySQL side. `--no-pg` or
+    // `--pg-port 0` disables it outright.
+    if opts.allow_pg && opts.pg_port != 0 {
+        let mut bound = None;
+        for port in opts.pg_port..opts.pg_port.saturating_add(9) {
+            match TcpListener::bind(("0.0.0.0", port)) {
+                Ok(l) => {
+                    bound = Some((l, port));
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        match bound {
+            Some((pg_listener, pg_port)) => {
+                if pg_port != opts.pg_port {
+                    eprintln!("pg: port {} busy, listening on {pg_port} instead", opts.pg_port);
+                }
+                println!("pg listening on 0.0.0.0:{pg_port} (protocol 3.0 simple query)");
+                println!("connect: psql -h 127.0.0.1 -p {pg_port} -U root");
+                let _ = pg_listener.set_nonblocking(true);
+                let pg = std::thread::spawn({
+                    let db = db.clone();
+                    let opts = opts.clone();
+                    let tls = tls.clone();
+                    let auth_path = auth_path.clone();
+                    let active = active.clone();
+                    let registry = registry.clone();
+                    let draining = draining.clone();
+                    move || {
+                        while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+                            && !draining.load(Ordering::Relaxed)
+                        {
+                            match pg_listener.accept() {
+                                Ok((stream, _)) => {
+                                    if let Err(e) = stream.set_nonblocking(false) {
+                                        eprintln!("pg accept error: {e}");
+                                        continue;
+                                    }
+                                    let admitted = {
+                                        let mut n = active.lock().unwrap();
+                                        if *n >= opts.max_connections.max(1) {
+                                            false
+                                        } else {
+                                            *n += 1;
+                                            true
+                                        }
+                                    };
+                                    let guard = ConnGuard { active: active.clone() };
+                                    let reg_id = registry.add(&stream);
+                                    let db = db.clone();
+                                    let opts = opts.clone();
+                                    let tls = tls.clone();
+                                    let auth_path = auth_path.clone();
+                                    let registry = registry.clone();
+                                    let draining = draining.clone();
+                                    std::thread::spawn(move || {
+                                        let _guard = guard;
+                                        let ctx = wire::ConnCtx {
+                                            auth_path,
+                                            idle_timeout: opts.idle_timeout,
+                                            shutdown: draining,
+                                            admitted,
+                                            tls,
+                                        };
+                                        let r = wire::pg::handle_pg_connection(db, stream, &ctx);
+                                        registry.remove(reg_id);
+                                        if let Err(e) = r {
+                                            eprintln!("pg connection error: {e}");
+                                        }
+                                    });
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                                Err(e) => eprintln!("pg accept error: {e}"),
+                            }
+                        }
+                    }
+                });
+                handles.push(pg);
+            }
+            None => eprintln!("pg: ports {}-{} all busy, postgresql wire disabled", opts.pg_port, opts.pg_port.saturating_add(8)),
+        }
+    }
     // Nonblocking accept so SIGINT/SIGTERM and COM_SHUTDOWN are honored
     // within ~100ms even with zero traffic.
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) && !draining.load(Ordering::Relaxed) {

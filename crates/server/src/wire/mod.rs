@@ -41,6 +41,7 @@ pub mod canned;
 pub mod constants;
 pub mod handshake;
 pub mod packet;
+pub mod pg;
 pub mod stmt;
 pub mod tls;
 

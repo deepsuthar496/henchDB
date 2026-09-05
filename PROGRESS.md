@@ -29,7 +29,7 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **127/127 tests passing** (94 engine + 33 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
+- **Quality & Size Ceiling**: **139/139 tests passing** (94 engine + 45 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
 
 ---
 
@@ -264,6 +264,7 @@ python bench_strict.py 3
 | 2026-09-05 | **SEC2: Wire Encryption — TLS 1.2/1.3 via rustls** (`crates/server/Cargo.toml`, `wire/tls.rs`, `wire/handshake.rs`, `wire/constants.rs`, `wire/packet.rs`, `wire/stmt.rs`, `wire/mod.rs`, `wire/tests.rs`, `server/src/main.rs`): (1) **First external dependencies in the workspace** (`server` only — `engine` stays std-only): `rustls 0.23` (ring provider; pure Rust at runtime, C compiler at build time only) + `rustls-pemfile 2`; (2) **Negotiation**: `CLIENT_SSL (0x0800)` advertised in HandshakeV10 only when `--tls-cert`/`--tls-key` are configured; 32-byte `SSLRequest` detected by length + SSL bit (`parse_ssl_request`); upgrade runs the rustls handshake on the raw socket (pre-auth 30s timeout bounds it), then auth + commands continue over the encrypted stream; SSL requested without certs fails closed (ERR 1047, no downgrade); startup with only one of `--tls-cert`/`--tls-key` or unreadable files aborts instead of running plaintext; (3) **Plumbing**: new `ConnStream::{Plain,Tls}` enum with Read/Write impls; `packet.rs`/`stmt.rs`/`execute_statements` generalized from `TcpStream` to `R: Read`/`W: Write`; writes go through `BufReader<ConnStream>::get_mut`, timeouts via `ConnStream::set_read_timeout`; plaintext + legacy auto-detect paths untouched; (4) **Tests**: 4 new (SSLRequest detect incl. shapes, caps advertisement gated on config, config load accept/reject, live rustls loopback roundtrip with embedded self-signed localhost RSA cert); (5) **Verified live**: stock `mysql.exe --ssl-mode=REQUIRED` connects (client reports `TLS_AES_256_GCM_SHA384`), queries run, `--ssl-mode=DISABLED` still plaintext, no-cert server rejects SSL clients (2026) while serving plaintext. | 117/117 tests green (84 engine + 33 server), release zero warnings |
 | 2026-09-05 | **B+ Tree Merges, Root Collapse & EBR Reclamation on DELETE** (`btree.rs`, `table.rs`, `db/mod.rs`): (1) **Fix-up passes** (`fix_pass`/`fix_child`/`borrow`/`merge`): after every `remove()`, one lock-coupled root→leaf descent per merge level borrows a key through the parent separator from a sibling holding > `MIN_KEYS` (64), else fuses sparse siblings (combined always < `MAX_KEYS`, so always fits); parent separators, child pointers, and leaf `next` links update under the parent's exclusive latch; a merge-drained parent is fixed by repeating the pass (merges strictly reduce node count, so it terminates); single-child internal roots collapse under the root mutex (reverse of wrapping); (2) **OLC safety**: same-level sibling latches are only taken while the common parent is exclusively held (serializing such writers); all other paths latch strictly root→leaf one at a time — deadlock-free by construction; version bumps on every unlock restart overlapping optimistic readers; (3) **Reclamation**: merged-away `Arc`s retire via the attached `EpochManager` (`BTree::set_epoch_manager`, propagated through `Table::set_epoch_manager` to primary + secondary trees at open/replay/DDL, plus new `add_index` trees); `remove()` pumps `try_reclaim`; without a manager the dropped `Arc` still frees once stale readers release it; (4) **Tests**: 4 new (10k→1k heavy delete shrinks node count >2x with exact content, 300→5 root collapse to height 1, 4-way concurrent deletes + optimistic readers, pinned-guard EBR queue + drain); diagnostics `height()`/`node_count()` added. Note: one `STATUS_ACCESS_VIOLATION` in `concurrent_inserts_and_reads` under full parallel load mid-session (insert-only path, untouched by this change; passes in isolation and on rerun) — the documented `UnsafeCell` torn-read race, roadmap item for relaxed-atomics/COW. | 121/121 tests green (88 engine + 33 server), release zero warnings |
 | 2026-09-05 | **F3: MVCC Version Buffer & Snapshot Isolation** (`db/mvcc.rs`, `db/mod.rs`, `sql/ast.rs`, `sql/parser.rs`, `sql/tests.rs`, `db/tests.rs`): (1) **Epochs**: `commit_epoch` counter allocated under the commit lock (epochs follow WAL order) in `commit_txn` + `commit_single_update`; (2) **Recording**: `record_install` preserves the superseded row + commits the live epoch per key, but only while a snapshot reader is active (zero overhead otherwise); identical overwrites and absent-key deletes skipped; DROP TABLE/DATABASE purge their history; checkpoint GCs; (3) **Reads**: `START TRANSACTION WITH CONSISTENT SNAPSHOT` pins the counter and registers for GC protection; `visible_row` time-travels through `snapshot_lookup` (current iff commit epoch < R, else newest chain entry with `until` >= R); scans additionally restore keys deleted after the pin via `snapshot_scan_extra` (IN-list order preserved, key order restored on range/full scans); staged own-writes still win; plain `BEGIN`/autocommit paths byte-identical to before; (4) **Boundary fix found by the suite**: pin R equals the next allocatable epoch, so visibility is strict (`C < R`, `until >= R`) — the naive `<=` leaked the first post-pin commit; (5) **Tests**: 6 new (parser, repeatable point reads across update+insert, deleted-row visibility point+scan, uncommitted-write invisibility + rollback, chain growth + full drain on release + zero recording in plain OLTP, 200-write concurrent storm with stable pinned reads). Documented v1 limits: history is in-memory only (post-open rows read as epoch 0), multi-row commits install row-by-row (per-row, not atomic, snapshot visibility). | 127/127 tests green (94 engine + 33 server), release zero warnings; `db/tests.rs` at 1,471 lines (split on the next test-adding task) |
+| 2026-09-05 | **PG1: PostgreSQL Wire Protocol 3.0 — Simple Query Frontend** (`wire/pg/{mod,codec,tests}.rs`, `wire/mod.rs`, `server/src/main.rs`, `crates/engine/src/db/mod.rs`): (1) **Codec** (`pg/codec.rs`, pure functions): startup/SSLRequest/GSS parsing, `AuthenticationOk`/cleartext frames, `ParameterStatus`/`BackendKeyData`/`ReadyForQuery`, `RowDescription` (type OIDs 16/20/23/25/700/701/1114/1184) + text `DataRow` (NULL as -1) + `CommandComplete` tags (`SELECT n`, `INSERT 0 n`, `UPDATE/DELETE n`) + `ErrorResponse` with PG SQLSTATE map (42P01/23505/42601/0A000/...) + `EmptyQueryResponse`; (2) **Handler** (`pg/mod.rs`): SSLRequest → `S` + rustls upgrade when certs configured else `N`; StartupMessage params; cleartext-password auth verified against `auth.bin` verifiers (sha256/double-sha1 recompute; empty accounts pass empty); `USE <database>` routing; per-statement execute with describe-driven column types (TEXT fallback); first-error-skips-rest + `ReadyForQuery` (`I`/`T` via new `Session::in_transaction()`); `X` clean close; extended-protocol messages get per-message `0A000` without killing the conn; (3) **Listener** (`main.rs`): dedicated `--pg-port` (default 5432, tries +1..+8 on conflict, `--no-pg`/`0` disables; never breaks the MySQL side) with shared admission counting, registry, drain flag, and TLS config; (4) **Tests**: 12 new (startup decode/reject, SSL codes, frame shapes, error fields, SQLSTATE map, multicolumn RowDescription OIDs, NULL DataRow, tags, framing incl. oversize reject, password paths incl. cross-plugin fail-closed, ReadyForQuery vs real txn); (5) **Verified live with stock `psql.exe`**: DDL/DML/SELECT with correct tags, NULL rendering, 42P01 errors, BEGIN/UPDATE/COMMIT/DELETE tags, unknown-user 28P01 reject, `sslmode=require` over TLS (queries run), plaintext fallback after `N`. Deviations: all statements via `Database::execute` (no separate `query` entry exists); `server_version` reports `18.0 (henchDB 0.1.0)` from constants instead of a hardcoded string. Follow-ups (PG2): extended protocol (needed by DBeaver/psycopg volumetric use), COPY, SCRAM. | 139/139 tests green (94 engine + 45 server), release zero warnings; `db/mod.rs` at 1,402 lines, `db/tests.rs` 1,471 (split both on the next touching task) |
 *(next agents: add rows here)*
 
 ---
@@ -299,50 +300,75 @@ The engine has achieved core relational and performance superiority over MySQL 8
 * ✅ **Frontier Milestone F3 (v1.0): MVCC Version Buffer & Snapshot Isolation**
   - `START TRANSACTION WITH CONSISTENT SNAPSHOT` pins a read epoch; installs record superseded rows only while readers are active; point + scan reads time-travel (deleted-after-pin rows restored); GC on release/checkpoint/DROP. v1 limits: in-memory history (no restart survival), per-row (not atomic) commit visibility.
 
----
-
-### 🎯 Active Priorities for Enterprise Production (v1.0)
-
-### 1. 🔐 Enterprise Priority 1 (SEC2): Wire Encryption (TLS 1.3 / SSL)
-* **Status**: ✅ **DONE** (rustls 0.23 + ring; `--tls-cert`/`--tls-key`; `CLIENT_SSL` gated on config; plaintext + legacy paths intact)
-* **Remaining**: per-user privileges (SEC8) before exposing the port publicly; certificate rotation without restart.
+* ✅ **Milestone PG1: PostgreSQL Wire Protocol 3.0 (Simple Query Frontend)**
+  - Dedicated `--pg-port` listener (5432 + fallback); SSLRequest/TLS upgrade reuse rustls; cleartext-password auth against `auth.bin`; `RowDescription`/text `DataRow`/`CommandComplete`/SQLSTATE errors via the shared engine executor; verified live with stock `psql.exe` (plaintext + `sslmode=require`). Follow-up PG2: extended protocol, COPY, SCRAM.
 
 ---
 
-### 2. ⚡ Enterprise Priority 2 (F5-remainder): Cascades Memo Optimizer
-* **Status**: 🟡 **FUTURE WORK**
-* **Why it matters**: Greedy ordering + smallest-side hash builds already cover the common multi-table shapes. Full Cascades (costed memo, bushy plans) is incremental from here.
+* ✅ **Enterprise Priority 1 (SEC2): Wire Encryption (TLS 1.3 / SSL)**
+  - MySQL wire `SSLRequest` packet negotiation; pure Rust runtime crypto (`rustls 0.23` + `ring`); `--tls-cert` and `--tls-key` support; verified live with stock `mysql.exe --ssl-mode=REQUIRED`.
+
+* ✅ **Enterprise Priority 2: In-Memory Hash Joins & Greedy Join Ordering (F5 part 1)**
+  - Equi-key build/probe per join step (smaller-side build for `INNER`, right-build for `LEFT`); greedy join ordering (`order_joins` places smallest-ready INNER first, LEFT barriers, canonical written-order `*` projection).
+
+* ✅ **Enterprise Priority 3: Foreign Key Constraints & Referential Integrity**
+  - `FOREIGN KEY (col) REFERENCES tbl(col) [ON DELETE RESTRICT/CASCADE/SET NULL]` in `CREATE TABLE`; child INSERT/UPDATE validation, parent DELETE actions in atomic commit, DROP guard, auto-indexing (`fk_{col}`).
+
+* ✅ **Enterprise Priority 4: B+ Tree Merges & EBR Reclamation on DELETE**
+  - Borrow/merge underflow fix-ups with parent-latched separators, root collapse under the root mutex, merged nodes retired via `EpochManager`.
+
+* ✅ **Enterprise Priority 5: MVCC Version Buffer & Snapshot Isolation (F3)**
+  - `START TRANSACTION WITH CONSISTENT SNAPSHOT` pins read epoch; superseded rows recorded only while snapshot readers are active; point + scan reads time-travel (deleted-after-pin rows restored); automatic GC.
+
+---
+
+## 7. Strategic Roadmap: v2.0 Frontier (PostgreSQL Ecosystem & Advanced Scale)
+
+With v1.0 feature completeness achieved across single-node OLTP, concurrency, durability, and MySQL client compatibility, the v2.0 frontier expands henchDB into a multi-ecosystem drop-in replacement:
+
+---
+
+### 1. 🐘 Priority 1: Head-to-Head Benchmark Suite vs PostgreSQL 16/17 (`bench_postgres.py`)
+* **Status**: 🎯 **TOP IMMEDIATE PRIORITY**
+* **Why it matters**: Demonstrates henchDB's architectural superiority over PostgreSQL's process-per-connection fork model, heap-tuple VACUUM table bloat, and `WALWriteLock` spinlock contention.
 * **Architecture**:
-  - Memoize alternative orderings with estimated cardinalities; allow bushy (non-left-deep) shapes for 4+ table joins.
+  - Build `bench_postgres.py` mirroring `bench_strict.py` (same 50,000-row `bench` schema, identical point select, range scan, read-write transaction, and durable update workloads).
+  - Test against local PostgreSQL 16/17 with default durability (`synchronous_commit = on`).
+* **Effort**: Low–Medium.
+
+---
+
+### 2. 🔌 Priority 2: Dual-Protocol PostgreSQL Compatibility (pgproto 3.0 / Port 5432)
+* **Status**: 🎯 **STRATEGIC ECOSYSTEM EXPANSION**
+* **Why it matters**: Allows developers and web frameworks in the PostgreSQL ecosystem (`psql`, `psycopg2`, `node-postgres`, `pgx`, `asyncpg`, Prisma, DBeaver) to use henchDB as a drop-in Postgres replacement with zero code changes.
+* **Architecture**:
+  - Implement PostgreSQL Frontend/Backend Protocol 3.0 in `crates/server/src/wire/pg.rs`.
+  - Listen on port 5432 (or sniff StartupMessage `0x00030000` on the multi-protocol listener).
+  - Handle StartupMessage, Simple Query (`'Q'`), RowDescription (`'T'`), DataRow (`'D'`), CommandComplete (`'C'`), and ReadyForQuery (`'Z'`).
+  - Route incoming SQL through the existing hand-written SQL parser and execution pipeline.
 * **Effort**: Medium.
 
 ---
 
-### 3. Enterprise Priority 3: B+ Tree Node Merging & Memory Reclamation on `DELETE`
-* **Status**: DONE (borrow/merge fix-ups, root collapse, EBR retire — see completed milestones; follow-up: page-level deallocation for overflow pool still open)
+### 3. 📦 Priority 3: Online Physical Backup & Streaming Snapshot Tooling (`henchdump`)
+* **Status**: 🟡 **BACKLOG**
+* **Why it matters**: Live backups without stopping the database server or interrupting concurrent transactions.
+* **Architecture**:
+  - Stream consistent snapshot images + active WAL segment offsets directly to local disk or object storage.
+* **Effort**: Medium.
 
 ---
 
-### 4. 🔄 Enterprise Priority 4 (F3): MVCC Version Buffer & Snapshot Isolation (`research.md` §MVCC)
-* **Status**: DONE (version buffer + `START TRANSACTION WITH CONSISTENT SNAPSHOT` + GC — see completed milestones; follow-ups: restart-surviving history, atomic multi-row commit visibility)
-* **Effort**: Done.
-* **Why it matters**: Readers currently see committed tree state directly (Read Committed). Long analytical reports running alongside heavy writers require `REPEATABLE READ` snapshot isolation.
-* **Architecture**:
-  - Append historical row deltas to an in-memory version buffer rather than overwriting in-place.
-  - Analytical readers pin an epoch timestamp and walk backwards through version chains without taking latches or stalling writers.
+### 4. 🚀 Priority 4: Distributed Per-Core WAL & Linux `io_uring` (Linux)
+* **Status**: 🟡 **HIGH-END HARDWARE SCALE**
+* **Why it matters**: Pushes write scalability on 32+ core dedicated Linux servers beyond 100,000+ durable writes/sec.
+* **Architecture**: Dedicated private ring buffer per CPU core, deferred commit epoch synchronization, `io_uring` `IOPOLL` on Linux (`cfg`-gated).
 * **Effort**: High.
 
 ---
 
-### 5. 🚀 Enterprise Priority 5 (F6): Per-Core Distributed WAL & io_uring (Linux)
-* **Status**: 🟡 **SCALABILITY ROADMAP**
-* **Why it matters**: Scales durable commit throughput on 32+ core servers beyond the single group-commit syncer lock.
-* **Architecture**: Dedicated private ring buffer per CPU core, deferred commit epoch synchronization, `io_uring` `IOPOLL` on Linux (`cfg`-gated).
-
----
-
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**127 tests: 94 engine + 33 server** as of this writing).
+1. `cargo test` — all green (**139 tests: 94 engine + 45 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

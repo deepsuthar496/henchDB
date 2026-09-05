@@ -69,6 +69,13 @@ pub struct Session {
     pub(crate) snapshot: Option<SnapshotPin>,
 }
 
+impl Session {
+    /// True while an explicit transaction is open (drives PG ReadyForQuery).
+    pub fn in_transaction(&self) -> bool {
+        self.txn.is_some()
+    }
+}
+
 impl Default for Session {
     fn default() -> Self {
         Session {

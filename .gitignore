@@ -2,6 +2,7 @@ target/
 mysql/
 mysql_data/
 temp/
+postgresql/
 __pycache__/
 *.pyc
 *.log
@@ -17,5 +18,6 @@ Desktop.ini
 .idea/
 *.iml
 data/
+postgres_data/
 research.md
 *.py
