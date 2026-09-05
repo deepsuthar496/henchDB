@@ -52,8 +52,9 @@ fn query_execution_timeout() {
     db.execute(&mut s, "SET max_execution_time = 1").unwrap();
     assert_eq!(s.max_execution_time, Some(std::time::Duration::from_millis(1)));
 
+    std::thread::sleep(std::time::Duration::from_millis(2));
     let res = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.id WHERE t.v LIKE '%row%'");
-    assert!(res.is_ok() || matches!(res, Err(Error::QueryTimeout)));
+    assert_eq!(res, Err(Error::QueryTimeout));
 
     db.execute(&mut s, "SET max_execution_time = 0").unwrap();
     assert_eq!(s.max_execution_time, None);

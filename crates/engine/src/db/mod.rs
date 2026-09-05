@@ -38,7 +38,7 @@ pub(crate) mod query;
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Output {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Datum>>,
@@ -130,14 +130,19 @@ impl Database {
         let snap = dir.join("snapshot.bin");
         if snap.exists() {
             let mut f = File::open(&snap)?;
-            for (def, rows) in catalog::decode_snapshot(&mut f)? {
+            let (snap_dbs, snap_tables) = catalog::decode_snapshot(&mut f)?;
+            for db_name in snap_dbs {
+                databases.insert(db_name);
+            }
+            for (def, rows) in snap_tables {
+                if let Some((db_prefix, _)) = def.name.split_once('.') {
+                    databases.insert(db_prefix.to_string());
+                }
                 let table = Arc::new(Table::new(def));
                 table.set_pool(pool.clone());
                 for row in rows {
                     match row.key {
-                        // v2: explicit key + stored value (may be a locator).
                         Some(key) => table.restore_kv(&key, &row.value)?,
-                        // v1: inline values only, key re-derived.
                         None => table.restore_raw(&row.value)?,
                     }
                 }
@@ -205,9 +210,13 @@ impl Database {
     /// Flush a durable snapshot and truncate the WAL.
     pub fn checkpoint(&self) -> Result<()> {
         let _guard = self.commit_lock.lock().unwrap();
-        // The snapshot references overflow pages, so the pool must be durable
-        // first; WAL replay (full rows) remains the backstop regardless.
         self.pool.sync_data()?;
+
+        let dbs_guard = self.databases.read().unwrap();
+        let mut db_list: Vec<String> = dbs_guard.iter().cloned().collect();
+        db_list.sort();
+        drop(dbs_guard);
+
         let tables = self.tables.read().unwrap();
         let mut data = Vec::new();
         for table in tables.values() {
@@ -219,7 +228,7 @@ impl Database {
         {
             let f = File::create(&tmp)?;
             let mut bw = std::io::BufWriter::with_capacity(128 * 1024, f);
-            catalog::encode_snapshot(&mut bw, &data)?;
+            catalog::encode_snapshot(&mut bw, &db_list, &data)?;
             bw.flush()?;
             bw.into_inner().map_err(|e| Error::Io(e.to_string()))?.sync_data()?;
         }
@@ -358,8 +367,16 @@ impl Database {
                 Ok(Output::ok("ROLLBACK"))
             }
             Statement::ShowTables => {
+                let prefix = format!("{}.", session.current_db);
                 let tables = self.tables.read().unwrap();
-                let mut names: Vec<String> = tables.keys().cloned().collect();
+                let mut names: Vec<String> = Vec::new();
+                for key in tables.keys() {
+                    if let Some(rest) = key.strip_prefix(&prefix) {
+                        names.push(rest.to_string());
+                    } else if session.current_db == "default" && !key.contains('.') {
+                        names.push(key.clone());
+                    }
+                }
                 names.sort();
                 Ok(Output {
                     columns: vec!["table".into()],
@@ -1131,6 +1148,12 @@ impl Database {
         table: &Arc<Table>,
         selection: Option<&Expr>,
     ) -> Result<Vec<Vec<Datum>>> {
+        let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() > dl {
+                return Err(Error::QueryTimeout);
+            }
+        }
         let schema = table.schema();
         let overlay: Option<Vec<(Vec<u8>, &StagedWrite)>> = session.txn.as_ref().map(|t| {
             t.staged
@@ -1205,7 +1228,16 @@ impl Database {
                 }
             }
             AccessPath::FullScan => {
+                let mut check_counter = 0usize;
                 for (k, raw) in table.tree().scan_all() {
+                    check_counter += 1;
+                    if check_counter % 256 == 0 {
+                        if let Some(dl) = deadline {
+                            if std::time::Instant::now() > dl {
+                                return Err(Error::QueryTimeout);
+                            }
+                        }
+                    }
                     rows.push((k, table.decode_stored(&raw)?));
                 }
             }

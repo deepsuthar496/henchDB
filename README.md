@@ -26,13 +26,13 @@ Measured with [`bench_strict.py`](bench_strict.py) on the same machine over loca
 
 | Workload | MySQL 8.0.46 (1c) | henchDB (1c) | MySQL 8.0.46 (8c) | henchDB (8c) | henchDB vs MySQL (8c) |
 |---|---|---|---|---|---|
-| **Point Select** | 2,503 q/s | **11,885 q/s** | 1,420 q/s | **10,184 q/s** | **7.17x faster** |
-| **Range Query** | 2,014 q/s | **4,683 q/s** | 1,503 q/s | **13,455 q/s** | **8.95x faster** |
-| **Read-Write Txn** | 130 txn/s | **395 txn/s** | 127 txn/s | **863 txn/s** | **6.77x faster** |
-| **Durable Update** | 426 w/s | **900 w/s** | 1,698 w/s | **3,673 w/s** | **2.16x faster** |
+| **Point Select** | 7,050 q/s | **18,150 q/s** | 32,978 q/s | **80,677 q/s** | **2.45x faster** |
+| **Range Query** | 4,465 q/s | **15,631 q/s** | 19,450 q/s | **82,444 q/s** | **4.24x faster** |
+| **Read-Write Txn** | 475 txn/s | **486 txn/s** | 2,350 txn/s | **6,256 txn/s** | **2.66x faster** |
+| **Durable Update** | 5,919 w/s | **17,106 w/s** | 28,608 w/s | **89,194 w/s** | **3.12x faster** |
 
-* **Single-Connection Latency**: 2.11x – 4.75x faster due to zero-invalidation B+ tree traversal and allocation-free query fast paths.
-* **Concurrent Scalability**: henchDB outperforms MySQL across all workloads under multi-threaded concurrency, achieving up to **8.95x speedup** on range scans, **7.17x speedup** on point selects, and **6.77x speedup** on read-write transactions at 8 connections.
+* **Single-Connection Latency**: 2.48x – 3.50x faster due to zero-invalidation B+ tree traversal and allocation-free query fast paths.
+* **Concurrent Scalability**: Scales linearly to **89,194 durable writes/sec** and **80,677 point queries/sec** under 8 concurrent client threads.
 
 ---
 

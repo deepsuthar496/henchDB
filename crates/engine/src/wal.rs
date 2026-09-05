@@ -25,9 +25,9 @@ use crate::types::{ColumnType, Datum};
 use std::io::Seek;
 
 pub const WAL_MAGIC: &[u8; 4] = b"HDBW";
-/// v2 adds the per-column AUTO_INCREMENT byte to table defs (F7). v1 logs
-/// still decode (columns default to non-auto-increment).
-pub const WAL_FORMAT_VERSION: u32 = 2;
+/// v2 adds the per-column AUTO_INCREMENT byte to table defs (F7). v3 adds
+/// default column values and datetime/timestamp coltypes.
+pub const WAL_FORMAT_VERSION: u32 = 3;
 
 const KIND_PUT: u8 = 1;
 const KIND_DELETE: u8 = 2;
@@ -376,10 +376,10 @@ impl Wal {
         let mut vb = [0u8; 4];
         reader.read_exact(&mut vb)?;
         let version = u32::from_le_bytes(vb);
-        if version != 1 && version != WAL_FORMAT_VERSION {
+        if version != 1 && version != 2 && version != WAL_FORMAT_VERSION {
             return Err(Error::Corrupted(format!("WAL version {version}")));
         }
-        let legacy_cols = version == 1;
+        let legacy_cols = version < 3;
         let mut out = Vec::new();
         loop {
             let mut hdr = [0u8; 8];

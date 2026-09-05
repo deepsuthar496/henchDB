@@ -218,6 +218,11 @@ pub fn handle_mysql_connection(
                 writer.flush()?;
                 return Ok(());
             }
+            if let Some(db_name) = &hs.db {
+                if !db_name.is_empty() {
+                    let _ = db.execute(&mut session, &format!("USE `{db_name}`"));
+                }
+            }
             hs.username
         }
         _ => {
@@ -269,8 +274,21 @@ pub fn handle_mysql_connection(
                 break;
             }
             COM_INIT_DB => {
-                write_packet(&mut writer, &ok_payload(0, ""), &mut out_seq)?;
-                writer.flush()?;
+                let db_name = String::from_utf8_lossy(&payload[1..])
+                    .trim_matches('\0')
+                    .trim()
+                    .to_string();
+                if db_name.is_empty() {
+                    write_err_msg(&mut writer, &mut out_seq, 1049, "Unknown database ''")?;
+                } else {
+                    match db.execute(&mut session, &format!("USE `{db_name}`")) {
+                        Ok(_) => {
+                            write_packet(&mut writer, &ok_payload(0, ""), &mut out_seq)?;
+                            writer.flush()?;
+                        }
+                        Err(e) => write_err(&mut writer, &mut out_seq, &e)?,
+                    }
+                }
             }
             COM_PING => {
                 write_packet(&mut writer, &ok_payload(0, ""), &mut out_seq)?;
