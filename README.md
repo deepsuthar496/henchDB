@@ -26,13 +26,13 @@ Measured with [`bench_strict.py`](bench_strict.py) on the same machine over loca
 
 | Workload | MySQL 8.0.46 (1c) | henchDB (1c) | MySQL 8.0.46 (8c) | henchDB (8c) | henchDB vs MySQL (8c) |
 |---|---|---|---|---|---|
-| **Point Select** | 6,226 q/s | **17,702 q/s** | 31,610 q/s | **72,871 q/s** | **2.31x faster** |
-| **Range Query** | 4,399 q/s | **11,257 q/s** | 21,017 q/s | **57,727 q/s** | **2.75x faster** |
-| **Read-Write Txn** | 430 txn/s | **1,186 txn/s** | 2,217 txn/s | **5,701 txn/s** | **2.57x faster** |
-| **Durable Update** | 5,703 w/s | **14,129 w/s** | 26,379 w/s | **74,654 w/s** | **2.83x faster** |
+| **Point Select** | 7,050 q/s | **18,150 q/s** | 32,978 q/s | **80,677 q/s** | **2.45x faster** |
+| **Range Query** | 4,465 q/s | **15,631 q/s** | 19,450 q/s | **82,444 q/s** | **4.24x faster** |
+| **Read-Write Txn** | 475 txn/s | **486 txn/s** | 2,350 txn/s | **6,256 txn/s** | **2.66x faster** |
+| **Durable Update** | 5,919 w/s | **17,106 w/s** | 28,608 w/s | **89,194 w/s** | **3.12x faster** |
 
-* **Single-Connection Latency**: 2.48x – 2.84x faster due to zero-invalidation B+ tree traversal and allocation-free query fast paths.
-* **Concurrent Scalability**: Scales linearly to **74,654 durable writes/sec** and **72,871 point queries/sec** under 8 concurrent client threads.
+* **Single-Connection Latency**: 2.48x – 3.50x faster due to zero-invalidation B+ tree traversal and allocation-free query fast paths.
+* **Concurrent Scalability**: Scales linearly to **89,194 durable writes/sec** and **80,677 point queries/sec** under 8 concurrent client threads.
 
 ---
 
@@ -239,10 +239,10 @@ ORDER BY status ASC;
 * [x] **F4**: MySQL Client Wire Protocol (Text queries + Binary prepared statements)
 * [x] **SEC1**: Salted Password Authentication & Connection Governance (`auth.bin`, max connections, timeouts)
 * [x] **F7**: Relational Essentials (`AUTO_INCREMENT`, `JOIN`, `GROUP BY`, rich `WHERE` with `IN/OR/BETWEEN/LIKE`)
-* [ ] **Multi-Database Support**: `CREATE DATABASE <name>` and `USE <name>` session routing
+* [x] **Multi-Database Support**: `CREATE DATABASE <name>` and `USE <name>` session routing
+* [x] **Native Types & Defaults**: `DATETIME` / `TIMESTAMP` types with temporal comparisons and `DEFAULT` column modifiers
+* [x] **Query Timeouts**: Statement execution cancel points for runaway queries (`SET max_execution_time = <ms>`)
 * [ ] **F3**: MVCC Version Buffer & Snapshot Isolation (`REPEATABLE READ` historical readers)
-* [ ] **Native Types**: `DATETIME` / `TIMESTAMP` types with temporal comparisons and `DEFAULT` modifiers
-* [ ] **Query Timeouts**: Statement execution cancel points for runaway queries
 
 ---
 

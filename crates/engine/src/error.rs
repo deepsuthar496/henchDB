@@ -20,11 +20,17 @@ pub enum Error {
     IndexNotFound(String),
     IndexExists(String),
     InvalidSchema(String),
+    DatabaseNotFound(String),
+    DatabaseExists(String),
+    QueryTimeout,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::QueryTimeout => write!(f, "Query execution was interrupted, maximum statement execution time exceeded"),
+            Error::DatabaseNotFound(d) => write!(f, "database '{d}' does not exist"),
+            Error::DatabaseExists(d) => write!(f, "database '{d}' already exists"),
             Error::TableNotFound(t) => write!(f, "table '{t}' does not exist"),
             Error::TableExists(t) => write!(f, "table '{t}' already exists"),
             Error::ColumnNotFound(c) => write!(f, "column '{c}' not found"),

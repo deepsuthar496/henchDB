@@ -18,18 +18,18 @@ impl Database {
     /// `*` via the schema; anything without a result set yields no columns.
     /// Unknown tables/columns are errors (prepare-time validation, like
     /// MySQL).
-    pub fn describe(&self, sql: &str) -> Result<Vec<(String, ColumnType)>> {
+    pub fn describe(&self, session: &Session, sql: &str) -> Result<Vec<(String, ColumnType)>> {
         let stmt = parse_sql(sql.trim())?;
         match stmt {
             Statement::Select { items, from, joins, .. } => {
-                let mut tables: Vec<Arc<Table>> = vec![self.table(&from)?];
+                let mut tables: Vec<Arc<Table>> = vec![self.table(session, &from)?];
                 for j in joins {
-                    if tables.iter().any(|t| t.def.name == *j.table) {
+                    if tables.iter().any(|t| t.def.name == *j.table || t.def.name.ends_with(&format!(".{}", j.table))) {
                         return Err(Error::NotSupported(
                             "self-joins need table aliases (unsupported)".into(),
                         ));
                     }
-                    tables.push(self.table(&j.table)?);
+                    tables.push(self.table(session, &j.table)?);
                 }
                 // For bare star columns, qualify only on cross-table collision.
                 let mut cols = Vec::new();
@@ -174,7 +174,13 @@ impl Database {
         order_by: Vec<(String, bool)>,
         limit: Option<usize>,
     ) -> Result<Output> {
-        let table_arc = self.table(from)?;
+        let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() > dl {
+                return Err(Error::QueryTimeout);
+            }
+        }
+        let table_arc = self.table(session, from)?;
         let schema = table_arc.schema();
         let selection = selection.map(|s| Self::strip_qualifiers(&s, from)).transpose()?;
 
@@ -334,9 +340,10 @@ impl Database {
         let mut out = Vec::new();
         let mut base = 0usize;
         for t in tables {
+            let simple_name = t.def.name.split('.').last().unwrap_or(&t.def.name);
             for (i, c) in t.schema().columns.iter().enumerate() {
                 let name = if use_count[c.name.as_str()] > 1 {
-                    format!("{}.{}", t.def.name, c.name)
+                    format!("{simple_name}.{}", c.name)
                 } else {
                     c.name.clone()
                 };
@@ -353,7 +360,8 @@ impl Database {
         let mut base = 0usize;
         if let Some((t, c)) = name.split_once('.') {
             for table in tables {
-                if table.def.name == t {
+                let simple_name = table.def.name.split('.').last().unwrap_or(&table.def.name);
+                if table.def.name == t || simple_name == t {
                     return Ok(base
                         + table
                             .schema()
@@ -409,14 +417,20 @@ impl Database {
     ) -> Result<Output> {
         // 1. Scope tables; one table name per query (self-joins need aliases,
         //    which do not exist yet).
-        let mut tables: Vec<Arc<Table>> = vec![self.table(from)?];
+        let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() > dl {
+                return Err(Error::QueryTimeout);
+            }
+        }
+        let mut tables: Vec<Arc<Table>> = vec![self.table(session, from)?];
         for j in &joins {
-            if tables.iter().any(|t| t.def.name == j.table) {
+            if tables.iter().any(|t| t.def.name == j.table || t.def.name.ends_with(&format!(".{}", j.table))) {
                 return Err(Error::NotSupported(
                     "self-joins need table aliases (unsupported)".into(),
                 ));
             }
-            tables.push(self.table(&j.table)?);
+            tables.push(self.table(session, &j.table)?);
         }
         // 2. Inputs: full scans with the txn overlay (no per-table filter —
         //    WHERE applies post-join).
@@ -431,6 +445,11 @@ impl Database {
             let right_arity = tables[ji + 1].schema().columns.len();
             let mut next = Vec::new();
             for l in &rows {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        return Err(Error::QueryTimeout);
+                    }
+                }
                 let mut matched = false;
                 for r in &inputs[ji + 1] {
                     let mut combined = Vec::with_capacity(l.len() + r.len());

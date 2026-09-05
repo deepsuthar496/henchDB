@@ -14,7 +14,7 @@ pub const SNAPSHOT_MAGIC: &[u8; 4] = b"HDBS";
 /// checkpoints (v1 stored values only and re-derived keys, which locators
 /// cannot provide). v3 adds the per-column AUTO_INCREMENT byte (F7).
 /// Older snapshots still decode (missing fields take safe defaults).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 /// One snapshot row: explicit key plus stored value (inline row or locator).
 #[derive(Debug, Clone)]
@@ -58,9 +58,17 @@ impl Catalog {
 ///   table_def, row_count(u64), rows:
 ///     v1: [u32 len][value bytes]*
 ///     v2: [u32 key_len][key][u32 val_len][value]*
-pub fn encode_snapshot<W: Write>(w: &mut W, tables: &[(TableDef, Vec<(Vec<u8>, Vec<u8>)>)]) -> Result<()> {
+pub fn encode_snapshot<W: Write>(
+    w: &mut W,
+    databases: &[String],
+    tables: &[(TableDef, Vec<(Vec<u8>, Vec<u8>)>)],
+) -> Result<()> {
     w.write_all(SNAPSHOT_MAGIC)?;
     w.write_all(&SNAPSHOT_FORMAT_VERSION.to_le_bytes())?;
+    w.write_all(&(databases.len() as u32).to_le_bytes())?;
+    for db in databases {
+        put_str(w, db)?;
+    }
     w.write_all(&(tables.len() as u32).to_le_bytes())?;
     for (def, rows) in tables {
         let mut buf = Vec::new();
@@ -82,7 +90,7 @@ pub fn encode_snapshot<W: Write>(w: &mut W, tables: &[(TableDef, Vec<(Vec<u8>, V
     Ok(())
 }
 
-pub fn decode_snapshot<R: Read>(r: &mut R) -> Result<Vec<(TableDef, Vec<SnapRow>)>> {
+pub fn decode_snapshot<R: Read>(r: &mut R) -> Result<(Vec<String>, Vec<(TableDef, Vec<SnapRow>)>)> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
     if &magic != SNAPSHOT_MAGIC {
@@ -91,10 +99,24 @@ pub fn decode_snapshot<R: Read>(r: &mut R) -> Result<Vec<(TableDef, Vec<SnapRow>
     let mut b4 = [0u8; 4];
     r.read_exact(&mut b4)?;
     let version = u32::from_le_bytes(b4);
-    if version != 1 && version != 2 && version != SNAPSHOT_FORMAT_VERSION {
+    if version != 1 && version != 2 && version != 3 && version != SNAPSHOT_FORMAT_VERSION {
         return Err(Error::Corrupted("snapshot version".into()));
     }
-    // Pre-v3 table defs carry no AUTO_INCREMENT byte per column.
+
+    let mut databases = Vec::new();
+    if version >= 4 {
+        r.read_exact(&mut b4)?;
+        let ndbs = u32::from_le_bytes(b4) as usize;
+        if ndbs > 10_000 {
+            return Err(Error::Corrupted("snapshot db count too large".into()));
+        }
+        for _ in 0..ndbs {
+            databases.push(take_str(r)?);
+        }
+    } else {
+        databases.push("default".to_string());
+    }
+
     r.read_exact(&mut b4)?;
     let ntables = u32::from_le_bytes(b4) as usize;
     if ntables > 100_000 {
@@ -145,7 +167,25 @@ pub fn decode_snapshot<R: Read>(r: &mut R) -> Result<Vec<(TableDef, Vec<SnapRow>
         }
         out.push((def, rows));
     }
-    Ok(out)
+    Ok((databases, out))
+}
+
+fn put_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
+    w.write_all(&(s.len() as u32).to_le_bytes())?;
+    w.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+fn take_str<R: Read>(r: &mut R) -> Result<String> {
+    let mut b4 = [0u8; 4];
+    r.read_exact(&mut b4)?;
+    let len = u32::from_le_bytes(b4) as usize;
+    if len > 1024 {
+        return Err(Error::Corrupted("db name too long".into()));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    String::from_utf8(buf).map_err(|_| Error::Corrupted("utf8 db name".into()))
 }
 
 #[cfg(test)]
@@ -160,21 +200,23 @@ mod tests {
             name: "t".into(),
             schema: Schema {
                 columns: vec![
-                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false },
-                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false, default_value: None },
+                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
                 ],
                 pk_idx: 0,
             },
             indexes: Vec::new(),
         };
+        let dbs = vec!["default".to_string()];
         let tables = vec![(def, vec![(vec![9u8], vec![1, 9, 3, 0, 0, 0, 0, 0, 0, 1, 2])])];
         let mut buf = Vec::new();
-        encode_snapshot(&mut buf, &tables).unwrap();
-        let decoded = decode_snapshot(&mut buf.as_slice()).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].0.name, "t");
-        assert_eq!(decoded[0].1.len(), 1);
-        assert_eq!(decoded[0].1[0].key, Some(vec![9u8]));
+        encode_snapshot(&mut buf, &dbs, &tables).unwrap();
+        let (snap_dbs, snap_tables) = decode_snapshot(&mut buf.as_slice()).unwrap();
+        assert_eq!(snap_dbs, vec!["default".to_string()]);
+        assert_eq!(snap_tables.len(), 1);
+        assert_eq!(snap_tables[0].0.name, "t");
+        assert_eq!(snap_tables[0].1.len(), 1);
+        assert_eq!(snap_tables[0].1[0].key, Some(vec![9u8]));
     }
 
     #[test]
@@ -184,8 +226,9 @@ mod tests {
         buf.extend_from_slice(b"HDBS");
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // zero tables
-        let decoded = decode_snapshot(&mut buf.as_slice()).unwrap();
-        assert!(decoded.is_empty());
+        let (snap_dbs, snap_tables) = decode_snapshot(&mut buf.as_slice()).unwrap();
+        assert_eq!(snap_dbs, vec!["default".to_string()]);
+        assert!(snap_tables.is_empty());
     }
 
     #[test]
@@ -194,16 +237,17 @@ mod tests {
             name: "t".into(),
             schema: Schema {
                 columns: vec![
-                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false },
-                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                    ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false, default_value: None },
+                    ColumnDef { name: "v".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
                 ],
                 pk_idx: 0,
             },
             indexes: Vec::new(),
         };
+        let dbs = vec!["default".to_string()];
         let tables = vec![(def, vec![(vec![9u8], vec![1, 9, 3, 0, 0, 0, 0, 0, 0, 1, 2])])];
         let mut buf = Vec::new();
-        encode_snapshot(&mut buf, &tables).unwrap();
+        encode_snapshot(&mut buf, &dbs, &tables).unwrap();
 
         // 1. Bit flip fuzzing: must return Error::Corrupted or Err, never panic
         for i in 0..buf.len() {

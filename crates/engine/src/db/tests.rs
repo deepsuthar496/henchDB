@@ -36,6 +36,34 @@ fn crud_roundtrip() {
 }
 
 #[test]
+fn query_execution_timeout() {
+    let dir = std::env::temp_dir().join(format!("hdbtimeout_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute(&mut s, "CREATE TABLE u (id INT PRIMARY KEY, v TEXT)").unwrap();
+    for i in 0..1_000 {
+        db.execute(&mut s, &format!("INSERT INTO t VALUES ({i}, 'row-{i}')")).unwrap();
+        db.execute(&mut s, &format!("INSERT INTO u VALUES ({i}, 'row-{i}')")).unwrap();
+    }
+
+    db.execute(&mut s, "SET max_execution_time = 1").unwrap();
+    assert_eq!(s.max_execution_time, Some(std::time::Duration::from_millis(1)));
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let res = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.id WHERE t.v LIKE '%row%'");
+    assert_eq!(res, Err(Error::QueryTimeout));
+
+    db.execute(&mut s, "SET max_execution_time = 0").unwrap();
+    assert_eq!(s.max_execution_time, None);
+    assert!(db.execute(&mut s, "SELECT COUNT(*) FROM t").is_ok());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn explicit_txn_commit_and_rollback() {
     let dir = std::env::temp_dir().join(format!("hdbtxn_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -293,16 +321,17 @@ fn describe_reports_prepare_metadata() {
     let dir = std::env::temp_dir().join(format!("hdbdesc_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let db = setup(&dir);
-    let cols = db.describe("SELECT * FROM t").unwrap();
+    let s = db.new_session();
+    let cols = db.describe(&s, "SELECT * FROM t").unwrap();
     assert_eq!(cols.len(), 3);
     assert_eq!(cols[0].0, "id");
-    let cols = db.describe("SELECT name FROM t").unwrap();
+    let cols = db.describe(&s, "SELECT name FROM t").unwrap();
     assert_eq!(cols.len(), 1);
-    let cols = db.describe("SELECT COUNT(*) FROM t").unwrap();
+    let cols = db.describe(&s, "SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(cols[0].0, "COUNT(*)");
-    assert!(db.describe("INSERT INTO t VALUES (1, 'x', 1.0)").unwrap().is_empty());
-    assert!(db.describe("SELECT * FROM missing").is_err());
-    assert!(db.describe("SELECT bogus FROM t").is_err());
+    assert!(db.describe(&s, "INSERT INTO t VALUES (1, 'x', 1.0)").unwrap().is_empty());
+    assert!(db.describe(&s, "SELECT * FROM missing").is_err());
+    assert!(db.describe(&s, "SELECT bogus FROM t").is_err());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -404,14 +433,14 @@ fn join_inner_left_and_group_by() {
     assert!(out.rows.is_empty());
 
     // Prepare-time describe works over joins (star qualifies collisions).
-    let cols = db.describe("SELECT users.name, SUM(orders.qty) FROM users JOIN orders ON users.id = orders.user_id").unwrap();
+    let cols = db.describe(&s, "SELECT users.name, SUM(orders.qty) FROM users JOIN orders ON users.id = orders.user_id").unwrap();
     assert_eq!(cols[0].0, "name");
     assert_eq!(cols[1].0, "SUM(orders.qty)");
-    let cols = db.describe("SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();
+    let cols = db.describe(&s, "SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();
     assert!(cols.iter().any(|(n, _)| n == "users.id"));
     assert!(cols.iter().any(|(n, _)| n == "orders.id"));
     assert!(cols.iter().any(|(n, _)| n == "name"));
-    assert!(db.describe("SELECT nope.x FROM users JOIN orders ON users.id = orders.user_id").is_err());
+    assert!(db.describe(&s, "SELECT nope.x FROM users JOIN orders ON users.id = orders.user_id").is_err());
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -581,8 +610,8 @@ fn path_table() -> Table {
         "t",
         Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false },
-                ColumnDef { name: "name".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false, default_value: None },
+                ColumnDef { name: "name".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
             ],
             pk_idx: 0,
         },
@@ -655,4 +684,61 @@ fn access_path_rich_where() {
         Ok(AccessPath::SecondaryIndex { .. }) => {}
         other => panic!("expected SecondaryIndex, got {other:?}"),
     }
+}
+
+#[test]
+fn database_namespaces_and_use() {
+    let dir = std::env::temp_dir().join(format!("hdbdb_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    let out = db.execute(&mut s, "SHOW DATABASES").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Text("default".into())]]);
+
+    db.execute(&mut s, "CREATE DATABASE shop").unwrap();
+    let out = db.execute(&mut s, "SHOW DATABASES").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Text("default".into())], vec![Datum::Text("shop".into())]]);
+
+    db.execute(&mut s, "USE shop").unwrap();
+    assert_eq!(s.current_db, "shop");
+
+    db.execute(&mut s, "CREATE TABLE items (id INT PRIMARY KEY, title TEXT)").unwrap();
+    db.execute(&mut s, "INSERT INTO items VALUES (1, 'Laptop')").unwrap();
+
+    let out = db.execute(&mut s, "SELECT title FROM items WHERE id = 1").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Text("Laptop".into())]]);
+
+    db.execute(&mut s, "USE default").unwrap();
+    assert!(db.execute(&mut s, "SELECT title FROM items WHERE id = 1").is_err());
+
+    db.execute(&mut s, "DROP DATABASE shop").unwrap();
+    assert!(db.execute(&mut s, "USE shop").is_err());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn schema_defaults_and_datetime_types() {
+    let dir = std::env::temp_dir().join(format!("hdbdt_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    db.execute(
+        &mut s,
+        "CREATE TABLE events (id INT PRIMARY KEY, name TEXT DEFAULT 'unnamed', created_at DATETIME)",
+    )
+    .unwrap();
+
+    db.execute(&mut s, "INSERT INTO events VALUES (1, 'Launch', '2026-09-04 12:00:00')").unwrap();
+    db.execute(&mut s, "INSERT INTO events VALUES (2, 'Party', '2026-10-01 18:30:00')").unwrap();
+
+    let out = db.execute(&mut s, "SELECT name, created_at FROM events WHERE created_at > '2026-09-15 00:00:00'").unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Datum::Text("Party".into()));
+
+    let dt_micros = crate::types::parse_datetime_str("2026-10-01 18:30:00").unwrap();
+    assert_eq!(out.rows[0][1], Datum::DateTime(dt_micros));
+
+    let _ = fs::remove_dir_all(&dir);
 }

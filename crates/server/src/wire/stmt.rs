@@ -35,6 +35,7 @@ pub fn result_column_types(out: &Output) -> Vec<u8> {
                         break;
                     }
                     Datum::Int(_) | Datum::Bool(_) => has_int = true,
+                    Datum::DateTime(_) => return TYPE_DATETIME,
                     Datum::Text(_) => return TYPE_VAR_STRING,
                 }
             }
@@ -55,6 +56,8 @@ pub fn schema_col_type(t: ColumnType) -> u8 {
         ColumnType::Float | ColumnType::Double => TYPE_DOUBLE,
         ColumnType::Text | ColumnType::VarChar => TYPE_VAR_STRING,
         ColumnType::Bool => TYPE_TINY,
+        ColumnType::DateTime => TYPE_DATETIME,
+        ColumnType::Timestamp => TYPE_TIMESTAMP,
     }
 }
 
@@ -113,6 +116,13 @@ pub fn binary_row_payload(row: &[Datum], types: &[u8]) -> Result<Vec<u8>, String
                     return Err(format!("column {i}: fractional float in integer column"));
                 }
                 p.extend_from_slice(&(*v as i64).to_le_bytes());
+            }
+            (Datum::DateTime(v), TYPE_DATETIME) | (Datum::DateTime(v), TYPE_TIMESTAMP) => {
+                p.extend_from_slice(&encode_binary_datetime(*v));
+            }
+            (Datum::Text(s), TYPE_DATETIME) | (Datum::Text(s), TYPE_TIMESTAMP) => {
+                let micros = engine::types::parse_datetime_str(s).unwrap_or(0);
+                p.extend_from_slice(&encode_binary_datetime(micros));
             }
             (Datum::Text(s), TYPE_VAR_STRING) => enc_lenenc_str3(&mut p, s),
             (other, TYPE_VAR_STRING) => enc_lenenc_str3(&mut p, &other.to_string()),
@@ -311,7 +321,68 @@ pub fn datum_literal(d: &Datum) -> String {
             }
         }
         Datum::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Datum::DateTime(v) => format!("'{}'", engine::types::format_datetime_micros(*v)),
     }
+}
+
+fn encode_binary_datetime(micros: i64) -> Vec<u8> {
+    if micros == 0 {
+        return vec![0];
+    }
+    let s = engine::types::format_datetime_micros(micros);
+    if let Some((y, m, d, h, min, sec, micro)) = parse_datetime_components(&s) {
+        if h == 0 && min == 0 && sec == 0 && micro == 0 {
+            let mut buf = vec![4u8];
+            buf.extend_from_slice(&(y as u16).to_le_bytes());
+            buf.push(m as u8);
+            buf.push(d as u8);
+            buf
+        } else if micro == 0 {
+            let mut buf = vec![7u8];
+            buf.extend_from_slice(&(y as u16).to_le_bytes());
+            buf.push(m as u8);
+            buf.push(d as u8);
+            buf.push(h as u8);
+            buf.push(min as u8);
+            buf.push(sec as u8);
+            buf
+        } else {
+            let mut buf = vec![11u8];
+            buf.extend_from_slice(&(y as u16).to_le_bytes());
+            buf.push(m as u8);
+            buf.push(d as u8);
+            buf.push(h as u8);
+            buf.push(min as u8);
+            buf.push(sec as u8);
+            buf.extend_from_slice(&(micro as u32).to_le_bytes());
+            buf
+        }
+    } else {
+        vec![0]
+    }
+}
+
+fn parse_datetime_components(s: &str) -> Option<(u32, u32, u32, u32, u32, u32, u32)> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() { return None; }
+    let date: Vec<&str> = parts[0].split('-').collect();
+    if date.len() != 3 { return None; }
+    let y: u32 = date[0].parse().ok()?;
+    let m: u32 = date[1].parse().ok()?;
+    let d: u32 = date[2].parse().ok()?;
+    let (h, min, sec, micro) = if parts.len() == 2 {
+        let time: Vec<&str> = parts[1].split(':').collect();
+        if time.len() != 3 { return None; }
+        let h: u32 = time[0].parse().ok()?;
+        let min: u32 = time[1].parse().ok()?;
+        let sec_parts: Vec<&str> = time[2].split('.').collect();
+        let s: u32 = sec_parts[0].parse().ok()?;
+        let ms: u32 = if sec_parts.len() == 2 { sec_parts[1].parse().ok().unwrap_or(0) } else { 0 };
+        (h, min, s, ms)
+    } else {
+        (0, 0, 0, 0)
+    };
+    Some((y, m, d, h, min, sec, micro))
 }
 
 pub fn render_mysql_date(parts: &[u64], with_time: bool, micros: Option<u64>) -> String {

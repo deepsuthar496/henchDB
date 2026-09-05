@@ -20,6 +20,7 @@ pub struct ColumnDef {
     pub ctype: ColumnType,
     pub nullable: bool,
     pub auto_increment: bool,
+    pub default_value: Option<Datum>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,7 +277,21 @@ impl Table {
 
     /// Validate/coerce a candidate row against the schema; returns an owned
     /// normalized copy.
+    pub fn fill_defaults(&self, mut row: Vec<Datum>) -> Vec<Datum> {
+        let schema = &self.def.schema;
+        while row.len() < schema.columns.len() {
+            let col = &schema.columns[row.len()];
+            if let Some(def_val) = &col.default_value {
+                row.push(def_val.clone());
+            } else {
+                row.push(Datum::Null);
+            }
+        }
+        row
+    }
+
     pub fn validate_row(&self, row: Vec<Datum>) -> Result<Vec<Datum>> {
+        let row = self.fill_defaults(row);
         let schema = &self.def.schema;
         if row.len() != schema.columns.len() {
             return Err(Error::ColumnCountMismatch {
@@ -285,13 +300,25 @@ impl Table {
             });
         }
         let mut norm = Vec::with_capacity(row.len());
-        for (col, d) in schema.columns.iter().zip(row.into_iter()) {
+        for (col, mut d) in schema.columns.iter().zip(row.into_iter()) {
             if d == Datum::Null {
-                if !col.nullable {
+                if let Some(def_val) = &col.default_value {
+                    d = def_val.clone();
+                } else if !col.nullable {
                     return Err(Error::NotNullViolation(col.name.clone()));
+                } else {
+                    norm.push(Datum::Null);
+                    continue;
                 }
-                norm.push(Datum::Null);
-                continue;
+            }
+            if matches!(col.ctype, ColumnType::DateTime | ColumnType::Timestamp) {
+                if let Datum::Text(s) = &d {
+                    if let Some(micros) = crate::types::parse_datetime_str(s) {
+                        d = Datum::DateTime(micros);
+                    }
+                } else if let Datum::Int(sec) = &d {
+                    d = Datum::DateTime(*sec * 1_000_000);
+                }
             }
             if !col.ctype.accepts(&d) {
                 return Err(Error::TypeMismatch {
@@ -648,8 +675,8 @@ mod tests {
     fn make_paged_table(frames: usize) -> (Table, Arc<BufferPool>) {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false },
-                ColumnDef { name: "body".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false },
+                ColumnDef { name: "id".into(), ctype: ColumnType::Int, nullable: false, auto_increment: false, default_value: None },
+                ColumnDef { name: "body".into(), ctype: ColumnType::Text, nullable: true, auto_increment: false, default_value: None },
             ],
             pk_idx: 0,
         };
@@ -670,18 +697,21 @@ mod tests {
                     ctype: ColumnType::Int,
                     nullable: false,
                     auto_increment: false,
+                    default_value: None,
                 },
                 ColumnDef {
                     name: "age".into(),
                     ctype: ColumnType::Int,
                     nullable: false,
                     auto_increment: false,
+                    default_value: None,
                 },
                 ColumnDef {
                     name: "name".into(),
                     ctype: ColumnType::Text,
                     nullable: true,
                     auto_increment: false,
+                    default_value: None,
                 },
             ],
             pk_idx: 0,
