@@ -400,6 +400,15 @@ impl BTree {
         }
     }
 
+    /// Replace value strictly in-place if key exists in a single lock-coupled descent.
+    /// Never splits nodes, wraps roots, or allocates new tree nodes.
+    /// Returns Some(previous_value) if key existed and was updated in-place,
+    /// or None if key was not found.
+    pub fn update_in_place(&self, key: &[u8], val: &[u8]) -> Option<Vec<u8>> {
+        let root = self.current_root();
+        update_in_place_rec(&root, key, val)
+    }
+
     /// Remove `key`, returning the removed value. Underflowing nodes are
     /// rebalanced (borrow or merge) and empty internal roots collapse, so
     /// heavy deletion shrinks the tree instead of leaving sparse leaves.
@@ -740,6 +749,36 @@ fn upsert_rec(node: &Arc<Node>, key: &[u8], val: &[u8], tree: &BTree) -> UpsertD
             let child = children[idx].clone();
             drop(g);
             upsert_rec(&child, key, val, tree)
+        }
+    }
+}
+
+fn update_in_place_rec(node: &Arc<Node>, key: &[u8], val: &[u8]) -> Option<Vec<u8>> {
+    let mut g = node.lock();
+    match &mut *g {
+        NodeBody::Leaf { keys, vals, .. } => {
+            let idx = lower_bound(keys, key);
+            if idx < keys.len() && keys[idx] == key {
+                if vals[idx].len() == val.len() {
+                    let prev = vals[idx].clone();
+                    vals[idx].copy_from_slice(val);
+                    Some(prev)
+                } else {
+                    let prev = std::mem::replace(&mut vals[idx], val.to_vec());
+                    Some(prev)
+                }
+            } else {
+                None
+            }
+        }
+        NodeBody::Internal { keys, children } => {
+            if children.is_empty() {
+                return None;
+            }
+            let idx = lower_bound(keys, key);
+            let child = children[idx].clone();
+            drop(g);
+            update_in_place_rec(&child, key, val)
         }
     }
 }
@@ -1091,5 +1130,43 @@ mod tests {
             let k = i.to_be_bytes();
             assert_eq!(t.get(&k), Some(k.to_vec()), "at {i}");
         }
+    }
+
+    #[test]
+    fn update_in_place_lifecycle_and_zero_split() {
+        let t = BTree::new();
+        // Insert 5,000 keys
+        for i in 0..5_000u64 {
+            let k = i.to_be_bytes();
+            let v = (i * 10).to_be_bytes();
+            t.insert(&k, &v);
+        }
+        let nodes_before = t.node_count();
+        let height_before = t.height();
+
+        // Update all 5,000 keys strictly in-place
+        for i in 0..5_000u64 {
+            let k = i.to_be_bytes();
+            let old_v = (i * 10).to_be_bytes();
+            let new_v = (i * 99).to_be_bytes();
+            let prev = t.update_in_place(&k, &new_v);
+            assert_eq!(prev, Some(old_v.to_vec()));
+        }
+
+        // Must not have split any nodes or increased height
+        assert_eq!(t.node_count(), nodes_before, "in-place updates must not split nodes");
+        assert_eq!(t.height(), height_before, "in-place updates must preserve height");
+
+        // Verify updated values
+        for i in 0..5_000u64 {
+            let k = i.to_be_bytes();
+            let new_v = (i * 99).to_be_bytes();
+            assert_eq!(t.get(&k), Some(new_v.to_vec()));
+        }
+
+        // Non-existent key must return None without modifying tree
+        let missing = 99_999u64.to_be_bytes();
+        assert_eq!(t.update_in_place(&missing, &b"dummy"[..]), None);
+        assert_eq!(t.len(), 5_000);
     }
 }

@@ -409,7 +409,10 @@ impl Table {
     pub fn upsert_row(&self, row: Vec<Datum>) -> Result<Option<Vec<Datum>>> {
         let key = self.key_of(&row)?;
         let storable = self.alloc_value(&Self::encode_row(&row))?;
-        let prev = self.tree.upsert(&key, &storable);
+        let prev = match self.tree.update_in_place(&key, &storable) {
+            Some(prev) => Some(prev),
+            None => self.tree.upsert(&key, &storable),
+        };
         if let Some(ref buf) = prev {
             self.free_value(buf);
         }
@@ -433,6 +436,35 @@ impl Table {
                     let sec_val = &row[idx.col_idx];
                     let sec_k = encode_sec_index_key(sec_val, pk_val)?;
                     idx.tree.insert(&sec_k, &[]);
+                }
+            }
+        }
+        Ok(prev)
+    }
+
+    /// Update an existing row in-place. Returns Some(old_row) if the key existed,
+    /// or None if the key was not found.
+    pub fn update_row(&self, row: Vec<Datum>) -> Result<Option<Vec<Datum>>> {
+        let key = self.key_of(&row)?;
+        let storable = self.alloc_value(&Self::encode_row(&row))?;
+        let prev = self.tree.update_in_place(&key, &storable);
+        if let Some(ref buf) = prev {
+            self.free_value(buf);
+        }
+        let prev = prev.map(|b| self.decode_stored(&b)).transpose()?;
+        let idx_guard = self.indexes.read().unwrap();
+        if !idx_guard.is_empty() {
+            let pk_val = &row[self.def.schema.pk_idx];
+            if let Some(ref old_row) = prev {
+                for idx in idx_guard.iter() {
+                    let old_val = &old_row[idx.col_idx];
+                    let new_val = &row[idx.col_idx];
+                    if old_val != new_val {
+                        let old_k = encode_sec_index_key(old_val, pk_val)?;
+                        idx.tree.remove(&old_k);
+                        let new_k = encode_sec_index_key(new_val, pk_val)?;
+                        idx.tree.insert(&new_k, &[]);
+                    }
                 }
             }
         }
@@ -658,7 +690,10 @@ impl Table {
     /// fails on real I/O errors.
     pub fn apply_raw(&self, key: &[u8], full: &[u8]) -> Result<()> {
         let storable = self.alloc_value(full)?;
-        let prev = self.tree.upsert(key, &storable);
+        let prev = match self.tree.update_in_place(key, &storable) {
+            Some(prev) => Some(prev),
+            None => self.tree.upsert(key, &storable),
+        };
         if let Some(ref buf) = prev {
             self.free_value(buf);
         }
