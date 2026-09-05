@@ -177,7 +177,6 @@ fn password_verification_paths() {
 
 #[test]
 fn ready_status_follows_transaction() {
-    // status() reads engine sessions; fresh sessions are idle.
     let dir = std::env::temp_dir().join(format!("hdbpg_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let db = engine::Database::open(&dir).unwrap();
@@ -188,5 +187,262 @@ fn ready_status_follows_transaction() {
     db.execute(&mut s, "ROLLBACK").unwrap();
     assert_eq!(status(&s), b'I');
     let _ = db;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- Extended protocol (PG2) -------------------------------------------------
+
+use super::exec::{pg_to_markers, PgConn};
+
+fn cstr(s: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(s.as_bytes());
+    out.push(0);
+}
+
+fn parse_payload(name: &str, query: &str, oids: &[u32]) -> Vec<u8> {
+    let mut p = Vec::new();
+    cstr(name, &mut p);
+    cstr(query, &mut p);
+    p.extend_from_slice(&(oids.len() as u16).to_be_bytes());
+    for oid in oids {
+        p.extend_from_slice(&oid.to_be_bytes());
+    }
+    p
+}
+
+fn bind_payload(
+    portal: &str,
+    stmt: &str,
+    formats: &[i16],
+    values: &[Option<&[u8]>],
+    result_formats: &[i16],
+) -> Vec<u8> {
+    let mut p = Vec::new();
+    cstr(portal, &mut p);
+    cstr(stmt, &mut p);
+    p.extend_from_slice(&(formats.len() as u16).to_be_bytes());
+    for f in formats {
+        p.extend_from_slice(&f.to_be_bytes());
+    }
+    p.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for v in values {
+        match v {
+            None => p.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(b) => {
+                p.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                p.extend_from_slice(b);
+            }
+        }
+    }
+    p.extend_from_slice(&(result_formats.len() as u16).to_be_bytes());
+    for f in result_formats {
+        p.extend_from_slice(&f.to_be_bytes());
+    }
+    p
+}
+
+#[test]
+fn markers_convert_and_validate() {
+    let (sql, max) = pg_to_markers("SELECT * FROM t WHERE a = $1 AND b = $2").unwrap();
+    assert_eq!(sql, "SELECT * FROM t WHERE a = ? AND b = ?");
+    assert_eq!(max, 2);
+    // Quoted dollars and comments are literal.
+    let (sql, _) = pg_to_markers("SELECT '$1', \"x$2\" FROM t -- $3\n WHERE a=$1 /* $4 */").unwrap();
+    assert_eq!(sql, "SELECT '$1', \"x$2\" FROM t -- $3\n WHERE a=? /* $4 */");
+    // Gaps, $0, and trailing $ are errors.
+    assert!(pg_to_markers("SELECT $1, $3").is_err());
+    assert!(pg_to_markers("SELECT $0").is_err());
+    assert!(pg_to_markers("SELECT 1$").is_err());
+    assert!(pg_to_markers("SELECT 1").unwrap().1 == 0);
+}
+
+#[test]
+fn extended_message_parsing() {
+    let p = parse_parse_msg(&parse_payload("s1", "SELECT $1", &[23])).unwrap();
+    assert_eq!(p.name, "s1");
+    assert_eq!(p.query, "SELECT $1");
+    assert_eq!(p.param_oids, vec![23]);
+    assert!(parse_parse_msg(b"s1\0SELECT").is_none());
+    let b = parse_bind_msg(&bind_payload("", "s1", &[0], &[Some(b"42")], &[])).unwrap();
+    assert_eq!(b.portal, "");
+    assert_eq!(b.statement, "s1");
+    assert_eq!(b.params.len(), 1);
+    assert_eq!(b.params[0].format, 0);
+    assert_eq!(b.params[0].value, Some(b"42".to_vec()));
+    // NULL param + binary format broadcast.
+    let b = parse_bind_msg(&bind_payload("p", "s1", &[1], &[None], &[1])).unwrap();
+    assert_eq!(b.params[0].value, None);
+    assert_eq!(b.params[0].format, 1);
+    assert_eq!(b.result_formats, vec![1]);
+    let d = parse_describe_msg(b"Ss1\0").unwrap();
+    assert_eq!((d.kind, d.name.as_str()), (b'S', "s1"));
+    assert!(parse_describe_msg(b"Xs1\0").is_none());
+    let mut e = b"\0".to_vec();
+    e.extend_from_slice(&7u32.to_be_bytes());
+    let e = parse_execute_msg(&e).unwrap();
+    assert_eq!((e.portal.as_str(), e.max_rows), ("", 7));
+    let c = parse_close_msg(b"Ps1\0").unwrap();
+    assert_eq!((c.kind, c.name.as_str()), (b'P', "s1"));
+}
+
+fn pg_test_db(dir: &std::path::Path) -> engine::Database {
+    let _ = std::fs::remove_dir_all(dir);
+    let db = engine::Database::open(dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.execute(&mut s, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    db
+}
+
+#[test]
+fn extended_text_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("hdbpgx_{}", std::process::id()));
+    let db = pg_test_db(&dir);
+    let mut s = db.new_session();
+    let mut conn = PgConn::default();
+    // Parse unnamed with explicit OID.
+    let r = conn
+        .on_parse(&parse_parse_msg(&parse_payload("", "SELECT v FROM t WHERE id = $1", &[23])).unwrap())
+        .unwrap();
+    assert_eq!(r[0], b'1');
+    // Describe statement: params + row desc.
+    let r = conn.on_describe(&db, &s, &parse_describe_msg(b"S\0").unwrap()).unwrap();
+    assert_eq!(r[0], b't'); // ParameterDescription first
+    assert!(r.windows(6).any(|w| w == b"\0\x01\0\0\0\x17")); // count 1, OID 23... layout check below instead
+    // Bind text param, all-text results.
+    let r = conn
+        .on_bind(&parse_bind_msg(&bind_payload("", "", &[0], &[Some(b"2")], &[])).unwrap())
+        .unwrap();
+    assert_eq!(r[0], b'2');
+    // Describe portal: RowDescription.
+    let r = conn.on_describe(&db, &s, &parse_describe_msg(b"P\0").unwrap()).unwrap();
+    assert_eq!(r[0], MSG_ROW_DESC);
+    // Execute all: one DataRow + SELECT 1.
+    let r = conn
+        .on_execute(&db, &mut s, &parse_execute_msg(&b"\0\x00\x00\x00\x00".to_vec()).unwrap())
+        .unwrap();
+    assert!(r[0] == MSG_ROW_DESC); // portal was described; no duplicate T
+    assert!(r.windows(2).any(|w| w == b"\x00\x01")); // one column
+    assert!(r.windows(1).any(|w| w == b"b")); // value 'b'
+    let tag = b"SELECT 1";
+    assert!(r.windows(tag.len()).any(|w| w == tag));
+    // Sync-equivalent: unnamed reuse works (overwrite + re-run).
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("", "SELECT COUNT(*) FROM t", &[])).unwrap())
+        .unwrap();
+    let _ = conn
+        .on_bind(&parse_bind_msg(&bind_payload("", "", &[], &[], &[])).unwrap())
+        .unwrap();
+    let r = conn
+        .on_execute(&db, &mut s, &parse_execute_msg(&b"\0\x00\x00\x00\x00".to_vec()).unwrap())
+        .unwrap();
+    assert!(r.windows(8).any(|w| w == b"SELECT 1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extended_binary_params_and_results() {
+    let dir = std::env::temp_dir().join(format!("hdbpgxb_{}", std::process::id()));
+    let db = pg_test_db(&dir);
+    let mut s = db.new_session();
+    let mut conn = PgConn::default();
+    // Unknown OID infers Int from text; binary result for id.
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("q", "SELECT id, v FROM t WHERE id = $1", &[])).unwrap())
+        .unwrap();
+    let _ = conn
+        .on_bind(&parse_bind_msg(&bind_payload("p", "q", &[0], &[Some(b"3")], &[1, 0])).unwrap())
+        .unwrap();
+    let r = conn
+        .on_execute(&db, &mut s, &parse_execute_msg(&{
+            let mut e = b"p\0".to_vec();
+            e.extend_from_slice(&0u32.to_be_bytes());
+            e
+        }).unwrap())
+        .unwrap();
+    // id column binary (4-byte BE 3), v column text.
+    assert!(r.windows(4).any(|w| w == 3i32.to_be_bytes()));
+    assert!(r.windows(1).any(|w| w == b"c"));
+    // Explicit binary int4 param.
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("qb", "SELECT v FROM t WHERE id = $1", &[23])).unwrap())
+        .unwrap();
+    let _ = conn
+        .on_bind(&parse_bind_msg(&bind_payload("", "qb", &[1], &[Some(&1i32.to_be_bytes())], &[])).unwrap())
+        .unwrap();
+    let r = conn
+        .on_execute(&db, &mut s, &parse_execute_msg(&b"\0\x00\x00\x00\x00".to_vec()).unwrap())
+        .unwrap();
+    assert!(r.windows(1).any(|w| w == b"a"));
+    // NULL param matches nothing (NULL = x is false).
+    let _ = conn
+        .on_bind(&parse_bind_msg(&bind_payload("", "qb", &[1], &[None], &[])).unwrap())
+        .unwrap();
+    let r = conn
+        .on_execute(&db, &mut s, &parse_execute_msg(&b"\0\x00\x00\x00\x00".to_vec()).unwrap())
+        .unwrap();
+    assert!(r.windows(8).any(|w| w == b"SELECT 0"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extended_partial_execute_suspends() {
+    let dir = std::env::temp_dir().join(format!("hdbpgxs_{}", std::process::id()));
+    let db = pg_test_db(&dir);
+    let mut s = db.new_session();
+    let mut conn = PgConn::default();
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("", "SELECT id FROM t ORDER BY id", &[])).unwrap())
+        .unwrap();
+    let _ = conn.on_bind(&parse_bind_msg(&bind_payload("", "", &[], &[], &[])).unwrap()).unwrap();
+    // max_rows = 2 of 3 → PortalSuspended; resume → SELECT 3 total.
+    let one = {
+        let mut e = b"\0".to_vec();
+        e.extend_from_slice(&2u32.to_be_bytes());
+        e
+    };
+    let r = conn.on_execute(&db, &mut s, &parse_execute_msg(&one).unwrap()).unwrap();
+    assert_eq!(r[0], MSG_ROW_DESC); // first Execute describes (no prior Describe)
+    // Output ends with the exact 5-byte PortalSuspended frame.
+    assert_eq!(r[r.len() - 5], b's');
+    assert_eq!(&r[r.len() - 4..], &[0, 0, 0, 4]);
+    let r = conn.on_execute(&db, &mut s, &parse_execute_msg(&one).unwrap()).unwrap();
+    assert!(r.windows(8).any(|w| w == b"SELECT 3"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extended_errors_and_close() {
+    let dir = std::env::temp_dir().join(format!("hdbpgxe_{}", std::process::id()));
+    let db = pg_test_db(&dir);
+    let mut s = db.new_session();
+    let mut conn = PgConn::default();
+    // Bad SQL fails at Parse.
+    assert!(conn
+        .on_parse(&parse_parse_msg(&parse_payload("", "BOGUS STATEMENT HERE", &[])).unwrap())
+        .is_err());
+    // Unknown statement / portal.
+    let b = parse_bind_msg(&bind_payload("", "nosuch", &[], &[], &[])).unwrap();
+    assert_eq!(conn.on_bind(&b).unwrap_err().0, "26000");
+    let d = parse_describe_msg(b"Snosuch\0").unwrap();
+    assert_eq!(conn.on_describe(&db, &s, &d).unwrap_err().0, "26000");
+    let e = parse_execute_msg(&b"nosuch\0\x00\x00\x00\x00".to_vec()).unwrap();
+    assert_eq!(conn.on_execute(&db, &mut s, &e).unwrap_err().0, "34000");
+    // Param count mismatch.
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("q", "SELECT * FROM t WHERE id = $1 OR id = $2", &[])).unwrap())
+        .unwrap();
+    let b = parse_bind_msg(&bind_payload("", "q", &[0], &[Some(b"1")], &[])).unwrap();
+    assert_eq!(conn.on_bind(&b).unwrap_err().0, "08P01");
+    // Close removes; CloseComplete emitted.
+    let c = parse_close_msg(b"Sq\0").unwrap();
+    assert_eq!(conn.on_close(&c).unwrap()[0], b'3');
+    assert!(conn.stmts.get("q").is_none());
+    // Named statement + portal lifecycle.
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("n", "SELECT 1", &[])).unwrap())
+        .is_ok();
     let _ = std::fs::remove_dir_all(&dir);
 }

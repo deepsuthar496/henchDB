@@ -14,6 +14,7 @@
 //! socket as-is (same exposure class as the legacy framed protocol).
 
 pub mod codec;
+pub mod exec;
 #[cfg(test)]
 mod tests;
 
@@ -271,6 +272,8 @@ fn pg_session(
 
     // Idle timeout from here on (handshake already completed).
     let _ = reader.get_mut().set_read_timeout(ctx.idle_timeout);
+    // Extended-protocol state (PG2): statements, portals, error barrier.
+    let mut pg = exec::PgConn::default();
     // -- Simple query loop. --
     loop {
         if ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -281,19 +284,143 @@ fn pg_session(
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(_) => break,
         };
+        // After an extended-flow error, skip everything until Sync (Flush
+        // still flushes, Terminate still closes).
+        if pg.failed && !matches!(t, MSG_SYNC | MSG_FLUSH | MSG_TERMINATE) {
+            continue;
+        }
         match t {
             MSG_TERMINATE => break,
             MSG_QUERY => {
+                // Simple Query resets extended error state and the unnamed
+                // statement/portal (spec behavior).
+                pg.failed = false;
+                pg.stmts.remove("");
+                pg.portals.remove("");
                 let sql = read_cstring(&payload).unwrap_or_default();
                 run_simple(&db, &mut session, &sql, reader)?;
             }
+            MSG_PARSE => {
+                let w = reader.get_mut();
+                match parse_parse_msg(&payload) {
+                    Some(m) => match pg.on_parse(&m) {
+                        Ok(resp) => {
+                            w.write_all(&resp)?;
+                            w.flush()?;
+                        }
+                        Err((code, msg)) => {
+                            pg.failed = true;
+                            w.write_all(&error_response(&code, &msg))?;
+                            w.flush()?;
+                        }
+                    },
+                    None => {
+                        pg.failed = true;
+                        w.write_all(&error_response("08P01", "malformed Parse message"))?;
+                        w.flush()?;
+                    }
+                }
+            }
+            MSG_BIND => {
+                let w = reader.get_mut();
+                match parse_bind_msg(&payload) {
+                    Some(m) => match pg.on_bind(&m) {
+                        Ok(resp) => {
+                            w.write_all(&resp)?;
+                            w.flush()?;
+                        }
+                        Err((code, msg)) => {
+                            pg.failed = true;
+                            w.write_all(&error_response(&code, &msg))?;
+                            w.flush()?;
+                        }
+                    },
+                    None => {
+                        pg.failed = true;
+                        w.write_all(&error_response("08P01", "malformed Bind message"))?;
+                        w.flush()?;
+                    }
+                }
+            }
+            MSG_DESCRIBE => {
+                let w = reader.get_mut();
+                match parse_describe_msg(&payload) {
+                    Some(m) => match pg.on_describe(&db, &session, &m) {
+                        Ok(resp) => {
+                            w.write_all(&resp)?;
+                            w.flush()?;
+                        }
+                        Err((code, msg)) => {
+                            pg.failed = true;
+                            w.write_all(&error_response(&code, &msg))?;
+                            w.flush()?;
+                        }
+                    },
+                    None => {
+                        pg.failed = true;
+                        w.write_all(&error_response("08P01", "malformed Describe message"))?;
+                        w.flush()?;
+                    }
+                }
+            }
+            MSG_EXECUTE => {
+                let w = reader.get_mut();
+                match parse_execute_msg(&payload) {
+                    Some(m) => match pg.on_execute(&db, &mut session, &m) {
+                        Ok(resp) => {
+                            w.write_all(&resp)?;
+                            w.flush()?;
+                        }
+                        Err((code, msg)) => {
+                            pg.failed = true;
+                            w.write_all(&error_response(&code, &msg))?;
+                            w.flush()?;
+                        }
+                    },
+                    None => {
+                        pg.failed = true;
+                        w.write_all(&error_response("08P01", "malformed Execute message"))?;
+                        w.flush()?;
+                    }
+                }
+            }
+            MSG_CLOSE => match parse_close_msg(&payload) {
+                Some(m) => match pg.on_close(&m) {
+                    Ok(resp) => {
+                        let w = reader.get_mut();
+                        w.write_all(&resp)?;
+                        w.flush()?;
+                    }
+                    Err((code, msg)) => {
+                        pg.failed = true;
+                        let w = reader.get_mut();
+                        w.write_all(&error_response(&code, &msg))?;
+                        w.flush()?;
+                    }
+                },
+                None => {
+                    pg.failed = true;
+                    let w = reader.get_mut();
+                    w.write_all(&error_response("08P01", "malformed Close message"))?;
+                    w.flush()?;
+                }
+            },
+            MSG_SYNC => {
+                pg.failed = false;
+                let w = reader.get_mut();
+                w.write_all(&ready_for_query(status(&session)))?;
+                w.flush()?;
+            }
+            MSG_FLUSH => {
+                reader.get_mut().flush()?;
+            }
             _ => {
-                // Extended protocol and friends are a documented follow-up;
-                // fail per-message without killing the connection.
+                // Anything else (COPY, replication, SASL) is a documented
+                // follow-up; fail per-message without killing the connection.
                 let w = reader.get_mut();
                 w.write_all(&error_response(
                     "0A000",
-                    "extended query protocol not supported; use simple query protocol",
+                    "message type not supported; use simple or extended query protocol",
                 ))?;
                 w.write_all(&ready_for_query(status(&session)))?;
                 w.flush()?;

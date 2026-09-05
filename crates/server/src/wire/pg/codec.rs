@@ -27,6 +27,14 @@ pub const MSG_EMPTY_QUERY: u8 = b'I';
 pub const MSG_QUERY: u8 = b'Q';
 pub const MSG_TERMINATE: u8 = b'X';
 pub const MSG_PASSWORD: u8 = b'p';
+// Extended protocol frontend messages.
+pub const MSG_PARSE: u8 = b'P';
+pub const MSG_BIND: u8 = b'B';
+pub const MSG_DESCRIBE: u8 = b'D';
+pub const MSG_EXECUTE: u8 = b'E';
+pub const MSG_CLOSE: u8 = b'C';
+pub const MSG_SYNC: u8 = b'S';
+pub const MSG_FLUSH: u8 = b'H';
 
 // Authentication codes.
 pub const AUTH_OK: i32 = 0;
@@ -237,6 +245,39 @@ pub fn empty_query_response() -> Vec<u8> {
     frame(MSG_EMPTY_QUERY, &[])
 }
 
+/// ParseComplete (`'1'`), BindComplete (`'2'`), CloseComplete (`'3'`).
+pub fn parse_complete() -> Vec<u8> {
+    frame(b'1', &[])
+}
+
+/// NoData (`'n'`) for Describe of statements without row output.
+pub fn no_data() -> Vec<u8> {
+    frame(b'n', &[])
+}
+
+/// PortalSuspended (`'s'`) when Execute's row limit cuts output short.
+pub fn portal_suspended() -> Vec<u8> {
+    frame(b's', &[])
+}
+
+pub fn bind_complete() -> Vec<u8> {
+    frame(b'2', &[])
+}
+
+pub fn close_complete() -> Vec<u8> {
+    frame(b'3', &[])
+}
+
+/// ParameterDescription (`'t'`): parameter count + type OIDs (0 = unknown).
+pub fn parameter_description(oids: &[u32]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(2 + oids.len() * 4);
+    p.extend_from_slice(&(oids.len() as u16).to_be_bytes());
+    for oid in oids {
+        p.extend_from_slice(&oid.to_be_bytes());
+    }
+    frame(b't', &p)
+}
+
 /// Render one datum in text format (`None` for NULL).
 pub fn datum_text(d: &engine::Datum) -> Option<Vec<u8>> {
     match d {
@@ -286,4 +327,186 @@ pub fn command_tag(message: &str, rows: usize, has_columns: bool) -> String {
 pub fn read_cstring(buf: &[u8]) -> Option<String> {
     let end = buf.iter().position(|b| *b == 0)?;
     Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Extended protocol payload parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed Parse message: statement name, query template, parameter OIDs.
+#[derive(Debug)]
+pub struct ParsedParse {
+    pub name: String,
+    pub query: String,
+    pub param_oids: Vec<u32>,
+}
+
+pub fn parse_parse_msg(payload: &[u8]) -> Option<ParsedParse> {
+    let mut pos = 0usize;
+    let name = read_cstring_at(payload, &mut pos)?;
+    let query = read_cstring_at(payload, &mut pos)?;
+    if pos + 2 > payload.len() {
+        return None;
+    }
+    let n = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2;
+    if pos + 4 * n > payload.len() {
+        return None;
+    }
+    let mut param_oids = Vec::with_capacity(n);
+    for _ in 0..n {
+        param_oids.push(u32::from_be_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]));
+        pos += 4;
+    }
+    let _ = pos;
+    Some(ParsedParse { name, query, param_oids })
+}
+
+fn read_cstring_at(buf: &[u8], pos: &mut usize) -> Option<String> {
+    let rel = buf[*pos..].iter().position(|b| *b == 0)?;
+    let s = String::from_utf8_lossy(&buf[*pos..*pos + rel]).into_owned();
+    *pos += rel + 1;
+    Some(s)
+}
+
+/// One bound parameter: format (0 = text, 1 = binary) + raw bytes (`None`
+/// encodes SQL NULL, independent of format).
+#[derive(Debug, Clone)]
+pub struct BoundParam {
+    pub format: i16,
+    pub value: Option<Vec<u8>>,
+}
+
+/// Parsed Bind message.
+#[derive(Debug)]
+pub struct ParsedBind {
+    pub portal: String,
+    pub statement: String,
+    pub params: Vec<BoundParam>,
+    pub result_formats: Vec<i16>,
+}
+
+pub fn parse_bind_msg(payload: &[u8]) -> Option<ParsedBind> {
+    let mut pos = 0usize;
+    let portal = read_cstring_at(payload, &mut pos)?;
+    let statement = read_cstring_at(payload, &mut pos)?;
+    if pos + 2 > payload.len() {
+        return None;
+    }
+    let nf = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2;
+    if pos + 2 * nf > payload.len() {
+        return None;
+    }
+    let mut formats = Vec::with_capacity(nf.max(1));
+    for _ in 0..nf {
+        formats.push(i16::from_be_bytes([payload[pos], payload[pos + 1]]));
+        pos += 2;
+    }
+    if pos + 2 > payload.len() {
+        return None;
+    }
+    let nv = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2;
+    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(nv);
+    for _ in 0..nv {
+        if pos + 4 > payload.len() {
+            return None;
+        }
+        let len = i32::from_be_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]);
+        pos += 4;
+        if len < 0 {
+            values.push(None);
+        } else {
+            let len = len as usize;
+            if pos + len > payload.len() {
+                return None;
+            }
+            values.push(Some(payload[pos..pos + len].to_vec()));
+            pos += len;
+        }
+    }
+    // Broadcast a single format code (or none → all text) across params.
+    let params: Vec<BoundParam> = values
+        .into_iter()
+        .enumerate()
+        .map(|(i, value)| BoundParam {
+            format: formats.get(i).or_else(|| formats.first()).copied().unwrap_or(0),
+            value,
+        })
+        .collect();
+    if pos + 2 > payload.len() {
+        return None;
+    }
+    let nr = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+    pos += 2;
+    if pos + 2 * nr > payload.len() {
+        return None;
+    }
+    let mut result_formats = Vec::with_capacity(nr);
+    for _ in 0..nr {
+        result_formats.push(i16::from_be_bytes([payload[pos], payload[pos + 1]]));
+        pos += 2;
+    }
+    Some(ParsedBind { portal, statement, params, result_formats })
+}
+
+/// Parsed Describe message: `kind` is `b'S'` (statement) or `b'P'` (portal).
+#[derive(Debug)]
+pub struct ParsedDescribe {
+    pub kind: u8,
+    pub name: String,
+}
+
+pub fn parse_describe_msg(payload: &[u8]) -> Option<ParsedDescribe> {
+    if payload.is_empty() || (payload[0] != b'S' && payload[0] != b'P') {
+        return None;
+    }
+    let mut pos = 1usize;
+    let name = read_cstring_at(payload, &mut pos)?;
+    Some(ParsedDescribe { kind: payload[0], name })
+}
+
+/// Parsed Execute message: portal name + max rows (0 = all).
+#[derive(Debug)]
+pub struct ParsedExecute {
+    pub portal: String,
+    pub max_rows: u32,
+}
+
+pub fn parse_execute_msg(payload: &[u8]) -> Option<ParsedExecute> {
+    let mut pos = 0usize;
+    let portal = read_cstring_at(payload, &mut pos)?;
+    if pos + 4 > payload.len() {
+        return None;
+    }
+    let max_rows = u32::from_be_bytes([
+        payload[pos],
+        payload[pos + 1],
+        payload[pos + 2],
+        payload[pos + 3],
+    ]);
+    Some(ParsedExecute { portal, max_rows })
+}
+
+/// Parsed Close message: `kind` is `b'S'` (statement) or `b'P'` (portal).
+#[derive(Debug)]
+pub struct ParsedClose {
+    pub kind: u8,
+    pub name: String,
+}
+
+pub fn parse_close_msg(payload: &[u8]) -> Option<ParsedClose> {
+    let d = parse_describe_msg(payload)?;
+    Some(ParsedClose { kind: d.kind, name: d.name })
 }
