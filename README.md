@@ -34,6 +34,17 @@ Measured with [`bench_strict.py`](bench_strict.py) on the same machine over loca
 * **Single-Connection Latency**: 2.48x – 3.50x faster due to zero-invalidation B+ tree traversal and allocation-free query fast paths.
 * **Concurrent Scalability**: Scales linearly to **89,194 durable writes/sec** and **80,677 point queries/sec** under 8 concurrent client threads.
 
+### Real-Time Live Visual Comparison
+To watch both databases compete head-to-head in real time with dynamic terminal meters, live QPS/TPS speedometers, and latency gauges:
+
+```bash
+# Run 4-stage visual tournament (Point Selects, Ranges, Txns, Updates):
+python bench_live.py
+
+# Or launch continuous real-time speedometer mode:
+python bench_live.py --live
+```
+
 ---
 
 ## Quick Start
