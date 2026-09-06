@@ -615,7 +615,6 @@ fn copy_socket_roundtrip() {
             auth_path: dir_srv.join("auth.bin"),
             idle_timeout: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            admitted: true,
             tls: None,
         };
         run_copy_in(&db, &mut s, "COPY t FROM STDIN", &mut reader, &ctx).unwrap();

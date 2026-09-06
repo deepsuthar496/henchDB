@@ -5,8 +5,9 @@
 //!   server serve           TCP server (length-prefixed text protocol)
 //!   server bench           in-process OLTP micro-benchmark
 //!
-//! The v0.1 server is thread-per-connection over blocking TCP — portable and
-//! correct. The research doc's pinned thread-per-core runtime with io_uring
+//! The v0.1 server multiplexes connections over a bounded worker pool
+//! with a polling parking loop (see `net/`): idle sockets hold no thread.
+//! The research doc's pinned thread-per-core runtime with io_uring
 //! is the Linux roadmap item (see agents.md); session handling is already
 //! isolated per connection so the runtime can be swapped without touching
 //! the engine.
@@ -23,6 +24,7 @@ use engine::{Database, Datum, Output, PRODUCT_NAME, PRODUCT_TAGLINE, VERSION};
 mod auth;
 mod metrics;
 mod mock_innodb;
+mod net;
 mod replication;
 mod wire;
 
@@ -56,8 +58,10 @@ struct ServerOpts {
     repl_password: String,
     /// Serve read-only without a primary (manual `--read-only`).
     read_only: bool,
-    /// Continuous WAL archiving directory for PITR (Priority 10).
+    /// WAL archive directory for PITR (`--wal-archive-dir`).
     wal_archive_dir: Option<String>,
+    /// Worker pool size (`--threads`, default 2x parallelism).
+    threads: usize,
 }
 
 impl ServerOpts {
@@ -65,8 +69,12 @@ impl ServerOpts {
         let port: u16 = arg_value(args, "--port").and_then(|p| p.parse().ok()).unwrap_or(3307);
         let max_connections: usize = arg_value(args, "--max-connections")
             .and_then(|m| m.parse().ok())
-            .unwrap_or(200);
-        let idle_timeout: Option<Duration> = match arg_value(args, "--idle-timeout") {
+            .unwrap_or(1024);
+        // `--wait-timeout` is the primary name (MySQL spelling); the older
+        // `--idle-timeout` still works as an alias.
+        let idle_timeout: Option<Duration> = match arg_value(args, "--wait-timeout")
+            .or_else(|| arg_value(args, "--idle-timeout"))
+        {
             Some(s) => s.parse::<u64>().ok().map(Duration::from_secs),
             None => Some(Duration::from_secs(28_800)), // MySQL wait_timeout default
         };
@@ -98,13 +106,15 @@ impl ServerOpts {
             repl_password: arg_value(args, "--repl-password").unwrap_or_default(),
             read_only: args.iter().any(|a| a == "--read-only"),
             wal_archive_dir: arg_value(args, "--wal-archive-dir"),
+            threads: net::pool::parse_threads(args),
         }
     }
 }
 
 /// Live-connection registry so shutdown can wake blocked readers.
+/// Cloneable handle shared by acceptors, poller, and pool workers.
 #[derive(Clone, Default)]
-struct ConnRegistry {
+pub(crate) struct ConnRegistry {
     inner: Arc<Mutex<RegistryInner>>,
 }
 
@@ -115,7 +125,7 @@ struct RegistryInner {
 }
 
 impl ConnRegistry {
-    fn add(&self, sock: &TcpStream) -> u64 {
+    pub(crate) fn add(&self, sock: &TcpStream) -> u64 {
         let mut g = self.inner.lock().unwrap();
         g.next += 1;
         let id = g.next;
@@ -127,26 +137,14 @@ impl ConnRegistry {
     fn remove(&self, id: u64) {
         self.inner.lock().unwrap().socks.remove(&id);
     }
-    fn shutdown_all(&self) {
+    pub(crate) fn shutdown_all(&self) {
         let g = self.inner.lock().unwrap();
         for s in g.socks.values() {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
     }
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner.lock().unwrap().socks.len()
-    }
-}
-
-/// One counted connection slot; released back to the pool on drop.
-struct ConnGuard {
-    active: Arc<Mutex<usize>>,
-}
-
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        let mut g = self.active.lock().unwrap();
-        *g = g.saturating_sub(1);
     }
 }
 
@@ -391,7 +389,7 @@ fn main() {
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
             eprintln!("usage: server [serve|passwd|bench|dump|restore] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only] [--wal-archive-dir <dir>]");
+            eprintln!("  serve --max-connections 1024 --wait-timeout 28800 --threads <2xCPU> [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only] [--wal-archive-dir <dir>]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
             eprintln!("  restore --backup backup.hdb [--dir data] [--force] [--archive-dir <dir> [--target-time \"YYYY-MM-DD [HH:MM:SS]\" | --target-txn <id>]]");
@@ -638,7 +636,7 @@ fn client_bench(args: &[String]) -> engine::Result<()> {
     Ok(())
 }
 
-fn arg_value(args: &[String], flag: &str) -> Option<String> {
+pub(crate) fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
@@ -786,10 +784,11 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     println!("protocols: mysql wire (HandshakeV10 + COM_QUERY + prepared statements, authenticated) + legacy framed text (auto-detect)");
     println!("tls: {}",
         if tls.is_some() { "enabled (CLIENT_SSL advertised)" } else { "disabled (plaintext only)" });
-    println!("limits: max_connections={} idle_timeout={} legacy={}",
+    println!("limits: max_connections={} idle_timeout={} legacy={} threads={}",
         opts.max_connections,
         opts.idle_timeout.map(|d| format!("{}s", d.as_secs())).unwrap_or_else(|| "off".into()),
-        if opts.allow_legacy { "on" } else { "off" });
+        if opts.allow_legacy { "on" } else { "off" },
+        opts.threads);
     println!("connect: mysql -h 127.0.0.1 -P {} -u root", opts.port);
     let active = Arc::new(Mutex::new(0usize));
     let registry = ConnRegistry::default();    // One process-wide drain flag shared by every connection: COM_SHUTDOWN
@@ -797,6 +796,34 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     // accept loop merges in.
     let draining = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
+    // -- Priority 11 runtime: one broker (connection table), one poller
+    // thread (parks idle sockets), and a bounded worker pool (owns a
+    // connection only while establishing or stepping it). --
+    let broker = Arc::new(net::Broker::new());
+    let shared = Arc::new(net::Shared {
+        db: db.clone(),
+        auth_path: auth_path.clone(),
+        idle_timeout: opts.idle_timeout,
+        shutdown: draining.clone(),
+        global: &SHUTDOWN_REQUESTED,
+        tls: tls.clone(),
+        allow_legacy: opts.allow_legacy,
+    });
+    println!("pool: {} worker threads (queue {})", opts.threads, net::JOB_QUEUE_BOUND);
+    let pool = net::pool::Pool::start(opts.threads, broker.clone(), shared.clone(), registry.clone());
+    // Accept threads submit through this handle; the pool itself is joined
+    // at drain time below.
+    let pool_submit = pool_sender(&pool);
+    let poller = {
+        let broker = broker.clone();
+        let shared = shared.clone();
+        let registry = registry.clone();
+        let tx = pool.sender().expect("pool running");
+        std::thread::Builder::new()
+            .name("poller".into())
+            .spawn(move || net::poller::run_poller(broker, tx, shared, registry))
+            .expect("spawn poller")
+    };
     // PG1: dedicated PostgreSQL listener (own port, no sniffing). Tries the
     // configured port, then +1..+8 (a local Postgres often owns 5432);
     // giving up only disables PG, never the MySQL side. `--no-pg` or
@@ -821,55 +848,26 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                 println!("connect: psql -h 127.0.0.1 -p {pg_port} -U root");
                 let _ = pg_listener.set_nonblocking(true);
                 let pg = std::thread::spawn({
-                    let db = db.clone();
-                    let opts = opts.clone();
-                    let tls = tls.clone();
-                    let auth_path = auth_path.clone();
+                    let broker = broker.clone();
                     let active = active.clone();
                     let registry = registry.clone();
                     let draining = draining.clone();
+                    let pool_submit = pool_submit.clone();
+                    let db = db.clone();
+                    let opts = opts.clone();
                     move || {
                         while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
                             && !draining.load(Ordering::Relaxed)
                         {
                             match pg_listener.accept() {
                                 Ok((stream, _)) => {
-                                    if let Err(e) = stream.set_nonblocking(false) {
+                                    // Park non-blocking from birth; the
+                                    // worker takes it blocking per checkout.
+                                    if let Err(e) = stream.set_nonblocking(true) {
                                         eprintln!("pg accept error: {e}");
                                         continue;
                                     }
-                                    let admitted = {
-                                        let mut n = active.lock().unwrap();
-                                        if *n >= opts.max_connections.max(1) {
-                                            false
-                                        } else {
-                                            *n += 1;
-                                            true
-                                        }
-                                    };
-                                    let guard = ConnGuard { active: active.clone() };
-                                    let reg_id = registry.add(&stream);
-                                    let db = db.clone();
-                                    let opts = opts.clone();
-                                    let tls = tls.clone();
-                                    let auth_path = auth_path.clone();
-                                    let registry = registry.clone();
-                                    let draining = draining.clone();
-                                    std::thread::spawn(move || {
-                                        let _guard = guard;
-                                        let ctx = wire::ConnCtx {
-                                            auth_path,
-                                            idle_timeout: opts.idle_timeout,
-                                            shutdown: draining,
-                                            admitted,
-                                            tls,
-                                        };
-                                        let r = wire::pg::handle_pg_connection(db, stream, &ctx);
-                                        registry.remove(reg_id);
-                                        if let Err(e) = r {
-                                            eprintln!("pg connection error: {e}");
-                                        }
-                                    });
+                                    admit(&broker, &active, &registry, &pool_submit, stream, net::Origin::Pg, &opts, &db);
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                     std::thread::sleep(Duration::from_millis(100));
@@ -958,46 +956,16 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) && !draining.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                // The listener is nonblocking (shutdown polling); accepted
-                // sockets inherit that on some platforms, so force blocking
-                // I/O back immediately — timeouts are managed per connection.
-                if let Err(e) = stream.set_nonblocking(false) {
+                // Park non-blocking from birth (the listener is nonblocking
+                // and accepted sockets inherit that on some platforms); the
+                // worker takes each connection blocking per checkout.
+                if let Err(e) = stream.set_nonblocking(true) {
                     eprintln!("accept error: {e}");
                     continue;
                 }
-                // Counted slot: a full pool still serves handshake + ERR 1040.
-                let admitted = {
-                    let mut n = active.lock().unwrap();
-                    if *n >= opts.max_connections.max(1) {
-                        false
-                    } else {
-                        *n += 1;
-                        true
-                    }
-                };
-                let guard = ConnGuard { active: active.clone() };
-                let reg_id = registry.add(&stream);
-                let db = db.clone();
-                let opts = opts.clone();
-                let tls = tls.clone();
-                let auth_path = auth_path.clone();
-                let registry = registry.clone();
-                let draining = draining.clone();
-                handles.push(std::thread::spawn(move || {
-                    let _guard = guard; // slot released when the thread ends
-                    let ctx = wire::ConnCtx {
-                        auth_path,
-                        idle_timeout: opts.idle_timeout,
-                        shutdown: draining,
-                        admitted,
-                        tls,
-                    };
-                    let r = handle_auto(db, stream, &opts, &ctx);
-                    registry.remove(reg_id);
-                    if let Err(e) = r {
-                        eprintln!("connection error: {e}");
-                    }
-                }));
+                // Counted slot: over-capacity connections still get their
+                // handshake + ERR 1040 from the establish step.
+                admit(&broker, &active, &registry, &pool_submit, stream, net::Origin::Main, &opts, &db);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -1005,68 +973,87 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
             Err(e) => eprintln!("accept error: {e}"),
         }
     }
-    // Graceful drain: no new connections, wake blocked readers, let
-    // in-flight queries finish, then checkpoint everything they committed.
-    println!("shutting down ({} live connections)...", registry.len());
+    // Graceful drain: no new connections (accept loops observe `draining`
+    // and exit), parked connections close, in-flight steps finish, then
+    // checkpoint everything they committed.
+    println!("shutting down ({} live connections, {} parked)...", registry.len(), broker.len());
     drop(listener);
-    registry.shutdown_all();
+    // Stop the poller first: it closes everything still parked and refuses
+    // late checkins (workers checking in afterwards close immediately).
+    let _ = poller.join();
+    // Drop our queue handle, then join the accept threads (they exit on
+    // `draining`, releasing their own handles): only after EVERY sender is
+    // gone does the queue close and let idle workers exit below.
+    drop(pool_submit);
     for h in handles {
         let _ = h.join();
     }
+    // Wake workers blocked in long reads; they finish their steps, drain
+    // the queue, and exit when it closes below.
+    registry.shutdown_all();
+    pool.join();
     println!("checkpointing...");
     db.checkpoint()?;
     println!("clean shutdown");
     Ok(())
 }
 
-/// Sniff the protocol: legacy framed clients push bytes immediately;
-/// MySQL clients wait silently for the server handshake.
-fn handle_auto(
-    db: Arc<Database>,
+/// Sender snapshot for the accept threads (the pool outlives them).
+fn pool_sender(pool: &net::pool::Pool) -> std::sync::mpsc::SyncSender<net::Job> {
+    pool.sender().expect("pool running")
+}
+
+/// Counted admission: register the socket with the broker and queue its
+/// handshake job. Over-capacity connections are still registered — their
+/// establish step serves the proper 1040/53300/ERR rejection, exactly like
+/// the old model. A full job queue (extreme overload) drops with a bare
+/// close instead.
+fn admit(
+    broker: &Arc<net::Broker>,
+    active: &Arc<Mutex<usize>>,
+    registry: &ConnRegistry,
+    tx: &std::sync::mpsc::SyncSender<net::Job>,
     stream: TcpStream,
+    origin: net::Origin,
     opts: &ServerOpts,
-    ctx: &wire::ConnCtx,
-) -> std::io::Result<()> {
-    use std::time::Duration;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-    let mut probe = [0u8; 1];
-    match stream.peek(&mut probe) {
-        Ok(n) if n > 0 => {
-            let _ = stream.set_read_timeout(None);
-            if !opts.allow_legacy {
-                eprintln!("legacy protocol disabled: closing {}", stream.peer_addr()?);
-                return Ok(());
-            }
-            if !ctx.admitted {
-                // Counted out: one framed ERR, then close.
-                let mut w = stream.try_clone()?;
-                let err = b"ERR too many connections";
-                let mut resp = Vec::with_capacity(4 + err.len());
-                resp.extend_from_slice(&(err.len() as u32).to_be_bytes());
-                resp.extend_from_slice(err);
-                w.write_all(&resp)?;
-                w.flush()?;
-                return Ok(());
-            }
-            handle_connection(db, stream, opts.idle_timeout)
+    db: &Arc<Database>,
+) {
+    let admitted = {
+        let mut n = active.lock().unwrap();
+        if *n >= opts.max_connections.max(1) {
+            false
+        } else {
+            *n += 1;
+            true
         }
-        Ok(_) => Ok(()), // client closed immediately
-        Err(e)
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
-        {
-            let _ = stream.set_read_timeout(None);
-            wire::handle_mysql_connection(db, stream, ctx)
-        }
-        Err(e) => Err(e),
+    };
+    let reg_id = registry.add(&stream);
+    let guard = net::ConnGuard { active: active.clone() };
+    let state = match origin {
+        net::Origin::Pg => net::ConnState::NewPg(stream),
+        net::Origin::Main => net::ConnState::NewMain(stream),
+    };
+    let id = broker.register_marked(net::Conn::new(origin, state, admitted, reg_id, guard, db.clone()));
+    if net::submit(tx, id) {
+        return;
+    }
+    eprintln!("pool queue full: dropping connection #{id}");
+    if let Some(conn) = broker.remove(id) {
+        conn.shutdown_sock();
+        registry.remove(conn.reg_id);
     }
 }
 
-fn handle_connection(
+/// Blocking setup for one legacy framed-text connection (`[u32 BE len][utf8
+/// sql]`). Runs once on a pool worker, then parks like any other session.
+/// `Ok(None)` = quiet close (including the over-capacity framed ERR, which
+/// is answered here exactly like the old model).
+pub(crate) fn legacy_establish(
     db: Arc<Database>,
     stream: TcpStream,
     idle_timeout: Option<Duration>,
-) -> std::io::Result<()> {
+    admitted: bool,
+) -> std::io::Result<Option<net::LegacySession>> {
     let peer = stream.peer_addr()?;
     println!("connected: {peer}");
     stream.set_nodelay(true)?;
@@ -1076,52 +1063,69 @@ fn handle_connection(
     if let Some(d) = idle_timeout {
         let _ = reader.get_mut().set_read_timeout(Some(d));
     }
-    let mut session = db.new_session();
-    let mut buf = Vec::with_capacity(256);
-    let mut resp = Vec::with_capacity(256);
-    // Processlist entry so legacy connections appear in SHOW PROCESSLIST.
-    let proc = wire::ProcGuard::register(&db, "legacy", &peer.to_string());
-    loop {
-        // Read frame: 4-byte BE length + payload.
-        let mut hdr = [0u8; 4];
-        match reader.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break, // idle
-            Err(_) => break, // client closed
-        }
-        let len = u32::from_be_bytes(hdr) as usize;
-        if len > 16 * 1024 * 1024 {
-            break; // protocol guard
-        }
-        buf.resize(len, 0);
-        reader.read_exact(&mut buf)?;
-        let sql = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => {
-                let err = b"ERR invalid utf-8";
-                resp.clear();
-                resp.extend_from_slice(&(err.len() as u32).to_be_bytes());
-                resp.extend_from_slice(err);
-                writer.write_all(&resp)?;
-                continue;
-            }
-        };
-
-        db.note_command(proc.id(), &session.current_db, "Query", sql.trim());
-        let payload = match db.execute(&mut session, sql.trim()) {
-            Ok(out) => format_output(&out),
-            Err(e) => format!("ERR {e}"),
-        };
-        db.note_idle(proc.id());
-        let bytes = payload.as_bytes();
-        resp.clear();
-        resp.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        resp.extend_from_slice(bytes);
+    if !admitted {
+        // Counted out: one framed ERR, then close.
+        let err = b"ERR too many connections";
+        let mut resp = Vec::with_capacity(4 + err.len());
+        resp.extend_from_slice(&(err.len() as u32).to_be_bytes());
+        resp.extend_from_slice(err);
         writer.write_all(&resp)?;
         writer.flush()?;
+        return Ok(None);
     }
-    println!("disconnected: {peer}");
-    Ok(())
+    // Processlist entry so legacy connections appear in SHOW PROCESSLIST.
+    let proc = wire::ProcGuard::register(&db, "legacy", &peer.to_string());
+    Ok(Some(net::LegacySession {
+        reader,
+        writer,
+        session: db.new_session(),
+        proc,
+        buf: Vec::with_capacity(256),
+        resp: Vec::with_capacity(256),
+    }))
+}
+
+/// One legacy step: read a single frame, execute it, write the reply.
+/// Reads block up to the idle timeout exactly like the old thread.
+pub(crate) fn legacy_step(
+    db: &Arc<Database>,
+    l: &mut net::LegacySession,
+) -> std::io::Result<net::Disposition> {
+    use net::Disposition::{Closed, Idle};
+    // Read frame: 4-byte BE length + payload.
+    let mut hdr = [0u8; 4];
+    match l.reader.read_exact(&mut hdr) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(Closed), // idle
+        Err(_) => return Ok(Closed), // client closed
+    }
+    let len = u32::from_be_bytes(hdr) as usize;
+    if len > 16 * 1024 * 1024 {
+        return Ok(Closed); // protocol guard
+    }
+    l.buf.resize(len, 0);
+    l.reader.read_exact(&mut l.buf).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "legacy frame truncated")
+    })?;
+    let payload = match std::str::from_utf8(&l.buf) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            db.note_command(l.proc.id(), &l.session.current_db, "Query", trimmed);
+            match db.execute(&mut l.session, trimmed) {
+                Ok(out) => format_output(&out),
+                Err(e) => format!("ERR {e}"),
+            }
+        }
+        Err(_) => "ERR invalid utf-8".to_string(),
+    };
+    db.note_idle(l.proc.id());
+    let bytes = payload.as_bytes();
+    l.resp.clear();
+    l.resp.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    l.resp.extend_from_slice(bytes);
+    l.writer.write_all(&l.resp)?;
+    l.writer.flush()?;
+    Ok(Idle)
 }
 
 fn format_output(out: &Output) -> String {

@@ -127,8 +127,6 @@ pub struct ConnCtx {
     pub idle_timeout: Option<Duration>,
     /// Set by COM_SHUTDOWN or the signal handler; the accept loop polls it.
     pub shutdown: Arc<AtomicBool>,
-    /// False when the server is at `max_connections`: handshake, then ERR.
-    pub admitted: bool,
     /// TLS config when `--tls-cert`/`--tls-key` were given. `None` means
     /// plaintext only (SSLRequest fails closed with an error).
     pub tls: Option<Arc<rustls::ServerConfig>>,
@@ -147,20 +145,53 @@ fn access_denied(user: &str, peer: &str, using_password: bool) -> Vec<u8> {
     )
 }
 
-/// Serve one MySQL-protocol connection until QUIT, error, or close.
-pub fn handle_mysql_connection(
+/// MySQL session state carried across pool worker handoffs (Priority 11).
+/// The `reader` (with its already-buffered pipeline bytes), the engine
+/// session, prepared statements, and the processlist guard all live here so
+/// a connection parks and resumes without losing protocol position.
+pub(crate) struct MysqlSession {
+    reader: BufReader<ConnStream>,
+    session: engine::Session,
+    stmts: HashMap<u32, Prepared>,
+    next_stmt_id: u32,
+    deprecate_eof: bool,
+    authed_user: String,
+    peer: String,
+    proc: ProcGuard,
+}
+
+impl MysqlSession {
+    /// Underlying transport (poller peeks / toggles blocking through this).
+    pub(crate) fn stream(&self) -> &ConnStream {
+        self.reader.get_ref()
+    }
+
+    /// Already-buffered bytes beyond the last consumed packet (lets the
+    /// worker drain pipelined commands without a poller round trip).
+    pub(crate) fn buffered(&self) -> &[u8] {
+        self.reader.buffer()
+    }
+}
+
+/// Blocking handshake + authentication for one MySQL-protocol connection.
+/// Runs once on a pool worker (bounded by the 30s pre-auth timeout), then
+/// the session parks in the poller until real commands arrive.
+/// `Ok(None)` = quiet close (peer went away mid-handshake); the pool drops
+/// the connection either way.
+pub(crate) fn mysql_establish(
     db: Arc<Database>,
     stream: TcpStream,
     ctx: &ConnCtx,
-) -> std::io::Result<()> {
+    admitted: bool,
+) -> std::io::Result<Option<MysqlSession>> {
     let peer = stream.peer_addr().unwrap_or_else(|_| "unknown:0".parse().unwrap());
     let peer_host = peer.ip().to_string();
     let mut stream = stream;
     stream.set_nodelay(true)?;
     let _ = stream.set_read_timeout(None);
     let mut session = db.new_session();
-    let mut stmts: HashMap<u32, Prepared> = HashMap::new();
-    let mut next_stmt_id: u32 = 1;
+    let stmts: HashMap<u32, Prepared> = HashMap::new();
+    let next_stmt_id: u32 = 1;
 
     // -- Handshake (fresh 20-byte scramble per connection: replay across
     // sessions is impossible even though the scramble travels in clear). --
@@ -181,7 +212,7 @@ pub fn handle_mysql_connection(
         let mut pre = BufReader::new(&mut stream);
         match read_packet(&mut pre, 16 * 1024 * 1024) {
             Ok(v) => v,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(None),
         }
     };
     let _ = stream.set_read_timeout(None);
@@ -194,7 +225,7 @@ pub fn handle_mysql_connection(
                 Ok(t) => ConnStream::Tls(Box::new(t)),
                 Err(e) => {
                     eprintln!("tls handshake failed for {peer}: {e}");
-                    return Ok(());
+                    return Ok(None);
                 }
             },
             None => {
@@ -204,7 +235,7 @@ pub fn handle_mysql_connection(
                     &mut sseq,
                 );
                 let _ = stream.flush();
-                return Ok(());
+                return Ok(None);
             }
         }
     } else {
@@ -216,7 +247,7 @@ pub fn handle_mysql_connection(
     let (cseq, resp) = if matches!(reader.get_ref(), ConnStream::Tls(_)) {
         match read_packet(&mut reader, 16 * 1024 * 1024) {
             Ok(v) => v,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(None),
         }
     } else {
         (cseq0, first)
@@ -233,11 +264,11 @@ pub fn handle_mysql_connection(
         .unwrap_or(false);
     sseq = cseq.wrapping_add(1);
     // -- Admission + authentication, before any OK. --
-    if !ctx.admitted {
+    if !admitted {
         eprintln!("connection refused (max_connections): {peer}");
         write_packet(reader.get_mut(), &err_payload(1040, "HY000", "Too many connections"), &mut sseq)?;
         reader.get_mut().flush()?;
-        return Ok(());
+        return Ok(None);
     }
     let authed_user = match hs {
         Some(hs) if !hs.username.is_empty() => {
@@ -259,7 +290,7 @@ pub fn handle_mysql_connection(
                 reader.get_mut().flush()?;
                 let (cseq2, sw_resp) = match read_packet(&mut reader, 16 * 1024 * 1024) {
                     Ok(v) => v,
-                    Err(_) => return Ok(()),
+                    Err(_) => return Ok(None),
                 };
                 sseq = cseq2.wrapping_add(1);
                 proof = sw_resp;
@@ -272,7 +303,7 @@ pub fn handle_mysql_connection(
                     let p = access_denied(&hs.username, &peer_host, !hs.auth.is_empty());
                     write_packet(reader.get_mut(), &p, &mut sseq)?;
                     reader.get_mut().flush()?;
-                    return Ok(());
+                    return Ok(None);
                 }
             };
             // Unknown users fail exactly like wrong passwords.
@@ -287,7 +318,7 @@ pub fn handle_mysql_connection(
                 let p = access_denied(&hs.username, &peer_host, using_password);
                 write_packet(reader.get_mut(), &p, &mut sseq)?;
                 reader.get_mut().flush()?;
-                return Ok(());
+                return Ok(None);
             }
             if let Some(db_name) = &hs.db {
                 if !db_name.is_empty() {
@@ -300,7 +331,7 @@ pub fn handle_mysql_connection(
             let p = access_denied("", &peer_host, false);
             write_packet(reader.get_mut(), &p, &mut sseq)?;
             reader.get_mut().flush()?;
-            return Ok(());
+            return Ok(None);
         }
     };
     write_packet(reader.get_mut(), &ok_payload(0, ""), &mut sseq)?;
@@ -315,27 +346,54 @@ pub fn handle_mysql_connection(
     } else {
         let _ = reader.get_mut().set_read_timeout(None);
     }
+    Ok(Some(MysqlSession {
+        reader,
+        session,
+        stmts,
+        next_stmt_id,
+        deprecate_eof,
+        authed_user,
+        peer: peer.to_string(),
+        proc,
+    }))
+}
 
-    // -- Command phase --
-    loop {
-        if ctx.shutdown.load(Ordering::Relaxed) {
-            break; // draining: listener is closing, finish promptly
-        }
-        let (cseq, payload) = match read_packet(&mut reader, 16 * 1024 * 1024) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break, // idle timeout
-            Err(_) => break, // client closed
-        };
+/// One command-phase step: read a single packet, dispatch it, and report
+/// whether the connection parks (`Idle`) or closes (`Closed`). Reads block
+/// up to the idle timeout exactly like the old per-connection thread, so a
+/// quiet client closes here while an active one keeps its worker.
+pub(crate) fn mysql_step(
+    db: &Arc<Database>,
+    m: &mut MysqlSession,
+    ctx: &ConnCtx,
+) -> std::io::Result<crate::net::Disposition> {
+    use crate::net::Disposition::{Closed, Idle};
+    // Disjoint field borrows: the reader, session, and statement map move
+    // independently while `m` stays whole for the copy fields below.
+    let reader = &mut m.reader;
+    let session = &mut m.session;
+    let stmts = &mut m.stmts;
+    let next_stmt_id = &mut m.next_stmt_id;
+    let proc = &m.proc;
+    let deprecate_eof = m.deprecate_eof;
+    if ctx.shutdown.load(Ordering::Relaxed) {
+        return Ok(Closed); // draining: listener is closing, finish promptly
+    }
+    let (cseq, payload) = match read_packet(reader, 16 * 1024 * 1024) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(Closed), // idle timeout
+        Err(_) => return Ok(Closed), // client closed
+    };
         if payload.is_empty() {
-            continue;
+            return Ok(Idle);
         }
         let mut out_seq = cseq.wrapping_add(1);
         match payload[0] {
-            COM_QUIT => break,
+            COM_QUIT => return Ok(Closed),
             COM_SHUTDOWN => {
                 // Any authenticated user may request shutdown in v1
                 // (per-user privileges are the SEC8 follow-up).
-                println!("shutdown requested by '{authed_user}' from {peer}");
+                println!("shutdown requested by '{}' from {}", m.authed_user, m.peer);
                 match db.checkpoint() {
                     Ok(()) => {
                         write_packet(reader.get_mut(), &ok_payload(0, ""), &mut out_seq)?;
@@ -344,7 +402,7 @@ pub fn handle_mysql_connection(
                     Err(e) => write_err(reader.get_mut(), &mut out_seq, &e)?,
                 }
                 ctx.shutdown.store(true, Ordering::Relaxed);
-                break;
+                return Ok(Closed);
             }
             COM_INIT_DB => {
                 let db_name = String::from_utf8_lossy(&payload[1..])
@@ -354,7 +412,7 @@ pub fn handle_mysql_connection(
                 if db_name.is_empty() {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1049, "Unknown database ''")?;
                 } else {
-                    match db.execute(&mut session, &format!("USE `{db_name}`")) {
+                    match db.execute(session, &format!("USE `{db_name}`")) {
                         Ok(_) => {
                             write_packet(reader.get_mut(), &ok_payload(0, ""), &mut out_seq)?;
                             reader.get_mut().flush()?;
@@ -368,7 +426,7 @@ pub fn handle_mysql_connection(
                 reader.get_mut().flush()?;
             }
             COM_RESET_CONNECTION => {
-                session = db.new_session();
+                *session = db.new_session();
                 write_packet(reader.get_mut(), &ok_payload(0, ""), &mut out_seq)?;
                 reader.get_mut().flush()?;
             }
@@ -377,13 +435,13 @@ pub fn handle_mysql_connection(
                 let sql = sql.trim();
                 if sql.is_empty() {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1065, "empty query")?;
-                    continue;
+                    return Ok(Idle);
                 }
                 // `mysqladmin shutdown` issues SHUTDOWN as text (COM_QUERY),
                 // not COM_SHUTDOWN: same graceful path, authenticated only
                 // (per-user privileges are the SEC8 follow-up).
                 if sql.eq_ignore_ascii_case("shutdown") {
-                    println!("shutdown requested by '{authed_user}' from {peer}");
+                    println!("shutdown requested by '{}' from {}", m.authed_user, m.peer);
                     match db.checkpoint() {
                         Ok(()) => {
                             write_packet(reader.get_mut(), &ok_payload(0, ""), &mut out_seq)?;
@@ -392,7 +450,7 @@ pub fn handle_mysql_connection(
                         Err(e) => write_err(reader.get_mut(), &mut out_seq, &e)?,
                     }
                     ctx.shutdown.store(true, Ordering::Relaxed);
-                    break;
+                    return Ok(Closed);
                 }
                 // Multi-statement text (client `-e "A; B"` with
                 // MULTI_STATEMENTS): execute in order, stream one
@@ -400,7 +458,7 @@ pub fn handle_mysql_connection(
                 let batch = split_statements(sql);
                 let batch = if batch.is_empty() { vec![sql.to_string()] } else { batch };
                 db.note_command(proc.id(), &session.current_db, "Query", batch.first().map(String::as_str).unwrap_or(sql));
-                execute_statements(&db, &mut session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, false)?;
+                execute_statements(&db, session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, false)?;
                 db.note_idle(proc.id());
             }
             COM_STMT_PREPARE => {
@@ -408,26 +466,26 @@ pub fn handle_mysql_connection(
                 let sql = sql.trim().to_string();
                 if sql.is_empty() {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1065, "empty statement")?;
-                    continue;
+                    return Ok(Idle);
                 }
                 if split_statements(&sql).len() > 1 {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1064, "multi-statement prepare not supported")?;
-                    continue;
+                    return Ok(Idle);
                 }
                 let offsets = find_placeholders(&sql);
                 if offsets.len() > MAX_PARAMS_PER_STMT {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1064, "too many parameters")?;
-                    continue;
+                    return Ok(Idle);
                 }
                 let neutral = neutralize_placeholders(&sql, &offsets);
                 match db.describe(&session, &neutral) {
                     Ok(cols) => {
                         if stmts.len() >= MAX_PREPARED_PER_CONN {
                             write_err_msg(reader.get_mut(), &mut out_seq, 1047, "too many prepared statements")?;
-                            continue;
+                            return Ok(Idle);
                         }
-                        let id = next_stmt_id;
-                        next_stmt_id = next_stmt_id.wrapping_add(1).max(1);
+                        let id = *next_stmt_id;
+                        *next_stmt_id = next_stmt_id.wrapping_add(1).max(1);
                         let num_params = offsets.len();
                         stmts.insert(id, Prepared::new(sql, offsets));
                         write_packet(reader.get_mut(), &prepare_ok_payload(id, cols.len(), num_params), &mut out_seq)?;
@@ -453,16 +511,16 @@ pub fn handle_mysql_connection(
             COM_STMT_EXECUTE => {
                 if payload.len() < 10 {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1064, "malformed EXECUTE packet")?;
-                    continue;
+                    return Ok(Idle);
                 }
                 let id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
                 let Some(ps) = stmts.get_mut(&id) else {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1243, "unknown prepared statement")?;
-                    continue;
+                    return Ok(Idle);
                 };
                 if ps.long_overflow {
                     write_err_msg(reader.get_mut(), &mut out_seq, 1105, "statement long data too large")?;
-                    continue;
+                    return Ok(Idle);
                 }
                 let num_params = ps.num_params();
                 match decode_execute_params(&payload[10..], num_params, &ps.param_types, &ps.long_data) {
@@ -475,7 +533,7 @@ pub fn handle_mysql_connection(
                                 let batch = split_statements(&final_sql);
                                 let batch = if batch.is_empty() { vec![final_sql] } else { batch };
                                 db.note_command(proc.id(), &session.current_db, "Execute", batch.first().map(String::as_str).unwrap_or(""));
-                                execute_statements(&db, &mut session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, true)?;
+                                execute_statements(&db, session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, true)?;
                                 db.note_idle(proc.id());
                             }
                             Err(msg) => write_err_msg(reader.get_mut(), &mut out_seq, 1064, &msg)?,
@@ -530,7 +588,5 @@ pub fn handle_mysql_connection(
                 write_err_msg(reader.get_mut(), &mut out_seq, 1047, &msg)?;
             }
         }
+        Ok(Idle)
     }
-    println!("mysql disconnected: {peer}");
-    Ok(())
-}

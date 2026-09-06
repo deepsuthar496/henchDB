@@ -55,6 +55,23 @@ impl ConnStream {
             ConnStream::Tls(s) => s.get_mut().set_read_timeout(dur),
         }
     }
+
+    /// Borrow the underlying TCP socket (polling + blocking-mode toggles).
+    /// For TLS this is the ciphertext transport: `peek` only detects
+    /// activity, framing stays inside the rustls session on the worker.
+    pub fn inner_tcp(&self) -> &TcpStream {
+        match self {
+            ConnStream::Plain(s) => s,
+            ConnStream::Tls(s) => s.get_ref(),
+        }
+    }
+
+    /// Toggle blocking mode on the underlying socket. The poller parks
+    /// sockets non-blocking; workers take them blocking (all protocol code
+    /// assumes blocking I/O with timeouts).
+    pub fn set_blocking(&self, blocking: bool) -> std::io::Result<()> {
+        self.inner_tcp().set_nonblocking(!blocking)
+    }
 }
 
 fn io_err(kind: std::io::ErrorKind, msg: String) -> std::io::Error {

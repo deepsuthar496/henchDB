@@ -77,6 +77,12 @@ fn access_denied(user: &str) -> Vec<u8> {
     )
 }
 
+/// Quiet-close marker for establish paths (the client was already answered
+/// or went away; the pool drops the socket on any error).
+fn hangup() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, "hangup")
+}
+
 /// Verify a cleartext password against the stored verifier.
 fn verify_password(v: &auth::Verifier, password: &[u8]) -> bool {
     if v.hash.is_empty() {
@@ -93,12 +99,38 @@ fn verify_password(v: &auth::Verifier, password: &[u8]) -> bool {
     false
 }
 
-/// Serve one PostgreSQL-protocol connection until Terminate, error, or close.
-pub fn handle_pg_connection(
+/// PG session state carried across pool worker handoffs (Priority 11).
+/// The `reader` (plus already-buffered pipeline bytes), the engine session,
+/// the extended-protocol state (`exec::PgConn`: statements/portals/error
+/// barrier), and the processlist guard all live here.
+pub(crate) struct PgSession {
+    reader: BufReader<ConnStream>,
+    session: engine::Session,
+    pg: exec::PgConn,
+    proc: ProcGuard,
+}
+
+impl PgSession {
+    /// Underlying transport (poller peeks / toggles blocking through this).
+    pub(crate) fn stream(&self) -> &ConnStream {
+        self.reader.get_ref()
+    }
+
+    /// Already-buffered bytes beyond the last consumed message.
+    pub(crate) fn buffered(&self) -> &[u8] {
+        self.reader.buffer()
+    }
+}
+
+/// Blocking startup handshake + authentication for one PG connection.
+/// Runs once on a pool worker (bounded by the 30s pre-auth timeout), then
+/// the session parks in the poller until real messages arrive.
+pub(crate) fn pg_establish(
     db: Arc<Database>,
     stream: TcpStream,
     ctx: &ConnCtx,
-) -> std::io::Result<()> {
+    admitted: bool,
+) -> std::io::Result<Option<PgSession>> {
     let peer = stream.peer_addr().unwrap_or_else(|_| "unknown:0".parse().unwrap());
     let mut stream = stream;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
@@ -108,7 +140,7 @@ pub fn handle_pg_connection(
         let mut pre = BufReader::new(&mut stream);
         match read_startup_body(&mut pre) {
             Ok(v) => v,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(None),
         }
     };
     // -- Phase 2: optional TLS upgrade, then a uniform ConnStream. --
@@ -127,7 +159,7 @@ pub fn handle_pg_connection(
                         }
                         Err(e) => {
                             eprintln!("pg tls handshake failed for {peer}: {e}");
-                            return Ok(());
+                            return Ok(None);
                         }
                     }
                 }
@@ -145,7 +177,7 @@ pub fn handle_pg_connection(
             BufReader::new(ConnStream::Plain(stream))
         } else {
             let _ = stream.write_all(&error_response("08006", "unsupported protocol version"));
-            return Ok(());
+            return Err(hangup());
         }
     } else {
         BufReader::new(ConnStream::Plain(stream))
@@ -153,7 +185,7 @@ pub fn handle_pg_connection(
     let body = if need_startup {
         match read_startup_body(&mut reader) {
             Ok(v) => v,
-            Err(_) => return Ok(()),
+            Err(_) => return Err(hangup()),
         }
     } else {
         first
@@ -162,32 +194,37 @@ pub fn handle_pg_connection(
         Some(p) => p,
         None => {
             let _ = reader.get_mut().write_all(&error_response("08006", "invalid startup packet"));
-            return Ok(());
+            return Err(hangup());
         }
     };
     if params.user.is_empty() {
         let _ = reader.get_mut().write_all(&access_denied(""));
-        return Ok(());
+        return Ok(None);
     }
-    pg_session(db, &mut reader, ctx, &peer, &params)
+    pg_session(db, reader, ctx, peer, params, admitted).map(Some)
 }
 
-/// Post-startup session over an established (plaintext or TLS) stream.
+/// Post-startup authentication + session setup over an established
+/// (plaintext or TLS) stream. Returns the parked session; rejections send
+/// the exact PG error packet first (`53300` when over capacity, `28P01`
+/// for bad credentials), matching the old behavior byte-for-byte.
 fn pg_session(
     db: Arc<Database>,
-    reader: &mut BufReader<ConnStream>,
+    reader: BufReader<ConnStream>,
     ctx: &ConnCtx,
-    peer: &std::net::SocketAddr,
-    params: &StartupParams,
-) -> std::io::Result<()> {
+    peer: std::net::SocketAddr,
+    params: StartupParams,
+    admitted: bool,
+) -> std::io::Result<PgSession> {
+    let mut reader = reader;
     let mut session = db.new_session();
 
-    if !ctx.admitted {
+    if !admitted {
         eprintln!("pg connection refused (max_connections): {peer}");
         let w = reader.get_mut();
         w.write_all(&error_response("53300", "too many connections"))?;
         w.flush()?;
-        return Ok(());
+        return Err(hangup());
     }
     // Authenticate against auth.bin (fail closed on store errors).
     let store = match UserStore::load(&ctx.auth_path) {
@@ -197,7 +234,7 @@ fn pg_session(
             let w = reader.get_mut();
             w.write_all(&access_denied(&params.user))?;
             w.flush()?;
-            return Ok(());
+            return Err(hangup());
         }
     };
     let authed_user = match store.users.get(&params.user) {
@@ -206,7 +243,7 @@ fn pg_session(
             let w = reader.get_mut();
             w.write_all(&access_denied(&params.user))?;
             w.flush()?;
-            return Ok(());
+            return Err(hangup());
         }
         Some(v) if v.hash.is_empty() => {
             reader.get_mut().write_all(&auth_message(AUTH_OK))?;
@@ -218,15 +255,15 @@ fn pg_session(
                 w.write_all(&auth_message(AUTH_CLEARTEXT))?;
                 w.flush()?;
             }
-            let (t, payload) = match read_message(reader) {
+            let (t, payload) = match read_message(&mut reader) {
                 Ok(m) => m,
-                Err(_) => return Ok(()),
+                Err(_) => return Err(hangup()),
             };
             if t != MSG_PASSWORD {
                 let w = reader.get_mut();
                 w.write_all(&access_denied(&params.user))?;
                 w.flush()?;
-                return Ok(());
+                return Err(hangup());
             }
             let password = payload.strip_suffix(&[0]).unwrap_or(&payload);
             if !verify_password(v, password) {
@@ -234,7 +271,7 @@ fn pg_session(
                 let w = reader.get_mut();
                 w.write_all(&access_denied(&params.user))?;
                 w.flush()?;
-                return Ok(());
+                return Err(hangup());
             }
             reader.get_mut().write_all(&auth_message(AUTH_OK))?;
             params.user.clone()
@@ -278,24 +315,43 @@ fn pg_session(
     // Idle timeout from here on (handshake already completed).
     let _ = reader.get_mut().set_read_timeout(ctx.idle_timeout);
     // Extended-protocol state (PG2): statements, portals, error barrier.
-    let mut pg = exec::PgConn::default();
-    // -- Simple query loop. --
-    loop {
-        if ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
-        let (t, payload) = match read_message(reader) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        };
+    let pg = exec::PgConn::default();
+    Ok(PgSession { reader, session, pg, proc })
+}
+
+/// One message-phase step: read a single frontend message, dispatch it, and
+/// report whether the connection parks (`Idle`) or closes (`Closed`). Reads
+/// block up to the idle timeout exactly like the old per-connection thread.
+/// Multi-message exchanges (extended Parse/Bind/Execute/Sync, COPY) keep
+/// their state in the session, so parking between messages is safe; an
+/// in-progress COPY runs to its terminator inside the step (the worker is
+/// legitimately busy while the client streams data).
+pub(crate) fn pg_step(
+    db: &Arc<Database>,
+    p: &mut PgSession,
+    ctx: &ConnCtx,
+) -> std::io::Result<crate::net::Disposition> {
+    use crate::net::Disposition::{Closed, Idle};
+    let reader = &mut p.reader;
+    let session = &mut p.session;
+    let pg = &mut p.pg;
+    let proc = &p.proc;
+    if ctx.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(Closed);
+    }
+    let (t, payload) = match read_message(reader) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(Closed),
+        Err(_) => return Ok(Closed),
+    };
         // After an extended-flow error, skip everything until Sync (Flush
-        // still flushes, Terminate still closes).
+        // still flushes, Terminate still closes). Parking here is safe:
+        // the next message resumes the skip when it arrives.
         if pg.failed && !matches!(t, MSG_SYNC | MSG_FLUSH | MSG_TERMINATE) {
-            continue;
+            return Ok(Idle);
         }
         match t {
-            MSG_TERMINATE => break,
+            MSG_TERMINATE => return Ok(Closed),
             MSG_QUERY => {
                 // Simple Query resets extended error state and the unnamed
                 // statement/portal (spec behavior).
@@ -305,9 +361,9 @@ fn pg_session(
                 let sql = read_cstring(&payload).unwrap_or_default();
                 db.note_command(proc.id(), &session.current_db, "Query", &sql);
                 if copy::is_copy_from_stdin(&sql) {
-                    run_copy_in(&db, &mut session, &sql, reader, ctx)?;
+                    run_copy_in(&db, session, &sql, reader, ctx)?;
                 } else {
-                    run_simple(&db, &mut session, &sql, reader)?;
+                    run_simple(&db, session, &sql, reader)?;
                 }
                 db.note_idle(proc.id());
             }
@@ -384,7 +440,7 @@ fn pg_session(
                             format!("portal {}", m.portal)
                         };
                         db.note_command(proc.id(), &session.current_db, "Execute", &info);
-                        let res = pg.on_execute(&db, &mut session, &m);
+                        let res = pg.on_execute(&db, session, &m);
                         db.note_idle(proc.id());
                         match res {
                             Ok(resp) => {
@@ -450,10 +506,8 @@ fn pg_session(
                 w.flush()?;
             }
         }
+        Ok(Idle)
     }
-    println!("pg disconnected: {peer}");
-    Ok(())
-}
 
 fn status(session: &engine::Session) -> u8 {
     if session.in_transaction() {
