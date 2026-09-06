@@ -34,6 +34,7 @@ use mvcc::SnapshotPin;
 
 use plan::{access_path, AccessPath};
 
+pub(crate) mod cost;
 pub(crate) mod ddl;
 pub(crate) mod diag;
 pub(crate) mod fk;
@@ -523,6 +524,10 @@ impl Database {
             Statement::ShowStatus { like } => Ok(self.show_status(like.as_deref())),
             Statement::ShowEngineStatus => Ok(self.show_engine_status()),
             Statement::ShowProcesslist => Ok(self.show_processlist()),
+            Statement::AnalyzeTable { table } => self.exec_analyze(session, &table),
+            Statement::Explain { analyze, statement } => {
+                self.exec_explain(session, analyze, &statement)
+            }
             Statement::CreateTable { name, columns, foreign_keys } => {
                 self.exec_create_table(session, name, columns, foreign_keys)
             }
@@ -554,7 +559,7 @@ impl Database {
         }
     }
 
-    fn resolve_table_key(&self, session: &Session, table_name: &str) -> String {
+    pub(crate) fn resolve_table_key(&self, session: &Session, table_name: &str) -> String {
         if table_name.contains('.') {
             table_name.to_string()
         } else {
@@ -570,7 +575,7 @@ impl Database {
         }
     }
 
-    fn table(&self, session: &Session, name: &str) -> Result<Arc<Table>> {
+    pub(crate) fn table(&self, session: &Session, name: &str) -> Result<Arc<Table>> {
         let key = self.resolve_table_key(session, name);
         self.tables
             .read()
@@ -1131,11 +1136,16 @@ impl Database {
         // (snapshot-aware); range/full scans below read committed rows and
         // are substituted afterwards. IN-list order is preserved (no
         // re-sorting) on the multi-point paths.
+        //
+        // The access path is cost-based (`db/cost.rs`): the heuristic
+        // candidate is kept for PK routes and downgraded to a full scan
+        // when random secondary dereferencing costs more than scanning.
+        let choice = crate::db::cost::choose_access_path(table, selection)?;
         let ordered_points = matches!(
-            access_path(table, selection)?,
+            choice.path,
             AccessPath::PkIn(_) | AccessPath::SecIn { .. }
         );
-        match access_path(table, selection)? {
+        match choice.path {
             AccessPath::Point(lit) => {
                 let key = encode_key(&lit)?;
                 if let Some(r) = self.visible_row(session, table, &key)? {

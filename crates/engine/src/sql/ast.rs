@@ -197,4 +197,11 @@ pub enum Statement {
         name: String,
         value: Datum,
     },
+    AnalyzeTable {
+        table: String,
+    },
+    Explain {
+        analyze: bool,
+        statement: Box<Statement>,
+    },
 }

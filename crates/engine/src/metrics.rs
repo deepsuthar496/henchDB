@@ -61,7 +61,7 @@ impl StmtKind {
             "DELETE" => StmtKind::Delete,
             "COMMIT" => StmtKind::Commit,
             "ROLLBACK" => StmtKind::Rollback,
-            "CREATE" | "DROP" | "ALTER" | "TRUNCATE" => StmtKind::Ddl,
+            "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "ANALYZE" => StmtKind::Ddl,
             _ => StmtKind::Other,
         }
     }

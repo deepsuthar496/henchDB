@@ -204,6 +204,41 @@ impl Parser {
                 let value = self.parse_literal_operand()?;
                 Ok(Statement::SetVariable { name, value })
             }
+            Some("ANALYZE") => {
+                self.pos += 1;
+                self.expect_kw("TABLE")?;
+                let table = self.expect_ident()?;
+                Ok(Statement::AnalyzeTable { table })
+            }
+            Some("EXPLAIN") => {
+                self.pos += 1;
+                let analyze = self.eat_kw("ANALYZE");
+                if kw(self.peek()).as_deref() != Some("SELECT") {
+                    return Err(Error::ParseError(format!(
+                        "EXPLAIN supports SELECT only, got {:?}",
+                        self.peek()
+                    )));
+                }
+                Ok(Statement::Explain {
+                    analyze,
+                    statement: Box::new(self.parse_select()?),
+                })
+            }
+            Some("DESCRIBE") => {
+                // MySQL synonym for EXPLAIN over a SELECT (table describe
+                // via DESCRIBE <ident> is not supported: use SHOW TABLES).
+                self.pos += 1;
+                if kw(self.peek()).as_deref() != Some("SELECT") {
+                    return Err(Error::ParseError(format!(
+                        "DESCRIBE supports SELECT only, got {:?}",
+                        self.peek()
+                    )));
+                }
+                Ok(Statement::Explain {
+                    analyze: false,
+                    statement: Box::new(self.parse_select()?),
+                })
+            }
             _ => Err(Error::ParseError(format!(
                 "expected statement, got {:?}",
                 self.peek()

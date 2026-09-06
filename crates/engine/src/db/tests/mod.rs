@@ -1,6 +1,6 @@
 //! db test suites: shared helpers plus core CRUD/schema/aggregate tests.
-//! Join, foreign-key, and transaction/MVCC suites live in `joins.rs`,
-//! `fk.rs`, and `txn.rs`.
+//! Join, foreign-key, transaction/MVCC, and optimizer suites live in
+//! `joins.rs`, `fk.rs`, `txn.rs`, and `opt.rs`.
 
 use super::*;
 
@@ -9,6 +9,7 @@ use crate::types::ColumnType;
 
 mod fk;
 mod joins;
+mod opt;
 mod txn;
 
 fn setup(dir: &Path) -> Database {

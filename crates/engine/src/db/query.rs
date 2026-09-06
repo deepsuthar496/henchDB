@@ -6,7 +6,43 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use super::cost::{
+    choose_access_path, estimate_count, full_scan_cost, local_predicate, path_key, path_name,
+    path_type, selectivity,
+};
 use super::plan::{equi_join, join_key, order_joins, JoinKey};
+
+/// Per-table input actuals (execution order) for `EXPLAIN ANALYZE`.
+pub(super) struct JoinCapture {
+    pub input_rows: Vec<usize>,
+}
+
+/// Shared join layout: scope tables, per-table pushdown estimates, and the
+/// greedy execution order. Used by the executor and EXPLAIN alike so the
+/// displayed plan is the executed plan.
+struct JoinPlan {
+    /// Scope tables in written order.
+    tables: Vec<Arc<Table>>,
+    /// Display names in written order (as written in FROM/JOIN).
+    names: Vec<String>,
+    /// Per-table estimates in written order.
+    estimates: Vec<TableEstimate>,
+    /// Execution order (table indices, 0 = FROM first).
+    order: Vec<usize>,
+}
+
+/// Filtered-size estimate for one join input.
+struct TableEstimate {
+    /// Pushable local predicate (None when none, or when the table is on
+    /// the NULL-supplying side of a LEFT JOIN).
+    local: Option<Expr>,
+    /// Selectivity of `local` (1.0 when None).
+    sel: f64,
+    /// Committed row estimate before filtering.
+    total: f64,
+    /// `total * sel`, rounded — the ordering key.
+    filtered: usize,
+}
 use super::{Database, Output, Session};
 use crate::error::{Error, Result};
 use crate::sql::{parse_sql, AggFunc, Expr, JoinClause, JoinKind, SelectItem, Statement};
@@ -86,6 +122,31 @@ impl Database {
                 ("Time".into(), ColumnType::BigInt),
                 ("State".into(), ColumnType::Text),
                 ("Info".into(), ColumnType::Text),
+            ]),
+            Statement::AnalyzeTable { .. } => Ok(vec![
+                ("Table".into(), ColumnType::Text),
+                ("Op".into(), ColumnType::Text),
+                ("Msg_type".into(), ColumnType::Text),
+                ("Msg_text".into(), ColumnType::Text),
+            ]),
+            Statement::Explain { analyze: false, .. } => Ok(vec![
+                ("table".into(), ColumnType::Text),
+                ("access_path".into(), ColumnType::Text),
+                ("type".into(), ColumnType::Text),
+                ("key".into(), ColumnType::Text),
+                ("rows".into(), ColumnType::BigInt),
+                ("filtered".into(), ColumnType::Text),
+                ("cost".into(), ColumnType::Text),
+            ]),
+            Statement::Explain { analyze: true, .. } => Ok(vec![
+                ("table".into(), ColumnType::Text),
+                ("access_path".into(), ColumnType::Text),
+                ("type".into(), ColumnType::Text),
+                ("key".into(), ColumnType::Text),
+                ("rows_est".into(), ColumnType::BigInt),
+                ("rows_act".into(), ColumnType::BigInt),
+                ("cost".into(), ColumnType::Text),
+                ("time_ms".into(), ColumnType::Text),
             ]),
             _ => Ok(vec![]),
         }
@@ -466,35 +527,108 @@ impl Database {
         limit: Option<usize>,
         group_by: Vec<String>,
     ) -> Result<Output> {
+        self.exec_select_joined_impl(
+            session, items, from, joins, selection, order_by, limit, group_by, None,
+        )
+    }
+
+    /// Resolve scope tables, extract pushable per-table predicates, and
+    /// order the join by filtered sizes (selective tables first). Shared by
+    /// the executor and EXPLAIN so the displayed plan is the executed plan.
+    fn plan_join(
+        &self,
+        session: &mut Session,
+        from: &str,
+        joins: &[JoinClause],
+        selection: Option<&Expr>,
+    ) -> Result<JoinPlan> {
         // 1. Scope tables; one table name per query (self-joins need aliases,
         //    which do not exist yet).
-        let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
-        if let Some(dl) = deadline {
-            if std::time::Instant::now() > dl {
-                return Err(Error::QueryTimeout);
-            }
-        }
         let mut tables: Vec<Arc<Table>> = vec![self.table(session, from)?];
-        for j in &joins {
+        let mut names: Vec<String> = vec![from.to_string()];
+        for j in joins {
             if tables.iter().any(|t| t.def.name == j.table || t.def.name.ends_with(&format!(".{}", j.table))) {
                 return Err(Error::NotSupported(
                     "self-joins need table aliases (unsupported)".into(),
                 ));
             }
             tables.push(self.table(session, &j.table)?);
+            names.push(j.table.clone());
         }
-        // 2. Inputs: full scans with the txn overlay (no per-table filter —
-        //    WHERE applies post-join).
+        // 2. Per-table estimates: local predicates only (single-table
+        //    conjuncts). Tables introduced by LEFT JOIN are never pushdown
+        //    targets — their predicates must see NULL-padded rows post-join.
+        let mut estimates = Vec::with_capacity(tables.len());
+        for (ti, t) in tables.iter().enumerate() {
+            let eligible = ti == 0 || joins[ti - 1].kind == JoinKind::Inner;
+            let local = if eligible {
+                local_predicate(selection, ti, &|n| Self::scope_table_idx(&tables, n).ok())
+            } else {
+                None
+            };
+            let stats = t.stats();
+            let total = estimate_count(t);
+            let sel = local
+                .as_ref()
+                .map(|e| selectivity(t, stats.as_ref(), e))
+                .unwrap_or(1.0);
+            estimates.push(TableEstimate {
+                local,
+                sel,
+                total,
+                filtered: (total * sel).round().max(0.0) as usize,
+            });
+        }
+        // 3. Greedy order over filtered sizes: smallest ready INNER join
+        //    first (LEFT = barrier).
+        let sizes: Vec<usize> = estimates.iter().map(|e| e.filtered).collect();
+        let order = order_joins(joins, &sizes, &|n| Self::scope_table_idx(&tables, n));
+        Ok(JoinPlan { tables, names, estimates, order })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_select_joined_impl(
+        &self,
+        session: &mut Session,
+        items: Vec<SelectItem>,
+        from: &str,
+        joins: Vec<JoinClause>,
+        selection: Option<Expr>,
+        order_by: Vec<(String, bool)>,
+        limit: Option<usize>,
+        group_by: Vec<String>,
+        mut capture: Option<&mut JoinCapture>,
+    ) -> Result<Output> {
+        let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
+        if let Some(dl) = deadline {
+            if std::time::Instant::now() > dl {
+                return Err(Error::QueryTimeout);
+            }
+        }
+        let plan = self.plan_join(session, from, &joins, selection.as_ref())?;
+        let tables = plan.tables;
+        // 2. Inputs: committed scans with the txn overlay, pre-filtered by
+        //    each table's pushable local predicates (the full WHERE still
+        //    applies post-join, so pushdown only ever skips doomed rows).
         let mut inputs = Vec::with_capacity(tables.len());
-        for t in &tables {
-            inputs.push(self.visible_rows(session, t, None)?);
+        for (ti, t) in tables.iter().enumerate() {
+            let mut rows = self.visible_rows(session, t, None)?;
+            if let Some(local) = plan.estimates[ti].local.as_ref() {
+                let scope = std::slice::from_ref(t);
+                Self::validate_scoped(local, scope)?;
+                let mut kept = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if Self::eval_scoped(local, scope, &r)? {
+                        kept.push(r);
+                    }
+                }
+                rows = kept;
+            }
+            inputs.push(rows);
         }
-        // 3. Greedy order: smallest ready INNER join first (LEFT = barrier).
-        //    `tables` keeps written order for output naming (SELECT * star
-        //    expansion below); `exec_*` is the execution layout and owns all
-        //    row positions from here on.
-        let sizes: Vec<usize> = inputs.iter().map(|r| r.len()).collect();
-        let exec_order = order_joins(&joins, &sizes, &|n| Self::scope_table_idx(&tables, n));
+        // 3. Execution layout from the plan order; `tables` keeps written
+        //    order for output naming, `exec_*` owns row positions.
+        let exec_order = plan.order;
         let exec_tables: Vec<Arc<Table>> =
             exec_order.iter().map(|&i| tables[i].clone()).collect();
         let exec_joins: Vec<JoinClause> =
@@ -503,6 +637,9 @@ impl Database {
             .iter()
             .map(|&i| std::mem::take(&mut inputs[i]))
             .collect();
+        if let Some(cap) = capture.as_mut() {
+            cap.input_rows = exec_inputs.iter().map(|r| r.len()).collect();
+        }
         // 4. Left-deep joins (hash on equi-keys, nested loop otherwise).
         let mut rows = std::mem::take(&mut exec_inputs[0]);
         for (ji, j) in exec_joins.iter().enumerate() {
@@ -600,6 +737,178 @@ impl Database {
             rows: out_rows,
             message: "OK".into(),
         })
+    }
+
+    /// `EXPLAIN [ANALYZE] SELECT`: one plan row per table (execution
+    /// order for joins) without executing — or with a single timed
+    /// execution filling actuals when `analyze` is set.
+    pub(super) fn exec_explain(
+        &self,
+        session: &mut Session,
+        analyze: bool,
+        inner: &Statement,
+    ) -> Result<Output> {
+        let Statement::Select {
+            items,
+            from,
+            joins,
+            selection,
+            order_by,
+            limit,
+            group_by,
+        } = inner.clone()
+        else {
+            return Err(Error::NotSupported("EXPLAIN supports SELECT only".into()));
+        };
+        if joins.is_empty() && group_by.is_empty() {
+            return self.explain_single(session, analyze, &from, selection, items, order_by, limit);
+        }
+        self.explain_join(session, analyze, &from, joins, selection, items, order_by, limit, group_by)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn explain_single(
+        &self,
+        session: &mut Session,
+        analyze: bool,
+        from: &str,
+        selection: Option<Expr>,
+        items: Vec<SelectItem>,
+        order_by: Vec<(String, bool)>,
+        limit: Option<usize>,
+    ) -> Result<Output> {
+        let table_arc = self.table(session, from)?;
+        let sel = selection.map(|s| Self::strip_qualifiers(&s, from)).transpose()?;
+        let stats = table_arc.stats();
+        let sel_rate = sel
+            .as_ref()
+            .map(|e| selectivity(&table_arc, stats.as_ref(), e))
+            .unwrap_or(1.0);
+        let choice = choose_access_path(&table_arc, sel.as_ref())?;
+        let key = path_key(&table_arc, &choice.path)
+            .map(Datum::Text)
+            .unwrap_or(Datum::Null);
+        let est = choice.est_rows.round().max(0.0) as i64;
+        let mut row = vec![
+            Datum::Text(from.to_string()),
+            Datum::Text(path_name(&choice.path).into()),
+            Datum::Text(path_type(&choice.path).into()),
+            key,
+            Datum::Int(est),
+        ];
+        let columns;
+        if analyze {
+            let t0 = std::time::Instant::now();
+            let out = self.exec_select_single(session, items, from, sel, order_by, limit)?;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            row.push(Datum::Int(out.rows.len() as i64));
+            row.push(Datum::Text(format!("{:.2}", choice.cost)));
+            row.push(Datum::Text(format!("{ms:.3}")));
+            columns = vec![
+                "table".into(),
+                "access_path".into(),
+                "type".into(),
+                "key".into(),
+                "rows_est".into(),
+                "rows_act".into(),
+                "cost".into(),
+                "time_ms".into(),
+            ];
+        } else {
+            row.push(Datum::Text(format!("{:.1}%", sel_rate * 100.0)));
+            row.push(Datum::Text(format!("{:.2}", choice.cost)));
+            columns = vec![
+                "table".into(),
+                "access_path".into(),
+                "type".into(),
+                "key".into(),
+                "rows".into(),
+                "filtered".into(),
+                "cost".into(),
+            ];
+        }
+        Ok(Output { columns, rows: vec![row], message: "OK".into() })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn explain_join(
+        &self,
+        session: &mut Session,
+        analyze: bool,
+        from: &str,
+        joins: Vec<JoinClause>,
+        selection: Option<Expr>,
+        items: Vec<SelectItem>,
+        order_by: Vec<(String, bool)>,
+        limit: Option<usize>,
+        group_by: Vec<String>,
+    ) -> Result<Output> {
+        let plan = self.plan_join(session, from, &joins, selection.as_ref())?;
+        // Optional timed execution for actuals (inputs in exec order).
+        let mut capture = JoinCapture { input_rows: Vec::new() };
+        let ms = if analyze {
+            let t0 = std::time::Instant::now();
+            self.exec_select_joined_impl(
+                session,
+                items,
+                from,
+                joins,
+                selection,
+                order_by,
+                limit,
+                group_by,
+                Some(&mut capture),
+            )?;
+            Some(t0.elapsed().as_secs_f64() * 1000.0)
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        for (pos, &ti) in plan.order.iter().enumerate() {
+            let e = &plan.estimates[ti];
+            let access = if e.local.is_some() { "FILTERED SCAN" } else { "FULL SCAN" };
+            let cost = full_scan_cost(e.total);
+            let mut row = vec![
+                Datum::Text(plan.names[ti].clone()),
+                Datum::Text(access.into()),
+                Datum::Text("ALL".into()),
+                Datum::Null,
+                Datum::Int(e.filtered as i64),
+            ];
+            if let Some(ms) = ms {
+                let act = capture.input_rows.get(pos).copied().unwrap_or(0) as i64;
+                row.push(Datum::Int(act));
+                row.push(Datum::Text(format!("{cost:.2}")));
+                row.push(Datum::Text(format!("{ms:.3}")));
+            } else {
+                row.push(Datum::Text(format!("{:.1}%", e.sel * 100.0)));
+                row.push(Datum::Text(format!("{cost:.2}")));
+            }
+            rows.push(row);
+        }
+        let columns = if analyze {
+            vec![
+                "table".into(),
+                "access_path".into(),
+                "type".into(),
+                "key".into(),
+                "rows_est".into(),
+                "rows_act".into(),
+                "cost".into(),
+                "time_ms".into(),
+            ]
+        } else {
+            vec![
+                "table".into(),
+                "access_path".into(),
+                "type".into(),
+                "key".into(),
+                "rows".into(),
+                "filtered".into(),
+                "cost".into(),
+            ]
+        };
+        Ok(Output { columns, rows, message: "OK".into() })
     }
 
     /// One left-deep join step over accumulated `left_rows` and the next

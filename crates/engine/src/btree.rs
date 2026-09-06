@@ -237,6 +237,10 @@ pub struct BTree {
     merges: AtomicU64,
     /// Successful zero-split in-place value updates (telemetry).
     in_place: AtomicU64,
+    /// Live entry count (exact: every insert/upsert/remove funnels through
+    /// the wrappers below, including restore paths). O(1) size estimates
+    /// for the optimizer without scanning.
+    entries: AtomicU64,
     /// Epoch manager quarantining superseded node bodies (every write swaps
     /// in a new body and retires the old one) and merged-away nodes.
     /// Always present — even standalone trees need quarantine for their
@@ -278,6 +282,7 @@ impl BTree {
             splits: AtomicU64::new(0),
             merges: AtomicU64::new(0),
             in_place: AtomicU64::new(0),
+            entries: AtomicU64::new(0),
             epoch: Mutex::new(EpochManager::new()),
             fix: Mutex::new(()),
         }
@@ -466,6 +471,11 @@ impl BTree {
         self.in_place.load(Ordering::Relaxed)
     }
 
+    /// Exact live entry count (maintained on every mutation).
+    pub fn entry_count(&self) -> u64 {
+        self.entries.load(Ordering::Relaxed)
+    }
+
     /// Single-tree telemetry rollup for diagnostics.
     pub fn stats(&self) -> TreeStats {
         TreeStats {
@@ -502,7 +512,12 @@ impl BTree {
             }
             let root = self.current_root();
             match insert_rec(&root, key, val, self, &epoch) {
-                Descend::Done(inserted) => return inserted,
+                Descend::Done(inserted) => {
+                    if inserted {
+                        self.entries.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return inserted;
+                }
                 Descend::Restart => continue, // stale full root; loop re-wraps
             }
         }
@@ -527,7 +542,12 @@ impl BTree {
             }
             let root = self.current_root();
             match upsert_rec(&root, key, val, self, &epoch) {
-                UpsertDescend::Done(prev) => return prev,
+                UpsertDescend::Done(prev) => {
+                    if prev.is_none() {
+                        self.entries.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return prev;
+                }
                 UpsertDescend::Restart => continue,
             }
         }
@@ -556,6 +576,7 @@ impl BTree {
         let _pin = epoch.pin();
         let root = self.current_root();
         let removed = delete_rec(&root, key, &epoch)?;
+        self.entries.fetch_sub(1, Ordering::Relaxed);
         // One fix-up descent per merge level; merges strictly reduce the
         // node count, so this terminates.
         while self.fix_pass(key) {}

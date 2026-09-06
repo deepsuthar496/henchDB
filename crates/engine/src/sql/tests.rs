@@ -366,3 +366,41 @@ fn parse_start_transaction() {
     assert!(parse_sql("START TRANSACTION WITH FOO").is_err());
     assert!(parse_sql("START FOO").is_err());
 }
+
+#[test]
+fn parse_analyze_and_explain() {
+    let s = parse_sql("ANALYZE TABLE users;").unwrap();
+    assert_eq!(s, Statement::AnalyzeTable { table: "users".into() });
+
+    let s = parse_sql("EXPLAIN SELECT * FROM t WHERE id = 1;").unwrap();
+    match s {
+        Statement::Explain { analyze, statement } => {
+            assert!(!analyze);
+            assert!(matches!(*statement, Statement::Select { .. }));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
+    let s = parse_sql("EXPLAIN ANALYZE SELECT a FROM t JOIN u ON t.id = u.id;").unwrap();
+    match s {
+        Statement::Explain { analyze, statement } => {
+            assert!(analyze);
+            assert!(matches!(*statement, Statement::Select { .. }));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
+    // MySQL DESCRIBE synonym over SELECT.
+    let s = parse_sql("DESCRIBE SELECT * FROM t;").unwrap();
+    match s {
+        Statement::Explain { analyze, statement } => {
+            assert!(!analyze);
+            assert!(matches!(*statement, Statement::Select { .. }));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
+    assert!(parse_sql("EXPLAIN DELETE FROM t;").is_err());
+    assert!(parse_sql("DESCRIBE t;").is_err());
+    assert!(parse_sql("ANALYZE t;").is_err());
+}

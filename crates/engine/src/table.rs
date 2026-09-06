@@ -82,6 +82,9 @@ pub struct TableDef {
     pub schema: Schema,
     pub indexes: Vec<IndexDef>,
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// Last `ANALYZE TABLE` result (None = never analyzed). Tolerant
+    /// trailing codec section: old images decode to None.
+    pub stats: Option<crate::stats::TableStats>,
 }
 
 impl TableDef {
@@ -91,6 +94,7 @@ impl TableDef {
             schema,
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            stats: None,
         }
     }
 }
@@ -113,6 +117,9 @@ pub struct Table {
     /// rolled-back or deleted values are kept (MySQL semantics); the counter
     /// is rebuilt as max(pk)+1 on open so it never regresses across restarts.
     auto_inc: Mutex<Option<AutoIncState>>,
+    /// Last `ANALYZE TABLE` result (None = never analyzed). Restored from
+    /// the def on open; attached to the def on checkpoint via `table_def`.
+    stats: RwLock<Option<crate::stats::TableStats>>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,12 +145,14 @@ impl Table {
             }
         }
         let auto_inc = Table::auto_inc_for(&def);
+        let stats = def.stats.clone();
         Table {
             def,
             tree: BTree::new(),
             indexes: RwLock::new(sec_indexes),
             pool: RwLock::new(None),
             auto_inc: Mutex::new(auto_inc),
+            stats: RwLock::new(stats),
         }
     }
 
@@ -588,7 +597,18 @@ impl Table {
     pub fn table_def(&self) -> TableDef {
         let mut def = self.def.clone();
         def.indexes = self.secondary_indexes();
+        def.stats = self.stats.read().unwrap().clone();
         def
+    }
+
+    /// Replace the stored statistics (from `ANALYZE TABLE`).
+    pub fn set_stats(&self, stats: crate::stats::TableStats) {
+        *self.stats.write().unwrap() = Some(stats);
+    }
+
+    /// Last analyzed statistics, if any.
+    pub fn stats(&self) -> Option<crate::stats::TableStats> {
+        self.stats.read().unwrap().clone()
     }
 
     /// Primary keys matching a secondary index range or equality query.

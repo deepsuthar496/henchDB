@@ -139,6 +139,7 @@ impl Database {
             },
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            stats: None,
         };
         let fks = self.fk_build_defs(session, &key, &name, &bare, foreign_keys)?;
         let mut def = bare;

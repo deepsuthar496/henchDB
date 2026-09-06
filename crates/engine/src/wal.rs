@@ -627,6 +627,15 @@ pub(crate) fn encode_table_def_pub(def: &TableDef, out: &mut Vec<u8>) {
             crate::table::FkAction::SetNull => 2,
         });
     }
+    // Trailing ANALYZE stats section (same tolerant pattern): older images
+    // end here and decode to None; presence byte keeps None explicit.
+    match &def.stats {
+        Some(s) => {
+            out.push(1);
+            crate::stats::encode_stats(s, out);
+        }
+        None => out.push(0),
+    }
 }
 
 fn decode_table_def(buf: &[u8], off: &mut usize, legacy_cols: bool) -> Result<TableDef> {
@@ -730,11 +739,24 @@ pub(crate) fn decode_table_def_pub(buf: &[u8], off: &mut usize, legacy_cols: boo
             });
         }
     }
+    // Trailing stats section: absent in older images (None); a presence
+    // byte distinguishes explicit None from truncation (which errors).
+    let mut stats = None;
+    if *off < buf.len() {
+        let present = *buf
+            .get(*off)
+            .ok_or_else(|| Error::Corrupted("tabledef: EOF".into()))?;
+        *off += 1;
+        if present != 0 {
+            stats = Some(crate::stats::decode_stats(buf, off)?);
+        }
+    }
     Ok(TableDef {
         name,
         schema: crate::table::Schema { columns, pk_idx },
         indexes,
         foreign_keys,
+        stats,
     })
 }
 
@@ -800,6 +822,7 @@ mod tests {
             },
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+                stats: None,
         };
         let mut buf = Vec::new();
         encode_table_def_pub(&def, &mut buf);
@@ -847,6 +870,7 @@ mod tests {
             },
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+                stats: None,
         };
         wal.append_batch(&[
             Record::CreateTable { txn: 1, def: def.clone() },
@@ -891,6 +915,7 @@ mod tests {
             },
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+                stats: None,
         };
         wal.append_batch(&[
             Record::CreateTable { txn: 1, def },

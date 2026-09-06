@@ -55,7 +55,7 @@ impl Datum {
         }
     }
 
-    fn as_f64(&self) -> Option<f64> {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
         match self {
             Datum::Int(v) => Some(*v as f64),
             Datum::Float(v) => Some(*v),

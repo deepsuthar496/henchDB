@@ -15,6 +15,7 @@ pub mod latch;
 pub mod metrics;
 pub mod page;
 pub mod sql;
+pub mod stats;
 pub mod table;
 pub mod types;
 pub mod wal;
