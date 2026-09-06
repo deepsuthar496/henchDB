@@ -120,6 +120,10 @@ pub struct Table {
     /// Last `ANALYZE TABLE` result (None = never analyzed). Restored from
     /// the def on open; attached to the def on checkpoint via `table_def`.
     stats: RwLock<Option<crate::stats::TableStats>>,
+    /// Ephemeral (derived-table) materialization: rows live inline in the
+    /// tree keyed by row id, and the access planner always full-scans
+    /// (positional keys carry no value order). Never checkpointed.
+    ephemeral: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,7 +157,43 @@ impl Table {
             pool: RwLock::new(None),
             auto_inc: Mutex::new(auto_inc),
             stats: RwLock::new(stats),
+            ephemeral: false,
         }
+    }
+
+    /// Materialized derived table: `schema` covers exactly the inner
+    /// projection (all nullable); rows append inline keyed by row id.
+    pub fn new_ephemeral(name: String, schema: Schema) -> Self {
+        Table {
+            def: TableDef {
+                name,
+                schema,
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                stats: None,
+            },
+            tree: BTree::new(),
+            indexes: RwLock::new(Vec::new()),
+            pool: RwLock::new(None),
+            auto_inc: Mutex::new(None),
+            stats: RwLock::new(None),
+            ephemeral: true,
+        }
+    }
+
+    /// Append one row to an ephemeral table (row-id keyed, always inline).
+    pub fn append_ephemeral(&self, id: u64, row: &[Datum]) -> Result<()> {
+        debug_assert!(self.ephemeral, "append_ephemeral on a base table");
+        let key = crate::types::encode_key(&Datum::Int(id as i64))?;
+        // Bypass the pool path deliberately: ephemeral rows never spill
+        // (they live and die with the query).
+        let enc = Self::encode_row(row);
+        self.tree.insert(&key, &enc);
+        Ok(())
+    }
+
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
     }
 
     fn auto_inc_for(def: &TableDef) -> Option<AutoIncState> {

@@ -20,7 +20,7 @@ fn parse_select_full() {
                 items,
                 vec![SelectItem::Column("id".into()), SelectItem::Column("name".into())]
             );
-            assert_eq!(from, "users");
+            assert_eq!(from.name(), "users");
             assert!(selection.is_some());
             assert_eq!(order_by, vec![("id".into(), true)]);
             assert_eq!(limit, Some(10));
@@ -260,7 +260,7 @@ fn parse_aggregates() {
                     SelectItem::Aggregate { func: AggFunc::Max, column: "name".into() },
                 ]
             );
-            assert_eq!(from, "t");
+            assert_eq!(from.name(), "t");
             assert!(selection.is_some());
         }
         other => panic!("wrong stmt {other:?}"),
@@ -281,10 +281,10 @@ fn parse_join_and_group_by() {
     .unwrap();
     match s {
         Statement::Select { items, from, joins, selection, order_by, limit, group_by } => {
-            assert_eq!(from, "users");
+            assert_eq!(from.name(), "users");
             assert_eq!(items.len(), 2);
             assert_eq!(joins.len(), 1);
-            assert_eq!(joins[0].table, "orders");
+            assert_eq!(joins[0].table.name(), "orders");
             assert_eq!(joins[0].kind, JoinKind::Inner);
             assert!(selection.is_some());
             assert_eq!(order_by, vec![("users.id".into(), false)]);
@@ -304,7 +304,7 @@ fn parse_join_and_group_by() {
     match s {
         Statement::Select { joins, .. } => {
             assert_eq!(joins.len(), 2);
-            assert_eq!(joins[1].table, "c");
+            assert_eq!(joins[1].table.name(), "c");
         }
         other => panic!("wrong stmt {other:?}"),
     }
@@ -403,4 +403,109 @@ fn parse_analyze_and_explain() {
     assert!(parse_sql("EXPLAIN DELETE FROM t;").is_err());
     assert!(parse_sql("DESCRIBE t;").is_err());
     assert!(parse_sql("ANALYZE t;").is_err());
+}
+
+#[test]
+fn parse_subqueries() {
+    // IN-subquery (and NOT IN).
+    let s = parse_sql("SELECT * FROM t WHERE id IN (SELECT uid FROM orders);").unwrap();
+    match s {
+        Statement::Select { selection: Some(Expr::InSubquery { expr, query, negated }), .. } => {
+            assert_eq!(*expr, Expr::Column("id".into()));
+            assert_eq!(query.from, TableRef::Table("orders".into()));
+            assert!(!negated);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql("SELECT * FROM t WHERE id NOT IN (SELECT uid FROM orders);").unwrap();
+    match s {
+        Statement::Select { selection: Some(Expr::InSubquery { negated, .. }), .. } => {
+            assert!(negated);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Literal IN-lists still parse as value lists.
+    let s = parse_sql("SELECT * FROM t WHERE id IN (1, 2);").unwrap();
+    match s {
+        Statement::Select { selection: Some(Expr::In { values, .. }), .. } => {
+            assert_eq!(values.len(), 2);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // EXISTS / NOT EXISTS.
+    let s = parse_sql("SELECT * FROM t WHERE EXISTS (SELECT 1 FROM orders);").unwrap();
+    match s {
+        Statement::Select { selection: Some(Expr::Exists { negated, .. }), .. } => {
+            assert!(!negated);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql("SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM orders);").unwrap();
+    match s {
+        Statement::Select { selection: Some(Expr::Exists { negated, .. }), .. } => {
+            assert!(negated);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Scalar subqueries: both comparison sides + parenthesized-left form.
+    let s = parse_sql("SELECT * FROM t WHERE g > (SELECT MAX(g) FROM u);").unwrap();
+    match s {
+        Statement::Select {
+            selection: Some(Expr::Cmp { left, op: CmpOp::Gt, right }),
+            ..
+        } => {
+            assert!(matches!(*left, Expr::Column(_)));
+            assert!(matches!(*right, Expr::ScalarSubquery(_)));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql("SELECT * FROM t WHERE (SELECT MAX(g) FROM u) > 5;").unwrap();
+    match s {
+        Statement::Select {
+            selection: Some(Expr::Cmp { left, op: CmpOp::Gt, right }),
+            ..
+        } => {
+            assert!(matches!(*left, Expr::ScalarSubquery(_)));
+            assert!(matches!(*right, Expr::Literal(_)));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Scalar in the projection list, with and without AS alias.
+    let s = parse_sql("SELECT a, (SELECT MAX(g) FROM u) AS m FROM t;").unwrap();
+    match s {
+        Statement::Select { items, .. } => {
+            assert_eq!(items.len(), 2);
+            match &items[1] {
+                SelectItem::Subquery { alias, .. } => assert_eq!(alias.as_deref(), Some("m")),
+                other => panic!("wrong item {other:?}"),
+            }
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Derived tables in FROM and JOIN, AS optional.
+    let s = parse_sql("SELECT * FROM (SELECT id FROM t WHERE id > 1) AS d;").unwrap();
+    match s {
+        Statement::Select { from, .. } => match from {
+            TableRef::Derived { alias, .. } => assert_eq!(alias, "d"),
+            other => panic!("wrong from {other:?}"),
+        },
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql(
+        "SELECT * FROM t JOIN (SELECT uid FROM orders) o ON t.id = o.uid;",
+    )
+    .unwrap();
+    match s {
+        Statement::Select { joins, .. } => {
+            assert_eq!(joins.len(), 1);
+            match &joins[0].table {
+                TableRef::Derived { alias, .. } => assert_eq!(alias, "o"),
+                other => panic!("wrong join table {other:?}"),
+            }
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Rejections: derived without alias, non-SELECT parens in FROM.
+    assert!(parse_sql("SELECT * FROM (SELECT id FROM t);").is_err());
+    assert!(parse_sql("SELECT * FROM (t);").is_err());
 }

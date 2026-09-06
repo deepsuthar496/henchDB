@@ -36,6 +36,44 @@ pub enum SelectItem {
     Column(String),
     CountStar,
     Aggregate { func: AggFunc, column: String },
+    /// Scalar subquery in the projection list (exactly one row/column).
+    Subquery {
+        query: Box<SelectStmt>,
+        alias: Option<String>,
+    },
+    /// Bare literal in the projection list (`SELECT 1`, the canonical
+    /// `EXISTS (SELECT 1 ...)` body).
+    Literal(Datum),
+}
+
+/// A standalone SELECT: the reusable unit for top-level statements,
+/// subqueries, and derived tables.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectStmt {
+    pub items: Vec<SelectItem>,
+    pub from: TableRef,
+    pub joins: Vec<JoinClause>,
+    pub selection: Option<Expr>,
+    pub order_by: Vec<(String, bool)>,
+    pub limit: Option<usize>,
+    pub group_by: Vec<String>,
+}
+
+/// A FROM/JOIN source: a base table by name, or a materialized subquery.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableRef {
+    Table(String),
+    Derived { query: Box<SelectStmt>, alias: String },
+}
+
+impl TableRef {
+    /// Display name: the table name, or the derived alias.
+    pub fn name(&self) -> &str {
+        match self {
+            TableRef::Table(n) => n,
+            TableRef::Derived { alias, .. } => alias,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +85,7 @@ pub enum JoinKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinClause {
     pub kind: JoinKind,
-    pub table: String,
+    pub table: TableRef,
     pub on: Expr,
 }
 
@@ -113,6 +151,19 @@ pub enum Expr {
         pattern: String,
         negated: bool,
     },
+    /// `expr [NOT] IN (subquery)`: single-column membership test.
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<SelectStmt>,
+        negated: bool,
+    },
+    /// `(subquery)` used as a scalar operand: exactly one row/column.
+    ScalarSubquery(Box<SelectStmt>),
+    /// `[NOT] EXISTS (subquery)`: true when the subquery yields ≥ 1 row.
+    Exists {
+        query: Box<SelectStmt>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +203,7 @@ pub enum Statement {
     },
     Select {
         items: Vec<SelectItem>,
-        from: String,
+        from: TableRef,
         joins: Vec<JoinClause>,
         selection: Option<Expr>,
         order_by: Vec<(String, bool)>,

@@ -63,6 +63,11 @@ fn coerce_for_col(ctype: ColumnType, lit: &Datum) -> Option<Datum> {
 /// become IN lists; anything else falls back to full scan (the executor
 /// re-filters every row against the full predicate, so paths stay correct).
 pub(crate) fn access_path(table: &Table, selection: Option<&Expr>) -> Result<AccessPath> {
+    // Ephemeral (derived-table) materializations are keyed by row id, so
+    // positional keys carry no value order: always scan, filter in memory.
+    if table.is_ephemeral() {
+        return Ok(AccessPath::FullScan);
+    }
     let Some(sel) = selection else {
         return Ok(AccessPath::FullScan);
     };

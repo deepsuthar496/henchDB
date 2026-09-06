@@ -70,9 +70,11 @@ crates/engine/src/
                       txns, commit pipeline, recovery), ddl (databases, tables,
                       indexes), diag (SHOW STATUS/ENGINE/PROCESSLIST,
                       Prometheus assembly), cost (CBO selectivity + costing),
-                      replica (read-only gate, WAL/snapshot apply), query
+                      replica (read-only gate, WAL/snapshot apply),
+                      subquery (IN/EXISTS/scalar/derived evaluation),
+                      explain (EXPLAIN plan display), query
                       (SELECT/JOIN/GROUP BY execution), plan (access paths),
-                      tests/ (suites: core, joins, fk, txn, opt)
+                      tests/ (suites: core, joins, fk, txn, opt, subquery)
   stats.rs            ANALYZE TABLE collection + TableStats codec (tolerant
                       trailing TableDef section)
   metrics.rs          atomic telemetry (counters, latency histogram, process
@@ -103,7 +105,7 @@ you upgrade a component, update the row and the module doc comment.
 | Writes | Session-staged write set; commit takes one commit lock, validates, WAL-batches, installs (allocating an MVCC commit epoch); installs record superseded rows while snapshot readers are active | Per-core WAL shards, Early Lock Release, column-granular versioning (RCC) |
 | Durability | Single WAL file, CRC32 per record, per-txn redo on recovery, snapshot + WAL truncate checkpoint. **Group commit implemented**: commits append under a short lock, one background syncer batches concurrent commits into one fsync (200us collection window), installs happen strictly in WAL-offset order (install frontier + condvar); DDL goes through the same sequencer via `Database::wal_commit` | Per-core WAL buffers (shard the current WAL), io_uring `IOPOLL` (Linux-only, `cfg`-gate it), parallel replay |
 | Concurrency | Single commit lock (serializes installs) | Lock-free commit pipelines; keep commit lock only as the correctness fallback |
-| SQL | Hand-written lexer/parser (`sql/` modules); SELECT/INSERT/UPDATE/DELETE/DDL/BEGIN/COMMIT/ROLLBACK/SHOW TABLES/CHECKPOINT; WHERE = AND/OR/NOT + IN/BETWEEN/LIKE over column-vs-literal ANDed (parens, precedence); CBO access paths (`db/cost.rs`: stats-driven PK point/range + secondary seek vs full scan on cost, ANALYZE TABLE persistence, EXPLAIN [ANALYZE]); index access paths on PK (point/multi-point/range) + secondary; AUTO_INCREMENT integer PKs; SUM/AVG/MIN/MAX (+COUNT); INNER/LEFT JOIN (hash join on equi-keys, nested-loop fallback, greedy smallest-ready-first ordering with LEFT barriers); FOREIGN KEY (RESTRICT/CASCADE/SET NULL, auto-indexed columns, PK/secondary/scan seeks) | sqlparser-rs MySQL dialect, Cascades memo optimizer (greedy covers common shapes), morsel-driven vectorized execution (Arrow), GROUP BY pushdown |
+| SQL | Hand-written lexer/parser (`sql/` modules); SELECT/INSERT/UPDATE/DELETE/DDL/BEGIN/COMMIT/ROLLBACK/SHOW TABLES/CHECKPOINT; WHERE = AND/OR/NOT + IN/BETWEEN/LIKE over column-vs-literal ANDed (parens, precedence); CBO access paths (`db/cost.rs`: stats-driven PK point/range + secondary seek vs full scan on cost, ANALYZE TABLE persistence, EXPLAIN [ANALYZE]); index access paths on PK (point/multi-point/range) + secondary; AUTO_INCREMENT integer PKs; SUM/AVG/MIN/MAX (+COUNT); INNER/LEFT JOIN (hash join on equi-keys, nested-loop fallback, greedy smallest-ready-first ordering with LEFT barriers); FOREIGN KEY (RESTRICT/CASCADE/SET NULL, auto-indexed columns, PK/secondary/scan seeks); subqueries (`db/subquery.rs`: IN/EXISTS/scalar uncorrelated-cached + correlated via session frames, derived FROM/JOIN materialized ephemeral, literal projection) | sqlparser-rs MySQL dialect, Cascades memo optimizer (greedy covers common shapes), morsel-driven vectorized execution (Arrow), GROUP BY pushdown |
 | Server | Thread-per-connection TCP, dual wire frontends — MySQL (text + binary prepares, `CLIENT_SSL` optional via `--tls-cert`/`--tls-key` rustls) + PostgreSQL 3.0 on `--pg-port` (simple query + extended Parse/Bind/Describe/Execute with text/binary params, SSLRequest/TLS upgrade, cleartext auth vs `auth.bin`) — plus legacy framed text (auto-detected, `--no-legacy` to disable); max-connections + idle/handshake timeouts; COM_SHUTDOWN + signal graceful drain; `server passwd` manages `auth.bin` verifiers | Pinned thread-per-core runtime, io_uring sockets, server-side cursors, statement timeouts, per-user privileges, PG COPY/SCRAM/cursors (PG3) |
 
 Known v0.1 simplifications (intentional, do not "fix" silently — implement

@@ -438,12 +438,71 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
-        self.pos += 1;
+        let s = self.parse_select_stmt()?;
+        Ok(Statement::Select {
+            items: s.items,
+            from: s.from,
+            joins: s.joins,
+            selection: s.selection,
+            order_by: s.order_by,
+            limit: s.limit,
+            group_by: s.group_by,
+        })
+    }
+
+    /// Parse `SELECT ...` with the cursor on the SELECT keyword (shared by
+    /// top-level statements and parenthesized subqueries).
+    fn parse_select_stmt(&mut self) -> Result<SelectStmt> {
+        self.expect_kw("SELECT")?;
+        self.parse_select_body()
+    }
+
+    /// Lookahead: keyword at `pos + off` (for `(` SELECT / `IN` SELECT tests).
+    fn peek_kw_at(&self, off: usize) -> Option<String> {
+        kw(self.tokens.get(self.pos + off).unwrap_or(&Token::Eof))
+    }
+
+    /// Parse a `(SELECT ...) [AS] alias` derived table. The cursor is on `(`.
+    fn parse_derived(&mut self) -> Result<TableRef> {
+        self.expect_sym('(')?;
+        if kw(self.peek()).as_deref() != Some("SELECT") {
+            return Err(Error::ParseError(format!(
+                "expected SELECT after '(' in FROM, got {:?}",
+                self.peek()
+            )));
+        }
+        let query = self.parse_select_stmt()?;
+        self.expect_sym(')')?;
+        self.eat_kw("AS");
+        let alias = self.expect_ident()?;
+        Ok(TableRef::Derived { query: Box::new(query), alias })
+    }
+
+    fn parse_table_ref(&mut self) -> Result<TableRef> {
+        if self.peek() == &Token::Sym('(') {
+            self.parse_derived()
+        } else {
+            Ok(TableRef::Table(self.expect_ident()?))
+        }
+    }
+
+    fn parse_select_body(&mut self) -> Result<SelectStmt> {
         let mut items = Vec::new();
         loop {
             if self.peek() == &Token::Sym('*') {
                 self.pos += 1;
                 items.push(SelectItem::Star);
+            } else if self.peek() == &Token::Sym('(') && self.peek_kw_at(1).as_deref() == Some("SELECT") {
+                // Scalar subquery in the projection list, optional AS alias.
+                self.pos += 1;
+                let query = self.parse_select_stmt()?;
+                self.expect_sym(')')?;
+                let alias = if self.eat_kw("AS") {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                items.push(SelectItem::Subquery { query: Box::new(query), alias });
             } else if kw(self.peek()).as_deref() == Some("COUNT") {
                 self.pos += 1;
                 self.expect_sym('(')?;
@@ -456,6 +515,18 @@ impl Parser {
                 let column = self.parse_col_ref()?;
                 self.expect_sym(')')?;
                 items.push(SelectItem::Aggregate { func, column });
+            } else if matches!(self.peek(), Token::Number(_) | Token::Str(_))
+                || (self.peek() == &Token::Sym('-')
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))))
+            {
+                match self.parse_operand()? {
+                    Expr::Literal(d) => items.push(SelectItem::Literal(d)),
+                    other => {
+                        return Err(Error::ParseError(format!(
+                            "expected literal in projection, got {other:?}"
+                        )))
+                    }
+                }
             } else {
                 items.push(SelectItem::Column(self.parse_col_ref()?));
             }
@@ -465,7 +536,7 @@ impl Parser {
             break;
         }
         self.expect_kw("FROM")?;
-        let from = self.expect_ident()?;
+        let from = self.parse_table_ref()?;
         let mut joins = Vec::new();
         loop {
             let kind = if self.eat_kw("INNER") {
@@ -483,7 +554,7 @@ impl Parser {
             let Some(kind) = kind else {
                 break;
             };
-            let table = self.expect_ident()?;
+            let table = self.parse_table_ref()?;
             self.expect_kw("ON")?;
             let on = self.parse_join_cond()?;
             joins.push(JoinClause { kind, table, on });
@@ -533,7 +604,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Statement::Select {
+        Ok(SelectStmt {
             items,
             from,
             joins,
@@ -662,12 +733,69 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expr> {
         if self.eat_kw("NOT") {
+            // `NOT EXISTS (SELECT ...)` parses directly (same semantics as
+            // NOT (EXISTS ...), but keeps the negated form for the planner).
+            if kw(self.peek()).as_deref() == Some("EXISTS") {
+                self.pos += 1;
+                return Ok(Expr::Exists {
+                    query: Box::new(self.parse_exists_body()?),
+                    negated: true,
+                });
+            }
             return Ok(Expr::Not(Box::new(self.parse_not()?)));
         }
         self.parse_predicate()
     }
 
+    /// Parse `(SELECT ...)` after EXISTS (cursor past the keyword).
+    fn parse_exists_body(&mut self) -> Result<SelectStmt> {
+        self.expect_sym('(')?;
+        if kw(self.peek()).as_deref() != Some("SELECT") {
+            return Err(Error::ParseError(format!(
+                "expected SELECT after EXISTS (, got {:?}",
+                self.peek()
+            )));
+        }
+        let stmt = self.parse_select_stmt()?;
+        self.expect_sym(')')?;
+        Ok(stmt)
+    }
+
     fn parse_predicate(&mut self) -> Result<Expr> {
+        if kw(self.peek()).as_deref() == Some("EXISTS") {
+            self.pos += 1;
+            return Ok(Expr::Exists {
+                query: Box::new(self.parse_exists_body()?),
+                negated: false,
+            });
+        }
+        // Scalar subquery in left-operand position: `(SELECT ...) [op x]`.
+        // Bare `(SELECT ...)` parses (predicate-position truthiness is
+        // rejected at execution, like other non-boolean predicates).
+        if self.peek() == &Token::Sym('(') && self.peek_kw_at(1).as_deref() == Some("SELECT") {
+            self.pos += 1;
+            let stmt = self.parse_select_stmt()?;
+            self.expect_sym(')')?;
+            let scalar = Expr::ScalarSubquery(Box::new(stmt));
+            if let Some(op) = self.parse_cmp_op() {
+                let second = self.parse_operand()?;
+                match &second {
+                    Expr::Column(_) | Expr::Literal(_) | Expr::ScalarSubquery(_) => {
+                        return Ok(Expr::Cmp {
+                            left: Box::new(scalar),
+                            op,
+                            right: Box::new(second),
+                        })
+                    }
+                    other => {
+                        return Err(Error::NotSupported(format!(
+                            "cannot compare a subquery with {other:?}"
+                        )))
+                    }
+                }
+            }
+            return Ok(scalar);
+        }
         if self.eat_sym('(') {
             let e = self.parse_expr()?;
             self.expect_sym(')')?;
@@ -695,6 +823,35 @@ impl Parser {
                         right: Box::new(first),
                     })
                 }
+                // Scalar subqueries compare like values (no flipping: the
+                // folded literal lands exactly where the subquery stood,
+                // except literal-first which normalizes like columns).
+                (Expr::Column(_), Expr::ScalarSubquery(_))
+                | (Expr::ScalarSubquery(_), Expr::Column(_))
+                | (Expr::ScalarSubquery(_), Expr::Literal(_))
+                | (Expr::ScalarSubquery(_), Expr::ScalarSubquery(_)) => {
+                    return Ok(Expr::Cmp {
+                        left: Box::new(first),
+                        op,
+                        right: Box::new(second),
+                    })
+                }
+                (Expr::Literal(_), Expr::ScalarSubquery(_)) => {
+                    return Ok(Expr::Cmp {
+                        left: Box::new(second),
+                        op: op.flipped(),
+                        right: Box::new(first),
+                    })
+                }
+                // Column-vs-column (same-table filters and correlated
+                // subquery equalities): the evaluator compares row values.
+                (Expr::Column(_), Expr::Column(_)) => {
+                    return Ok(Expr::Cmp {
+                        left: Box::new(first),
+                        op,
+                        right: Box::new(second),
+                    })
+                }
                 _ => {
                     return Err(Error::NotSupported(
                         "WHERE comparisons must be column vs literal".into(),
@@ -708,11 +865,7 @@ impl Parser {
         }
         if self.eat_kw("NOT") {
             if self.eat_kw("IN") {
-                return Ok(Expr::In {
-                    expr: Box::new(first),
-                    values: self.parse_in_list()?,
-                    negated: true,
-                });
+                return self.parse_in_tail(first, true);
             }
             if self.eat_kw("LIKE") {
                 return Ok(Expr::Like {
@@ -731,11 +884,7 @@ impl Parser {
             )));
         }
         if self.eat_kw("IN") {
-            return Ok(Expr::In {
-                expr: Box::new(first),
-                values: self.parse_in_list()?,
-                negated: false,
-            });
+            return self.parse_in_tail(first, false);
         }
         if self.eat_kw("LIKE") {
             return Ok(Expr::Like {
@@ -761,6 +910,26 @@ impl Parser {
         self.expect_kw("AND")?;
         let hi = self.parse_literal_operand()?;
         Ok((lo, hi))
+    }
+
+    /// Parse `IN (...)`: a literal list, or `IN (SELECT ...)` when the
+    /// paren holds a subquery.
+    fn parse_in_tail(&mut self, first: Expr, negated: bool) -> Result<Expr> {
+        if self.peek() == &Token::Sym('(') && self.peek_kw_at(1).as_deref() == Some("SELECT") {
+            self.pos += 1;
+            let query = self.parse_select_stmt()?;
+            self.expect_sym(')')?;
+            return Ok(Expr::InSubquery {
+                expr: Box::new(first),
+                query: Box::new(query),
+                negated,
+            });
+        }
+        Ok(Expr::In {
+            expr: Box::new(first),
+            values: self.parse_in_list()?,
+            negated,
+        })
     }
 
     fn parse_in_list(&mut self) -> Result<Vec<Datum>> {
@@ -797,6 +966,14 @@ impl Parser {
     }
 
     fn parse_operand(&mut self) -> Result<Expr> {
+        // Scalar subquery operand: `(SELECT ...)` (subqueries in any other
+        // paren position stay a parse error).
+        if self.peek() == &Token::Sym('(') && self.peek_kw_at(1).as_deref() == Some("SELECT") {
+            self.pos += 1;
+            let stmt = self.parse_select_stmt()?;
+            self.expect_sym(')')?;
+            return Ok(Expr::ScalarSubquery(Box::new(stmt)));
+        }
         match self.next() {
             Token::Str(s) => Ok(Expr::Literal(Datum::Text(s))),
             Token::Number(n) => {

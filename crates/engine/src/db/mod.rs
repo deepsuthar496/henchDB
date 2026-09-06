@@ -26,7 +26,7 @@ use crate::catalog;
 use crate::error::{Error, Result};
 use crate::metrics::{Metrics, StmtKind};
 use crate::page::{BufferPool, MAX_VALUE_LEN};
-use crate::sql::{eval_expr, parse_sql, Expr, Statement};
+use crate::sql::{parse_sql, Expr, Statement};
 use crate::table::Table;
 use crate::types::{decode_key, encode_key, Datum};
 use crate::wal::{Record, Wal};
@@ -37,11 +37,13 @@ use plan::{access_path, AccessPath};
 pub(crate) mod cost;
 pub(crate) mod ddl;
 pub(crate) mod diag;
+pub(crate) mod explain;
 pub(crate) mod fk;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub(crate) mod query;
 pub(crate) mod replica;
+pub(crate) mod subquery;
 
 #[cfg(test)]
 mod tests;
@@ -72,6 +74,10 @@ pub struct Session {
     pub max_execution_time: Option<Duration>,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
+    /// Subquery evaluation state (derived-table materializations, correlated
+    /// row frames, uncorrelated fold cache). Per-statement scope: cleared
+    /// at the top of `execute`, managed by `db/subquery.rs`.
+    pub(crate) subq: subquery::SubqueryState,
 }
 
 impl Session {
@@ -88,6 +94,7 @@ impl Default for Session {
             current_db: "default".to_string(),
             max_execution_time: None,
             snapshot: None,
+            subq: subquery::SubqueryState::default(),
         }
     }
 }
@@ -309,8 +316,14 @@ impl Database {
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<Output> {
         // Replica governance first: rejected writes never reach the
         // executor, the WAL, or the metrics counters.
-        if self.read_only.load(Ordering::Relaxed) && replica::is_write_statement(sql.trim()) {            return Err(Error::ReadOnlyReplica);
+        if self.read_only.load(Ordering::Relaxed) && replica::is_write_statement(sql.trim()) {
+            return Err(Error::ReadOnlyReplica);
         }
+        // Fresh subquery scope per statement (derived materializations,
+        // correlation frames, and fold caches never leak across queries).
+        session.subq.eph.clear();
+        session.subq.outer.clear();
+        session.subq.fold.clear();
         let _guard = self.epoch.pin();
         let t0 = std::time::Instant::now();
         let res = self.execute_inner(session, sql);
@@ -824,9 +837,12 @@ impl Database {
 
         // Fast path for point update on PK when autocommit (skipped for
         // FK-involved tables: those need statement-level checks below).
+        // Subquery predicates skip it too: the point probe cannot enforce
+        // them, and the generic path below folds per row.
         let fk_involved =
             !table_arc.def.foreign_keys.is_empty() || self.fk_is_referenced(&table_key);
-        if session.txn.is_none() && !fk_involved {
+        let has_sub = selection.as_ref().is_some_and(subquery::has_subquery);
+        if session.txn.is_none() && !fk_involved && !has_sub {
             if let Ok(AccessPath::Point(lit)) = access_path(&table_arc, selection.as_ref()) {
                 let key = encode_key(&lit)?;
                 if let Some(raw) = table_arc.tree().get(&key) {
@@ -853,7 +869,18 @@ impl Database {
             }
         }
 
-        let rows = self.visible_rows(session, &table_arc, selection.as_ref())?;
+        let (plain_sel, sub_sel) = match selection.as_ref() {
+            Some(s) if subquery::has_subquery(s) => {
+                let (p, q) = subquery::split_subquery_parts(s);
+                (p, q)
+            }
+            _ => (selection.clone(), None),
+        };
+        let mut rows = self.visible_rows(session, &table_arc, plain_sel.as_ref())?;
+        if let Some(q) = sub_sel.as_ref() {
+            let scope = std::slice::from_ref(&table_arc);
+            rows = subquery::filter_with_subqueries(self, session, scope, rows, q)?;
+        }
         let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
         // (new key, old row) per updated row for FK checks.
         let mut pairs: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
@@ -905,7 +932,18 @@ impl Database {
     ) -> Result<Output> {
         let table_arc = self.table(session, table)?;
         let table_key = self.resolve_table_key(session, table);
-        let rows = self.visible_rows(session, &table_arc, selection.as_ref())?;
+        let (plain_sel, sub_sel) = match selection.as_ref() {
+            Some(s) if subquery::has_subquery(s) => {
+                let (p, q) = subquery::split_subquery_parts(s);
+                (p, q)
+            }
+            _ => (selection.clone(), None),
+        };
+        let mut rows = self.visible_rows(session, &table_arc, plain_sel.as_ref())?;
+        if let Some(q) = sub_sel.as_ref() {
+            let scope = std::slice::from_ref(&table_arc);
+            rows = subquery::filter_with_subqueries(self, session, scope, rows, q)?;
+        }
         let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
         for row in &rows {
             let key = encode_key(&row[table_arc.schema().pk_idx])?;
@@ -1275,11 +1313,38 @@ impl Database {
 
         // Filter with the full predicate (index predicates re-evaluated —
         // correct and simple; the executor fast path avoids a re-scan).
+        // Resolution falls back outward across correlation frames, so
+        // subquery row environments evaluate here as well as in the
+        // dedicated fold paths (empty frames = plain scope behavior).
         if let Some(sel) = selection {
-            rows.into_iter()
-                .filter(|(_, r)| eval_expr(sel, schema, r).unwrap_or(false))
-                .map(|(_, r)| Ok(r))
-                .collect()
+            let mut out = Vec::new();
+            for (_, r) in rows {
+                // Unknown columns filter the row out (legacy behavior);
+                // every other evaluation error propagates.
+                match crate::sql::eval_with(sel, &mut |name| {
+                    match schema.index_of(name) {
+                        Some(idx) => Ok(r[idx].clone()),
+                        None => {
+                            for frame in session.subq.outer.iter().rev() {
+                                match Self::resolve_scope(&frame.tables, name) {
+                                    Ok(pos) => return Ok(frame.row[pos].clone()),
+                                    Err(Error::ColumnNotFound(_)) | Err(Error::TableNotFound(_)) => {
+                                        continue
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            Err(Error::ColumnNotFound(name.into()))
+                        }
+                    }
+                }) {
+                    Ok(true) => out.push(r),
+                    Ok(false) => {}
+                    Err(Error::ColumnNotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(out)
         } else {
             Ok(rows.into_iter().map(|(_, r)| r).collect())
         }

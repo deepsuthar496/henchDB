@@ -6,46 +6,53 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use super::cost::{
-    choose_access_path, estimate_count, full_scan_cost, local_predicate, path_key, path_name,
-    path_type, selectivity,
-};
+use super::cost::{estimate_count, local_predicate, selectivity};
 use super::plan::{equi_join, join_key, order_joins, JoinKey};
+use super::subquery;
 
 /// Per-table input actuals (execution order) for `EXPLAIN ANALYZE`.
 pub(super) struct JoinCapture {
     pub input_rows: Vec<usize>,
 }
 
+/// One global-aggregation output column: a row count, a column aggregate,
+/// or a pre-folded scalar subquery value.
+enum AggSpec {
+    Count,
+    Agg(AggFunc, usize),
+    Scalar(Datum),
+}
+
 /// Shared join layout: scope tables, per-table pushdown estimates, and the
 /// greedy execution order. Used by the executor and EXPLAIN alike so the
 /// displayed plan is the executed plan.
-struct JoinPlan {
+pub(super) struct JoinPlan {
     /// Scope tables in written order.
-    tables: Vec<Arc<Table>>,
+    pub(super) tables: Vec<Arc<Table>>,
     /// Display names in written order (as written in FROM/JOIN).
-    names: Vec<String>,
+    pub(super) names: Vec<String>,
     /// Per-table estimates in written order.
-    estimates: Vec<TableEstimate>,
+    pub(super) estimates: Vec<TableEstimate>,
     /// Execution order (table indices, 0 = FROM first).
-    order: Vec<usize>,
+    pub(super) order: Vec<usize>,
 }
 
 /// Filtered-size estimate for one join input.
-struct TableEstimate {
+pub(super) struct TableEstimate {
     /// Pushable local predicate (None when none, or when the table is on
     /// the NULL-supplying side of a LEFT JOIN).
-    local: Option<Expr>,
+    pub(super) local: Option<Expr>,
     /// Selectivity of `local` (1.0 when None).
-    sel: f64,
+    pub(super) sel: f64,
     /// Committed row estimate before filtering.
-    total: f64,
+    pub(super) total: f64,
     /// `total * sel`, rounded — the ordering key.
-    filtered: usize,
+    pub(super) filtered: usize,
 }
 use super::{Database, Output, Session};
 use crate::error::{Error, Result};
 use crate::sql::{parse_sql, AggFunc, Expr, JoinClause, JoinKind, SelectItem, Statement};
+use crate::sql::{SelectStmt, TableRef};
 use crate::table::{Schema, Table};
 use crate::types::{ColumnType, Datum};
 
@@ -59,52 +66,14 @@ impl Database {
         let stmt = parse_sql(sql.trim())?;
         match stmt {
             Statement::Select { items, from, joins, .. } => {
-                let mut tables: Vec<Arc<Table>> = vec![self.table(session, &from)?];
-                for j in joins {
-                    if tables.iter().any(|t| t.def.name == *j.table || t.def.name.ends_with(&format!(".{}", j.table))) {
-                        return Err(Error::NotSupported(
-                            "self-joins need table aliases (unsupported)".into(),
-                        ));
-                    }
-                    tables.push(self.table(session, &j.table)?);
-                }
-                // For bare star columns, qualify only on cross-table collision.
-                let mut cols = Vec::new();
-                for item in &items {
-                    match item {
-                        SelectItem::Star => {
-                            for (name, idx) in Self::star_columns(&tables) {
-                                let (owner, local) = Self::scope_owner(&tables, idx);
-                                cols.push((name, owner.schema().columns[local].ctype));
-                            }
-                        }
-                        SelectItem::Column(c) => {
-                            let idx = Self::resolve_scope(&tables, &c)?;
-                            let (owner, local) = Self::scope_owner(&tables, idx);
-                            cols.push((Self::proj_output_name(&item), owner.schema().columns[local].ctype));
-                        }
-                        SelectItem::CountStar => cols.push(("COUNT(*)".into(), ColumnType::BigInt)),
-                        SelectItem::Aggregate { func, column } => {
-                            let idx = Self::resolve_scope(&tables, &column)?;
-                            let (owner, local) = Self::scope_owner(&tables, idx);
-                            let ctype = owner.schema().columns[local].ctype;
-                            let out_type = match func {
-                                AggFunc::Avg => ColumnType::Double,
-                                AggFunc::Sum => match ctype {
-                                    ColumnType::Float | ColumnType::Double => ColumnType::Double,
-                                    _ => ColumnType::BigInt,
-                                },
-                                AggFunc::Min | AggFunc::Max => ctype,
-                            };
-                            cols.push((Self::proj_output_name(&item), out_type));
-                        }
-                    }
-                }
-                Ok(cols)
+                let mut tmp = Session {
+                    current_db: session.current_db.clone(),
+                    ..Default::default()
+                };
+                self.describe_select(session, &mut tmp, &items, &from, &joins)
             }
             Statement::ShowTables => Ok(vec![("table".into(), ColumnType::Text)]),
-            Statement::ShowDatabases => Ok(vec![("Database".into(), ColumnType::Text)]),
-            Statement::ShowStatus { .. } => Ok(vec![
+            Statement::ShowDatabases => Ok(vec![("Database".into(), ColumnType::Text)]),            Statement::ShowStatus { .. } => Ok(vec![
                 ("Variable_name".into(), ColumnType::Text),
                 ("Value".into(), ColumnType::Text),
             ]),
@@ -152,21 +121,154 @@ impl Database {
         }
     }
 
+    /// Describe one SELECT level: resolve sources (materializing derived
+    /// tables into a throwaway session — prepare-time only, never the
+    /// caller's session) and expand the projection to (name, type).
+    /// `tmp` carries nested derived scopes across recursion (same
+    /// setup/teardown discipline as execution).
+    fn describe_select(
+        &self,
+        session: &Session,
+        tmp: &mut Session,
+        items: &[SelectItem],
+        from: &TableRef,
+        joins: &[JoinClause],
+    ) -> Result<Vec<(String, ColumnType)>> {
+        // Derived sources need materialized schemas: run their inner
+        // queries in the throwaway session (SELECT-only, no side effects).
+        let saved = subquery::setup_derived(self, tmp, from, joins)?;
+        let r = self.describe_select_resolved(session, tmp, items, from, joins);
+        subquery::teardown_derived(tmp, saved);
+        r
+    }
+
+    fn describe_select_resolved(
+        &self,
+        session: &Session,
+        tmp: &mut Session,
+        items: &[SelectItem],
+        from: &TableRef,
+        joins: &[JoinClause],
+    ) -> Result<Vec<(String, ColumnType)>> {
+        let mut tables: Vec<Arc<Table>> = vec![subquery::resolve_table_ref(self, tmp, from)?];
+        for j in joins {
+            tables.push(subquery::resolve_table_ref(self, tmp, &j.table)?);
+        }
+        // Self-join guard mirrors the executor (derived aliases included:
+        // ephemeral def names are their aliases).
+        {
+            let mut seen: Vec<&str> = Vec::new();
+            for t in &tables {
+                let n = t.def.name.as_str();
+                if seen.contains(&n) {
+                    return Err(Error::NotSupported(
+                        "self-joins need table aliases (unsupported)".into(),
+                    ));
+                }
+                seen.push(n);
+            }
+        }
+        // For bare star columns, qualify only on cross-table collision.
+        let mut cols = Vec::new();
+        for item in items {
+            match item {
+                SelectItem::Star => {
+                    for (name, idx) in Self::star_columns(&tables) {
+                        let (owner, local) = Self::scope_owner(&tables, idx);
+                        cols.push((name, owner.schema().columns[local].ctype));
+                    }
+                }
+                SelectItem::Column(c) => {
+                    let idx = Self::resolve_scope(&tables, &c)?;
+                    let (owner, local) = Self::scope_owner(&tables, idx);
+                    cols.push((Self::proj_output_name(&item), owner.schema().columns[local].ctype));
+                }
+                SelectItem::CountStar => cols.push(("COUNT(*)".into(), ColumnType::BigInt)),
+                SelectItem::Literal(d) => cols.push((
+                    d.to_string(),
+                    match d {
+                        Datum::Int(_) => ColumnType::BigInt,
+                        Datum::Float(_) => ColumnType::Double,
+                        Datum::Text(_) => ColumnType::Text,
+                        Datum::Bool(_) => ColumnType::Bool,
+                        Datum::DateTime(_) => ColumnType::DateTime,
+                        Datum::Null => ColumnType::Text,
+                    },
+                )),                SelectItem::Aggregate { func, column } => {
+                    let idx = Self::resolve_scope(&tables, &column)?;
+                    let (owner, local) = Self::scope_owner(&tables, idx);
+                    let ctype = owner.schema().columns[local].ctype;
+                    let out_type = match func {
+                        AggFunc::Avg => ColumnType::Double,
+                        AggFunc::Sum => match ctype {
+                            ColumnType::Float | ColumnType::Double => ColumnType::Double,
+                            _ => ColumnType::BigInt,
+                        },
+                        AggFunc::Min | AggFunc::Max => ctype,
+                    };
+                    cols.push((Self::proj_output_name(&item), out_type));
+                }
+                SelectItem::Subquery { query, alias } => {
+                    let inner = self.describe_select(
+                        session,
+                        tmp,
+                        &query.items,
+                        &query.from,
+                        &query.joins,
+                    )?;
+                    if inner.len() != 1 {
+                        return Err(Error::InvalidQuery(
+                            "Subquery must return only one column".into(),
+                        ));
+                    }
+                    let name = alias.clone().unwrap_or_else(|| inner[0].0.clone());
+                    cols.push((name, inner[0].1));
+                }
+            }
+        }
+        Ok(cols)
+    }
+
     pub(super) fn exec_select(
         &self,
         session: &mut Session,
         items: Vec<SelectItem>,
-        from: &str,
+        from: &TableRef,
         joins: Vec<crate::sql::JoinClause>,
         selection: Option<Expr>,
         order_by: Vec<(String, bool)>,
         limit: Option<usize>,
         group_by: Vec<String>,
     ) -> Result<Output> {
-        if joins.is_empty() && group_by.is_empty() {
-            return self.exec_select_single(session, items, from, selection, order_by, limit);
-        }
-        self.exec_select_joined(session, items, from, joins, selection, order_by, limit, group_by)
+        // Derived-table scope: materialize this level's sources, run, then
+        // restore shadowed aliases (nesting-safe by construction).
+        let saved = subquery::setup_derived(self, session, from, &joins)?;
+        let out = if joins.is_empty() && group_by.is_empty() {
+            self.exec_select_single(session, items, from, selection, order_by, limit)
+        } else {
+            self.exec_select_joined(session, items, from, joins, selection, order_by, limit, group_by)
+        };
+        subquery::teardown_derived(session, saved);
+        out
+    }
+
+    /// Entry point for subquery levels (same setup/teardown discipline via
+    /// `exec_select`).
+    pub(super) fn exec_select_stmt(
+        &self,
+        session: &mut Session,
+        stmt: &SelectStmt,
+    ) -> Result<Output> {
+        self.exec_select(
+            session,
+            stmt.items.clone(),
+            &stmt.from,
+            stmt.joins.clone(),
+            stmt.selection.clone(),
+            stmt.order_by.clone(),
+            stmt.limit,
+            stmt.group_by.clone(),
+        )
     }
 
     /// Bare column part of a possibly qualified `table.col` reference.
@@ -181,6 +283,12 @@ impl Database {
             SelectItem::Column(c) => Self::bare_name(c).to_string(),
             SelectItem::CountStar => "COUNT(*)".into(),
             SelectItem::Aggregate { func, column } => format!("{}({column})", func.name()),
+            // Scalar subqueries name after their inner column (or alias at
+            // projection time); describe falls back to the same rule.
+            SelectItem::Subquery { query, alias } => alias.clone().unwrap_or_else(|| {
+                subquery::projection_scalar_name(query, None)
+            }),
+            SelectItem::Literal(d) => d.to_string(),
         }
     }
 
@@ -202,13 +310,16 @@ impl Database {
 
     /// Rewrite `table.col` refs to `col` for single-table statements (the
     /// qualifier must name this table). Keeps qualified sugar working on the
-    /// fast path without touching the index-aware machinery.
-    fn strip_qualifiers(expr: &Expr, table: &str) -> Result<Expr> {
+    /// fast path without touching the index-aware machinery. References to
+    /// other tables pass through untouched: inside subqueries they are
+    /// correlated outer references resolved at execution; at the top level
+    /// they fail then (like unknown bare columns, as empty results).
+    pub(super) fn strip_qualifiers(expr: &Expr, table: &str) -> Result<Expr> {
         match expr {
             Expr::Literal(d) => Ok(Expr::Literal(d.clone())),
             Expr::Column(name) => match name.split_once('.') {
                 Some((t, c)) if t == table => Ok(Expr::Column(c.into())),
-                Some(_) => Err(Error::ColumnNotFound(name.clone())),
+                Some(_) => Ok(Expr::Column(name.clone())),
                 None => Ok(Expr::Column(name.clone())),
             },
             Expr::Cmp { left, op, right } => Ok(Expr::Cmp {
@@ -226,7 +337,9 @@ impl Database {
             )),
             Expr::Not(e) => Ok(Expr::Not(Box::new(Self::strip_qualifiers(e, table)?))),
             // IN/BETWEEN/LIKE carry literal operands only; recurse the
-            // tested expression.
+            // tested expression. Subquery bodies keep their own scope:
+            // only the outer test expression strips qualifiers here
+            // (correlated qualified refs resolve outward at execution).
             Expr::In { expr, values, negated } => Ok(Expr::In {
                 expr: Box::new(Self::strip_qualifiers(expr, table)?),
                 values: values.clone(),
@@ -243,15 +356,21 @@ impl Database {
                 pattern: pattern.clone(),
                 negated: *negated,
             }),
+            Expr::InSubquery { expr, query, negated } => Ok(Expr::InSubquery {
+                expr: Box::new(Self::strip_qualifiers(expr, table)?),
+                query: query.clone(),
+                negated: *negated,
+            }),
+            Expr::ScalarSubquery(_) | Expr::Exists { .. } => Ok(expr.clone()),
         }
     }
 
     /// Single-table SELECT: index-aware fast path (unchanged hot path).
-    fn exec_select_single(
+    pub(super) fn exec_select_single(
         &self,
         session: &mut Session,
         items: Vec<SelectItem>,
-        from: &str,
+        from: &TableRef,
         selection: Option<Expr>,
         order_by: Vec<(String, bool)>,
         limit: Option<usize>,
@@ -262,52 +381,110 @@ impl Database {
                 return Err(Error::QueryTimeout);
             }
         }
-        let table_arc = self.table(session, from)?;
+        let table_arc = subquery::resolve_table_ref(self, session, from)?;
+        let display = from.name();
         let schema = table_arc.schema();
-        let selection = selection.map(|s| Self::strip_qualifiers(&s, from)).transpose()?;
+        let selection = selection.map(|s| Self::strip_qualifiers(&s, display)).transpose()?;
 
         let count_only = items.len() == 1 && matches!(items[0], SelectItem::CountStar);
         // Global aggregates (no GROUP BY): mixing aggregates with plain
         // columns is rejected like MySQL's ONLY_FULL_GROUP_BY.
         // (The sole-COUNT(*) case keeps its legacy path below.)
+        // Scalar-subquery items behave like plain per-row columns for the
+        // mixing rule (they fold to one value per row); aggregates still
+        // need GROUP BY when mixed with row values.
         let has_agg = items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::CountStar));
         let all_agg = !items.is_empty()
-            && items.iter().all(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::CountStar));
+            && items.iter().all(|i| {
+                matches!(
+                    i,
+                    SelectItem::Aggregate { .. } | SelectItem::CountStar | SelectItem::Subquery { .. }
+                )
+            });
         if has_agg && !all_agg {
             return Err(Error::NotSupported(
                 "mixing aggregates with plain columns requires GROUP BY".into(),
             ));
         }
         let agg_only = all_agg && !count_only;
+        /// Projection spec: plain column positions, per-row scalar
+        /// subqueries evaluated after ORDER BY / LIMIT truncation, or
+        /// row-independent constants.
+        enum ProjSpec {
+            Col(usize),
+            Subq(SelectStmt, Option<String>),
+            Const(Datum),
+        }
         let mut out_columns: Vec<String> = Vec::new();
+        let mut proj: Vec<ProjSpec> = Vec::new();
         if !count_only && !agg_only {
             for item in &items {
                 match item {
-                    SelectItem::Star => out_columns.extend(schema.column_names()),
+                    SelectItem::Star => {
+                        out_columns.extend(schema.column_names());
+                        proj.extend((0..schema.columns.len()).map(ProjSpec::Col));
+                    }
                     SelectItem::Column(c) => {
-                        Self::single_col_idx(schema, from, c)?;
+                        let idx = Self::single_col_idx(schema, display, c)?;
                         out_columns.push(Self::bare_name(c).into());
+                        proj.push(ProjSpec::Col(idx));
+                    }
+                    SelectItem::Literal(d) => {
+                        out_columns.push(d.to_string());
+                        proj.push(ProjSpec::Const(d.clone()));
+                    }
+                    SelectItem::Subquery { query, alias } => {
+                        out_columns.push(subquery::projection_scalar_name(query, alias.as_deref()));
+                        proj.push(ProjSpec::Subq((**query).clone(), alias.clone()));
                     }
                     SelectItem::CountStar => unreachable!(),
                     SelectItem::Aggregate { func, column } => {
-                        Self::single_col_idx(schema, from, column)?;
+                        Self::single_col_idx(schema, display, column)?;
                         out_columns.push(format!("{}({column})", func.name()));
+                        // Unreachable here (agg_only split above), kept for
+                        // exhaustiveness.
+                        return Err(Error::NotSupported(
+                            "mixing aggregates with plain columns requires GROUP BY".into(),
+                        ));
                     }
                 }
             }
         }
 
-        let mut rows = self.visible_rows(session, &table_arc, selection.as_ref())?;
+        // Subquery conjuncts bypass the indexed scan (planned opaque) and
+        // filter here per row; plain conjuncts keep their index paths (the
+        // post-filter re-checks everything, so the split is pure planning).
+        let (plain_sel, sub_sel) = match selection.as_ref() {
+            Some(s) if subquery::has_subquery(s) => {
+                let (p, q) = subquery::split_subquery_parts(s);
+                (p, q)
+            }
+            _ => (selection.clone(), None),
+        };
+        let mut rows = self.visible_rows(session, &table_arc, plain_sel.as_ref())?;
+        if let Some(q) = sub_sel.as_ref() {
+            let scope = std::slice::from_ref(&table_arc);
+            rows = subquery::filter_with_subqueries(self, session, scope, rows, q)?;
+        }
 
         if agg_only {
             // ORDER BY / LIMIT do not apply to a global aggregate row.
+            // Scalar subqueries fold once (uncorrelated-only; correlation
+            // has no row environment here and fails as unknown column).
             let mut aggs = Vec::with_capacity(items.len());
             for item in &items {
                 match item {
-                    SelectItem::CountStar => aggs.push((None, "COUNT(*)".into())),
+                    SelectItem::CountStar => aggs.push((AggSpec::Count, "COUNT(*)".into())),
                     SelectItem::Aggregate { func, column } => {
-                        let idx = Self::single_col_idx(schema, from, column)?;
-                        aggs.push((Some((*func, idx)), format!("{}({column})", func.name())));
+                        let idx = Self::single_col_idx(schema, display, column)?;
+                        aggs.push((AggSpec::Agg(*func, idx), format!("{}({column})", func.name())));
+                    }
+                    SelectItem::Subquery { query, alias } => {
+                        let d = subquery::eval_scalar_uncorrelated(self, session, query)?;
+                        let name = alias.clone().unwrap_or_else(|| {
+                            subquery::projection_scalar_name(query, None)
+                        });
+                        aggs.push((AggSpec::Scalar(d), name));
                     }
                     _ => unreachable!(),
                 }
@@ -318,7 +495,7 @@ impl Database {
         if !order_by.is_empty() {
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
-                keys.push(Self::single_col_idx(schema, from, col)?);
+                keys.push(Self::single_col_idx(schema, display, col)?);
             }
             rows.sort_by(|a, b| {
                 for (i, (_, desc)) in order_by.iter().enumerate() {
@@ -342,20 +519,29 @@ impl Database {
             });
         }
 
-        let proj: Vec<usize> = items
-            .iter()
-            .flat_map(|i| match i {
-                SelectItem::Star => (0..schema.columns.len()).collect::<Vec<usize>>(),
-                SelectItem::Column(c) => vec![Self::single_col_idx(schema, from, c).unwrap()],
-                SelectItem::CountStar => unreachable!(),
-                SelectItem::Aggregate { .. } => unreachable!(),
-            })
-            .collect();
-
-        let out_rows = rows
-            .into_iter()
-            .map(|r| proj.iter().map(|&i| r[i].clone()).collect())
-            .collect();
+        let scope = std::slice::from_ref(&table_arc);
+        let mut out_rows: Vec<Vec<Datum>> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut out = Vec::with_capacity(proj.len());
+            for p in &proj {
+                match p {
+                    ProjSpec::Col(i) => out.push(r[*i].clone()),
+                    ProjSpec::Const(d) => out.push(d.clone()),
+                    ProjSpec::Subq(q, a) => {
+                        let (d, _) = subquery::eval_projection_scalar(
+                            self,
+                            session,
+                            scope,
+                            &r,
+                            q,
+                            a.as_deref(),
+                        )?;
+                        out.push(d);
+                    }
+                }
+            }
+            out_rows.push(out);
+        }
         Ok(Output {
             columns: out_columns,
             rows: out_rows,
@@ -366,17 +552,18 @@ impl Database {
     /// Global aggregation over filtered rows: one output row. NULLs are
     /// skipped (empty set: COUNT → 0, others → NULL). Non-numeric values in
     /// SUM/AVG are type errors; MIN/MAX use the total datum order.
-    /// `aggs`: per-item (optional (func, column idx), output name).
-    fn exec_aggregate_rows(aggs: &[(Option<(AggFunc, usize)>, String)], rows: Vec<Vec<Datum>>) -> Result<Output> {
+    /// `aggs`: per-item (spec, output name).
+    fn exec_aggregate_rows(aggs: &[(AggSpec, String)], rows: Vec<Vec<Datum>>) -> Result<Output> {
         let mut out_row = Vec::with_capacity(aggs.len());
         let mut out_columns = Vec::with_capacity(aggs.len());
         for (agg, name) in aggs {
             out_columns.push(name.clone());
             match agg {
-                None => out_row.push(Datum::Int(rows.len() as i64)),
-                Some((func, idx)) => {
+                AggSpec::Count => out_row.push(Datum::Int(rows.len() as i64)),
+                AggSpec::Agg(func, idx) => {
                     out_row.push(Self::compute_aggregate(*func, *idx, &rows)?);
                 }
+                AggSpec::Scalar(d) => out_row.push(d.clone()),
             }
         }
         Ok(Output {
@@ -439,7 +626,8 @@ impl Database {
 
     /// Resolve `col` or `table.col` to a position in a concatenated joined
     /// row. Bare names must match exactly one table (ambiguity is an error).
-    fn resolve_scope(tables: &[Arc<Table>], name: &str) -> Result<usize> {
+    /// Shared with `db/subquery.rs` for correlated name resolution.
+    pub(crate) fn resolve_scope(tables: &[Arc<Table>], name: &str) -> Result<usize> {
         let mut base = 0usize;
         if let Some((t, c)) = name.split_once('.') {
             for table in tables {
@@ -505,6 +693,42 @@ impl Database {
         })
     }
 
+    /// Frame-aware `eval_scoped`: names failing the join scope fall back
+    /// outward across correlation frames (subquery row environments).
+    /// With empty frames this is exactly `eval_scoped`.
+    fn eval_scoped_framed(
+        session: &Session,
+        expr: &Expr,
+        tables: &[Arc<Table>],
+        row: &[Datum],
+    ) -> Result<bool> {
+        crate::sql::eval_with(expr, &mut |name| {
+            subquery::resolve_row(tables, row, session, name)
+        })
+    }
+
+    /// Frame-aware `validate_scoped`: names resolving in scope or in any
+    /// pushed frame pass (correlated references validate against the row
+    /// environment they execute with). Ambiguity still errors immediately.
+    fn validate_scoped_framed(
+        session: &Session,
+        expr: &Expr,
+        tables: &[Arc<Table>],
+    ) -> Result<()> {
+        let mut cols = Vec::new();
+        crate::sql::collect_columns(expr, &mut cols);
+        for name in cols {
+            match Self::resolve_scope(tables, name) {
+                Ok(_) => {}
+                Err(Error::ColumnNotFound(_)) | Err(Error::TableNotFound(_)) => {
+                    subquery::resolve_frame(session, name).map(|_| ())?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Fail cleanly on unknown/ambiguous columns before filtering (so a bad
     /// WHERE/ON errors instead of silently matching nothing).
     fn validate_scoped(expr: &Expr, tables: &[Arc<Table>]) -> Result<()> {
@@ -520,7 +744,7 @@ impl Database {
         &self,
         session: &mut Session,
         items: Vec<SelectItem>,
-        from: &str,
+        from: &TableRef,
         joins: Vec<JoinClause>,
         selection: Option<Expr>,
         order_by: Vec<(String, bool)>,
@@ -535,25 +759,34 @@ impl Database {
     /// Resolve scope tables, extract pushable per-table predicates, and
     /// order the join by filtered sizes (selective tables first). Shared by
     /// the executor and EXPLAIN so the displayed plan is the executed plan.
-    fn plan_join(
+    pub(super) fn plan_join(
         &self,
         session: &mut Session,
-        from: &str,
+        from: &TableRef,
         joins: &[JoinClause],
         selection: Option<&Expr>,
     ) -> Result<JoinPlan> {
         // 1. Scope tables; one table name per query (self-joins need aliases,
-        //    which do not exist yet).
-        let mut tables: Vec<Arc<Table>> = vec![self.table(session, from)?];
-        let mut names: Vec<String> = vec![from.to_string()];
+        //    which do not exist yet). Derived sources resolve from the
+        //    session materialization map (populated by `exec_select` setup).
+        let mut tables: Vec<Arc<Table>> = vec![subquery::resolve_table_ref(self, session, from)?];
+        let mut names: Vec<String> = vec![from.name().to_string()];
         for j in joins {
-            if tables.iter().any(|t| t.def.name == j.table || t.def.name.ends_with(&format!(".{}", j.table))) {
-                return Err(Error::NotSupported(
-                    "self-joins need table aliases (unsupported)".into(),
-                ));
+            if let TableRef::Table(t) = &j.table {
+                if tables.iter().any(|x| x.def.name == *t || x.def.name.ends_with(&format!(".{t}"))) {
+                    return Err(Error::NotSupported(
+                        "self-joins need table aliases (unsupported)".into(),
+                    ));
+                }
+            } else if let TableRef::Derived { alias, .. } = &j.table {
+                if tables.iter().any(|x| x.def.name == *alias) {
+                    return Err(Error::NotSupported(
+                        "self-joins need table aliases (unsupported)".into(),
+                    ));
+                }
             }
-            tables.push(self.table(session, &j.table)?);
-            names.push(j.table.clone());
+            tables.push(subquery::resolve_table_ref(self, session, &j.table)?);
+            names.push(j.table.name().to_string());
         }
         // 2. Per-table estimates: local predicates only (single-table
         //    conjuncts). Tables introduced by LEFT JOIN are never pushdown
@@ -561,11 +794,21 @@ impl Database {
         let mut estimates = Vec::with_capacity(tables.len());
         for (ti, t) in tables.iter().enumerate() {
             let eligible = ti == 0 || joins[ti - 1].kind == JoinKind::Inner;
-            let local = if eligible {
+            let mut local = if eligible {
                 local_predicate(selection, ti, &|n| Self::scope_table_idx(&tables, n).ok())
             } else {
                 None
             };
+            // Subquery conjuncts push only when every escaping reference
+            // stays on this table (cross-table correlation must see joined
+            // rows post-join; pushing it would mis-evaluate or error).
+            if let Some(e) = local.as_ref() {
+                if subquery::has_subquery(e)
+                    && !subquery::pushable_to(self, session, e, ti, &tables)
+                {
+                    local = None;
+                }
+            }
             let stats = t.stats();
             let total = estimate_count(t);
             let sel = local
@@ -587,11 +830,11 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn exec_select_joined_impl(
+    pub(super) fn exec_select_joined_impl(
         &self,
         session: &mut Session,
         items: Vec<SelectItem>,
-        from: &str,
+        from: &TableRef,
         joins: Vec<JoinClause>,
         selection: Option<Expr>,
         order_by: Vec<(String, bool)>,
@@ -610,19 +853,25 @@ impl Database {
         // 2. Inputs: committed scans with the txn overlay, pre-filtered by
         //    each table's pushable local predicates (the full WHERE still
         //    applies post-join, so pushdown only ever skips doomed rows).
+        //    Locals holding subqueries fold per row against the single-table
+        //    scope (push-safety was vetted during planning).
         let mut inputs = Vec::with_capacity(tables.len());
         for (ti, t) in tables.iter().enumerate() {
             let mut rows = self.visible_rows(session, t, None)?;
             if let Some(local) = plan.estimates[ti].local.as_ref() {
                 let scope = std::slice::from_ref(t);
-                Self::validate_scoped(local, scope)?;
-                let mut kept = Vec::with_capacity(rows.len());
-                for r in rows {
-                    if Self::eval_scoped(local, scope, &r)? {
-                        kept.push(r);
+                Self::validate_scoped_framed(session, local, scope)?;
+                if subquery::has_subquery(local) {
+                    rows = subquery::filter_with_subqueries(self, session, scope, rows, local)?;
+                } else {
+                    let mut kept = Vec::with_capacity(rows.len());
+                    for r in rows {
+                        if Self::eval_scoped_framed(session, local, scope, &r)? {
+                            kept.push(r);
+                        }
                     }
+                    rows = kept;
                 }
-                rows = kept;
             }
             inputs.push(rows);
         }
@@ -647,21 +896,35 @@ impl Database {
             let scope: &[Arc<Table>] = &exec_tables[..ji + 2];
             rows = Self::join_step(scope, &j.on, j.kind, rows, &exec_inputs[ji + 1], deadline)?;
         }
-        // 5. WHERE over joined rows.
+        // 5. WHERE over joined rows (subquery conjuncts fold per row
+        //    against the joined scope; plain conjuncts take the fast path).
+        //    Both validate frame-aware: correlated references resolve
+        //    against pushed row environments.
         if let Some(sel) = selection.as_ref() {
-            Self::validate_scoped(sel, &exec_tables)?;
-            let mut kept = Vec::with_capacity(rows.len());
-            for r in rows {
-                if Self::eval_scoped(sel, &exec_tables, &r)? {
-                    kept.push(r);
+            Self::validate_scoped_framed(session, sel, &exec_tables)?;
+            if subquery::has_subquery(sel) {
+                rows = subquery::filter_with_subqueries(self, session, &exec_tables, rows, sel)?;
+            } else {
+                let mut kept = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if Self::eval_scoped_framed(session, sel, &exec_tables, &r)? {
+                        kept.push(r);
+                    }
                 }
+                rows = kept;
             }
-            rows = kept;
         }
-        // 6. Project or group.
+        // 6. Project or group. Scalar subqueries behave like per-row
+        //    columns for the mixing rule; aggregates still need GROUP BY
+        //    when mixed with row values.
         let has_agg = items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::CountStar));
         let all_agg = !items.is_empty()
-            && items.iter().all(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::CountStar));
+            && items.iter().all(|i| {
+                matches!(
+                    i,
+                    SelectItem::Aggregate { .. } | SelectItem::CountStar | SelectItem::Subquery { .. }
+                )
+            });
         if !group_by.is_empty() {
             return self.exec_grouped(&items, &exec_tables, rows, &group_by, order_by, limit);
         }
@@ -674,10 +937,17 @@ impl Database {
             let mut aggs = Vec::with_capacity(items.len());
             for item in &items {
                 match item {
-                    SelectItem::CountStar => aggs.push((None, "COUNT(*)".into())),
+                    SelectItem::CountStar => aggs.push((AggSpec::Count, "COUNT(*)".into())),
                     SelectItem::Aggregate { func, column } => {
                         let idx = Self::resolve_scope(&exec_tables, column)?;
-                        aggs.push((Some((*func, idx)), format!("{}({column})", func.name())));
+                        aggs.push((AggSpec::Agg(*func, idx), format!("{}({column})", func.name())));
+                    }
+                    SelectItem::Subquery { query, alias } => {
+                        let d = subquery::eval_scalar_uncorrelated(self, session, query)?;
+                        let name = alias.clone().unwrap_or_else(|| {
+                            subquery::projection_scalar_name(query, None)
+                        });
+                        aggs.push((AggSpec::Scalar(d), name));
                     }
                     _ => unreachable!(),
                 }
@@ -705,7 +975,13 @@ impl Database {
             });
         }
         let mut out_columns = Vec::new();
-        let mut proj = Vec::new();
+        /// Joined projection spec: scope positions, or per-row scalars.
+        enum JProj {
+            Col(usize),
+            Subq(SelectStmt, Option<String>),
+            Const(Datum),
+        }
+        let mut proj: Vec<JProj> = Vec::new();
         for item in &items {
             match item {
                 SelectItem::Star => {
@@ -714,21 +990,47 @@ impl Database {
                     for (name, _) in Self::star_columns(&tables) {
                         let idx = Self::resolve_scope(&exec_tables, &name)?;
                         out_columns.push(name);
-                        proj.push(idx);
+                        proj.push(JProj::Col(idx));
                     }
                 }
                 SelectItem::Column(c) => {
                     let idx = Self::resolve_scope(&exec_tables, c)?;
                     out_columns.push(Self::proj_output_name(item));
-                    proj.push(idx);
+                    proj.push(JProj::Col(idx));
+                }
+                SelectItem::Literal(d) => {
+                    out_columns.push(d.to_string());
+                    proj.push(JProj::Const(d.clone()));
+                }
+                SelectItem::Subquery { query, alias } => {
+                    out_columns.push(subquery::projection_scalar_name(query, alias.as_deref()));
+                    proj.push(JProj::Subq((**query).clone(), alias.clone()));
                 }
                 _ => unreachable!(),
             }
         }
-        let mut out_rows: Vec<Vec<Datum>> = rows
-            .into_iter()
-            .map(|r| proj.iter().map(|&i| r[i].clone()).collect())
-            .collect();
+        let mut out_rows: Vec<Vec<Datum>> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut out = Vec::with_capacity(proj.len());
+            for p in &proj {
+                match p {
+                    JProj::Col(i) => out.push(r[*i].clone()),
+                    JProj::Const(d) => out.push(d.clone()),
+                    JProj::Subq(q, a) => {
+                        let (d, _) = subquery::eval_projection_scalar(
+                            self,
+                            session,
+                            &exec_tables,
+                            &r,
+                            q,
+                            a.as_deref(),
+                        )?;
+                        out.push(d);
+                    }
+                }
+            }
+            out_rows.push(out);
+        }
         if let Some(l) = limit {
             out_rows.truncate(l);
         }
@@ -739,177 +1041,7 @@ impl Database {
         })
     }
 
-    /// `EXPLAIN [ANALYZE] SELECT`: one plan row per table (execution
-    /// order for joins) without executing — or with a single timed
-    /// execution filling actuals when `analyze` is set.
-    pub(super) fn exec_explain(
-        &self,
-        session: &mut Session,
-        analyze: bool,
-        inner: &Statement,
-    ) -> Result<Output> {
-        let Statement::Select {
-            items,
-            from,
-            joins,
-            selection,
-            order_by,
-            limit,
-            group_by,
-        } = inner.clone()
-        else {
-            return Err(Error::NotSupported("EXPLAIN supports SELECT only".into()));
-        };
-        if joins.is_empty() && group_by.is_empty() {
-            return self.explain_single(session, analyze, &from, selection, items, order_by, limit);
-        }
-        self.explain_join(session, analyze, &from, joins, selection, items, order_by, limit, group_by)
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    fn explain_single(
-        &self,
-        session: &mut Session,
-        analyze: bool,
-        from: &str,
-        selection: Option<Expr>,
-        items: Vec<SelectItem>,
-        order_by: Vec<(String, bool)>,
-        limit: Option<usize>,
-    ) -> Result<Output> {
-        let table_arc = self.table(session, from)?;
-        let sel = selection.map(|s| Self::strip_qualifiers(&s, from)).transpose()?;
-        let stats = table_arc.stats();
-        let sel_rate = sel
-            .as_ref()
-            .map(|e| selectivity(&table_arc, stats.as_ref(), e))
-            .unwrap_or(1.0);
-        let choice = choose_access_path(&table_arc, sel.as_ref())?;
-        let key = path_key(&table_arc, &choice.path)
-            .map(Datum::Text)
-            .unwrap_or(Datum::Null);
-        let est = choice.est_rows.round().max(0.0) as i64;
-        let mut row = vec![
-            Datum::Text(from.to_string()),
-            Datum::Text(path_name(&choice.path).into()),
-            Datum::Text(path_type(&choice.path).into()),
-            key,
-            Datum::Int(est),
-        ];
-        let columns;
-        if analyze {
-            let t0 = std::time::Instant::now();
-            let out = self.exec_select_single(session, items, from, sel, order_by, limit)?;
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            row.push(Datum::Int(out.rows.len() as i64));
-            row.push(Datum::Text(format!("{:.2}", choice.cost)));
-            row.push(Datum::Text(format!("{ms:.3}")));
-            columns = vec![
-                "table".into(),
-                "access_path".into(),
-                "type".into(),
-                "key".into(),
-                "rows_est".into(),
-                "rows_act".into(),
-                "cost".into(),
-                "time_ms".into(),
-            ];
-        } else {
-            row.push(Datum::Text(format!("{:.1}%", sel_rate * 100.0)));
-            row.push(Datum::Text(format!("{:.2}", choice.cost)));
-            columns = vec![
-                "table".into(),
-                "access_path".into(),
-                "type".into(),
-                "key".into(),
-                "rows".into(),
-                "filtered".into(),
-                "cost".into(),
-            ];
-        }
-        Ok(Output { columns, rows: vec![row], message: "OK".into() })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn explain_join(
-        &self,
-        session: &mut Session,
-        analyze: bool,
-        from: &str,
-        joins: Vec<JoinClause>,
-        selection: Option<Expr>,
-        items: Vec<SelectItem>,
-        order_by: Vec<(String, bool)>,
-        limit: Option<usize>,
-        group_by: Vec<String>,
-    ) -> Result<Output> {
-        let plan = self.plan_join(session, from, &joins, selection.as_ref())?;
-        // Optional timed execution for actuals (inputs in exec order).
-        let mut capture = JoinCapture { input_rows: Vec::new() };
-        let ms = if analyze {
-            let t0 = std::time::Instant::now();
-            self.exec_select_joined_impl(
-                session,
-                items,
-                from,
-                joins,
-                selection,
-                order_by,
-                limit,
-                group_by,
-                Some(&mut capture),
-            )?;
-            Some(t0.elapsed().as_secs_f64() * 1000.0)
-        } else {
-            None
-        };
-        let mut rows = Vec::new();
-        for (pos, &ti) in plan.order.iter().enumerate() {
-            let e = &plan.estimates[ti];
-            let access = if e.local.is_some() { "FILTERED SCAN" } else { "FULL SCAN" };
-            let cost = full_scan_cost(e.total);
-            let mut row = vec![
-                Datum::Text(plan.names[ti].clone()),
-                Datum::Text(access.into()),
-                Datum::Text("ALL".into()),
-                Datum::Null,
-                Datum::Int(e.filtered as i64),
-            ];
-            if let Some(ms) = ms {
-                let act = capture.input_rows.get(pos).copied().unwrap_or(0) as i64;
-                row.push(Datum::Int(act));
-                row.push(Datum::Text(format!("{cost:.2}")));
-                row.push(Datum::Text(format!("{ms:.3}")));
-            } else {
-                row.push(Datum::Text(format!("{:.1}%", e.sel * 100.0)));
-                row.push(Datum::Text(format!("{cost:.2}")));
-            }
-            rows.push(row);
-        }
-        let columns = if analyze {
-            vec![
-                "table".into(),
-                "access_path".into(),
-                "type".into(),
-                "key".into(),
-                "rows_est".into(),
-                "rows_act".into(),
-                "cost".into(),
-                "time_ms".into(),
-            ]
-        } else {
-            vec![
-                "table".into(),
-                "access_path".into(),
-                "type".into(),
-                "key".into(),
-                "rows".into(),
-                "filtered".into(),
-                "cost".into(),
-            ]
-        };
-        Ok(Output { columns, rows, message: "OK".into() })
-    }
 
     /// One left-deep join step over accumulated `left_rows` and the next
     /// table's `right_rows`. Equi-keys hash; everything else nested-loops.
@@ -1096,6 +1228,7 @@ impl Database {
         enum GProj {
             Key(usize), // position in group_by
             Agg(Option<(AggFunc, usize)>),
+            Const(Datum),
         }
         let mut out_columns = Vec::with_capacity(items.len());
         let mut projs = Vec::with_capacity(items.len());
@@ -1126,6 +1259,19 @@ impl Database {
                     out_columns.push(Self::proj_output_name(item));
                     projs.push(GProj::Agg(Some((*func, idx))));
                 }
+                // Row-independent constants are coherent per group.
+                SelectItem::Literal(d) => {
+                    out_columns.push(d.to_string());
+                    projs.push(GProj::Const(d.clone()));
+                }
+                // Scalar subqueries have no group-row environment (only
+                // uncorrelated values would be coherent); reject cleanly
+                // instead of picking an arbitrary row's value.
+                SelectItem::Subquery { .. } => {
+                    return Err(Error::NotSupported(
+                        "scalar subqueries are not supported with GROUP BY".into(),
+                    ))
+                }
             }
         }
         let mut groups: BTreeMap<Vec<Datum>, Vec<usize>> = BTreeMap::new();
@@ -1147,6 +1293,7 @@ impl Database {
                     GProj::Agg(Some((func, idx))) => {
                         out_row.push(Self::compute_aggregate(*func, *idx, &member_rows)?)
                     }
+                    GProj::Const(d) => out_row.push(d.clone()),
                 }
             }
             paired.push((out_row, key.clone()));
@@ -1339,4 +1486,4 @@ fn compute_aggregate(func: AggFunc, idx: usize, rows: &[Vec<Datum>]) -> Result<D
     }
 }
 }
-
+

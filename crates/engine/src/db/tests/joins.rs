@@ -313,7 +313,7 @@ fn ord_join(table: &str, left: &str, right: &str) -> crate::sql::JoinClause {
     use crate::sql::{CmpOp, Expr};
     crate::sql::JoinClause {
         kind: crate::sql::JoinKind::Inner,
-        table: table.into(),
+        table: crate::sql::TableRef::Table(table.into()),
         on: Expr::Cmp {
             left: Box::new(Expr::Column(left.into())),
             op: CmpOp::Eq,

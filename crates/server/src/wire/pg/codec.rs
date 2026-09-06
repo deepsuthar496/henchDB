@@ -174,6 +174,8 @@ pub fn sqlstate(e: &engine::Error) -> &'static str {
         engine::Error::DatabaseNotFound(_) => "3D000",
         engine::Error::DatabaseExists(_) => "42P04",
         engine::Error::ReadOnlyReplica => "25006",
+        engine::Error::InvalidQuery(_) => "21000",
+        engine::Error::ExecutionError(_) => "21000",
         _ => "XX000",
     }
 }

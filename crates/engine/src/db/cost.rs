@@ -243,6 +243,11 @@ pub(crate) fn selectivity(table: &Table, stats: Option<&TableStats>, expr: &Expr
             Datum::Float(v) if *v == 0.0 => 0.0,
             _ => 1.0,
         },
+        // Subquery predicates: neutral membership/existence guesses (the
+        // executor folds them exactly; costing only needs stability).
+        Expr::InSubquery { .. } => 0.1,
+        Expr::Exists { .. } => 0.5,
+        Expr::ScalarSubquery(_) => 0.5,
     }
 }
 

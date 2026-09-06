@@ -25,6 +25,8 @@ pub enum Error {
     DatabaseExists(String),
     QueryTimeout,
     ReadOnlyReplica,
+    InvalidQuery(String),
+    ExecutionError(String),
 }
 
 impl fmt::Display for Error {
@@ -60,6 +62,8 @@ impl fmt::Display for Error {
                 f,
                 "The server is running with the --read-only option so it cannot execute this statement"
             ),
+            Error::InvalidQuery(m) => write!(f, "invalid query: {m}"),
+            Error::ExecutionError(m) => write!(f, "execution error: {m}"),
         }
     }
 }

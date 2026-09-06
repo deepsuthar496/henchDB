@@ -237,6 +237,8 @@ pub fn mysql_error_for(e: &engine::Error) -> (u16, &'static str) {
         engine::Error::ColumnNotFound(_) => (1054, "42S22"),
         engine::Error::ParseError(_) | engine::Error::NotSupported(_) => (1064, "42000"),
         engine::Error::ReadOnlyReplica => (1290, "HY000"),
+        engine::Error::InvalidQuery(_) => (1241, "21000"),
+        engine::Error::ExecutionError(_) => (1242, "21000"),
         _ => (1105, "HY000"),
     }
 }

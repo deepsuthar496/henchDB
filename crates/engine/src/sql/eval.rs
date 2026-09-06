@@ -96,6 +96,10 @@ pub fn collect_columns<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
         Expr::In { expr, .. } | Expr::Between { expr, .. } | Expr::Like { expr, .. } => {
             collect_columns(expr, out)
         }
+        // Subquery bodies live in their own scope (validated at execution):
+        // only the outer test expression belongs to this level.
+        Expr::InSubquery { expr, .. } => collect_columns(expr, out),
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } => {}
     }
 }
 

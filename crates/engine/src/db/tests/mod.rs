@@ -10,6 +10,7 @@ use crate::types::ColumnType;
 mod fk;
 mod joins;
 mod opt;
+mod subquery;
 mod txn;
 
 fn setup(dir: &Path) -> Database {

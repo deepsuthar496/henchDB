@@ -73,6 +73,26 @@ fn error_codes_for_read_only() {
 }
 
 #[test]
+fn error_codes_for_subqueries() {
+    assert_eq!(
+        crate::wire::packet::mysql_error_for(&engine::Error::InvalidQuery("x".into())),
+        (1241, "21000")
+    );
+    assert_eq!(
+        crate::wire::packet::mysql_error_for(&engine::Error::ExecutionError("x".into())),
+        (1242, "21000")
+    );
+    assert_eq!(
+        crate::wire::pg::codec::sqlstate(&engine::Error::InvalidQuery("x".into())),
+        "21000"
+    );
+    assert_eq!(
+        crate::wire::pg::codec::sqlstate(&engine::Error::ExecutionError("x".into())),
+        "21000"
+    );
+}
+
+#[test]
 fn primary_replica_streaming_e2e() {
     let base = std::env::temp_dir();
     let pdir = base.join(format!("hdbrpl_p_{}", std::process::id()));
