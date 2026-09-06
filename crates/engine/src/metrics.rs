@@ -109,6 +109,12 @@ pub struct MetricsSnapshot {
     pub wal_bytes: u64,
     pub active_txns: usize,
     pub active_conns: usize,
+    /// Replication (primary: connected replicas; replica: applied offset,
+    /// lag bytes, and CONNECTING/STREAMING/DISCONNECTED status).
+    pub repl_connected: usize,
+    pub repl_applied: u64,
+    pub repl_lag: u64,
+    pub repl_status: String,
 }
 
 /// Live inputs gathered by the database for status/prometheus assembly.
@@ -130,6 +136,8 @@ pub struct EngineExtra {
     pub table_count: usize,
     pub mvcc_snapshots: usize,
     pub mvcc_chains: usize,
+    /// Primary WAL written offset (log head) for `Rpl_master_wal_offset`.
+    pub master_wal_offset: u64,
 }
 
 pub struct Metrics {
@@ -150,6 +158,10 @@ pub struct Metrics {
     active_conns: AtomicUsize,
     next_proc_id: AtomicU64,
     processes: Mutex<HashMap<u64, ProcessInner>>,
+    repl_connected: AtomicUsize,
+    repl_applied: AtomicU64,
+    repl_lag: AtomicU64,
+    repl_status: Mutex<String>,
 }
 
 impl Metrics {
@@ -172,6 +184,10 @@ impl Metrics {
             active_conns: AtomicUsize::new(0),
             next_proc_id: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
+            repl_connected: AtomicUsize::new(0),
+            repl_applied: AtomicU64::new(0),
+            repl_lag: AtomicU64::new(0),
+            repl_status: Mutex::new(String::new()),
         }
     }
 
@@ -315,7 +331,35 @@ impl Metrics {
             wal_bytes: self.wal_bytes.load(Ordering::Relaxed),
             active_txns: self.active_txns.load(Ordering::Relaxed),
             active_conns: self.active_conns.load(Ordering::Relaxed),
+            repl_connected: self.repl_connected.load(Ordering::Relaxed),
+            repl_applied: self.repl_applied.load(Ordering::Relaxed),
+            repl_lag: self.repl_lag.load(Ordering::Relaxed),
+            repl_status: self.repl_status.lock().unwrap().clone(),
         }
+    }
+
+    /// Primary side: a replica (un)subscribed to the WAL stream.
+    pub fn repl_connected_inc(&self) {
+        self.repl_connected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn repl_connected_dec(&self) {
+        let prev = self.repl_connected.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "repl disconnect without connect");
+    }
+
+    /// Replica side: streaming progress + health (hot path: atomics only;
+    /// status string changes rarely).
+    pub fn set_repl_applied(&self, offset: u64) {
+        self.repl_applied.store(offset, Ordering::Relaxed);
+    }
+
+    pub fn set_repl_lag(&self, lag_bytes: u64) {
+        self.repl_lag.store(lag_bytes, Ordering::Relaxed);
+    }
+
+    pub fn set_repl_status(&self, status: &str) {
+        *self.repl_status.lock().unwrap() = status.to_string();
     }
 
     /// `SHOW STATUS` rows: `(Variable_name, Value)` in MySQL conventions.
@@ -348,6 +392,17 @@ impl Metrics {
             ),
             ("Innodb_os_log_fsyncs", extra.wal_syncs.to_string()),
             ("Innodb_os_log_written", snap.wal_bytes.to_string()),
+            (
+                "Rpl_semi_sync_master_clients",
+                snap.repl_connected.to_string(),
+            ),
+            ("Rpl_master_wal_offset", extra.master_wal_offset.to_string()),
+            ("Rpl_replica_status", snap.repl_status.clone()),
+            ("Rpl_replica_lag_bytes", snap.repl_lag.to_string()),
+            (
+                "Rpl_replica_applied_offset",
+                snap.repl_applied.to_string(),
+            ),
         ];
         all.into_iter()
             .filter(|(name, _)| match like {
@@ -510,6 +565,24 @@ impl Metrics {
             "btree_in_place_updates_total",
             "B+ tree zero-split in-place value updates.",
             &extra.btree_in_place.to_string(),
+        );
+        gauge(
+            &mut out,
+            "replication_connected_replicas",
+            "Replicas currently streaming from this primary.",
+            &snap.repl_connected.to_string(),
+        );
+        gauge(
+            &mut out,
+            "replication_applied_offset",
+            "Replica WAL offset applied locally (primary log space).",
+            &snap.repl_applied.to_string(),
+        );
+        gauge(
+            &mut out,
+            "replication_lag_bytes",
+            "Replica lag behind the primary durable offset, in bytes.",
+            &snap.repl_lag.to_string(),
         );
         out
     }

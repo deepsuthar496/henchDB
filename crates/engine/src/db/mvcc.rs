@@ -57,9 +57,16 @@ impl VersionState {
         }
     }
 
+    /// Drop all history and snapshot pins (replica snapshot-apply: prior
+    /// epochs are meaningless once the table set is replaced wholesale).
+    pub(crate) fn clear(&mut self) {
+        self.committed.clear();
+        self.chains.clear();
+        self.snapshots.clear();
+    }
+
     /// Drop history no live reader can consult (see module docs).
-    fn gc_locked(&mut self) {
-        match self.snapshots.values().copied().min() {
+    fn gc_locked(&mut self) {        match self.snapshots.values().copied().min() {
             None => {
                 self.chains.clear();
                 self.committed.clear();

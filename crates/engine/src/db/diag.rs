@@ -66,6 +66,7 @@ impl Database {
         let (chains, snapshots) = self.snapshot_counts();
         extra.mvcc_chains = chains;
         extra.mvcc_snapshots = snapshots;
+        extra.master_wal_offset = self.wal.next_offset();
         extra
     }
 

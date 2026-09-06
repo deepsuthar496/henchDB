@@ -70,9 +70,9 @@ crates/engine/src/
                       txns, commit pipeline, recovery), ddl (databases, tables,
                       indexes), diag (SHOW STATUS/ENGINE/PROCESSLIST,
                       Prometheus assembly), cost (CBO selectivity + costing),
-                      query (SELECT/JOIN/
-                      GROUP BY execution), plan (access paths), tests/ (suites:
-                      core, joins, fk, txn, opt)
+                      replica (read-only gate, WAL/snapshot apply), query
+                      (SELECT/JOIN/GROUP BY execution), plan (access paths),
+                      tests/ (suites: core, joins, fk, txn, opt)
   stats.rs            ANALYZE TABLE collection + TableStats codec (tolerant
                       trailing TableDef section)
   metrics.rs          atomic telemetry (counters, latency histogram, process
@@ -81,6 +81,8 @@ crates/engine/src/
 crates/server/src/
   main.rs             CLI: interactive shell | `serve` (TCP) | `bench` | `gcbench` | `benchmock`
   metrics.rs          std-only Prometheus HTTP exporter (GET /metrics, /health)
+  replication/        physical WAL streaming (protocol, primary feeder,
+                      read-only replica + reconnect) on --repl-port
   mock_innodb.rs      mock InnoDB-style data path for architecture micro-benchmarks
 bench_compare.py      real MySQL 8 vs henchDB harness (same Python client, both over TCP)
 mysql/, mysql_data/   local MySQL 8.0.46 (portable, port 3307) used by bench_compare.py

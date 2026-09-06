@@ -567,6 +567,39 @@ impl BufferPool {
         self.inner.lock().unwrap().file.sync_data()
     }
 
+    /// Drop all cached state and reopen the page file: used by replica
+    /// snapshot-apply after the primary's `pages.bin` image replaces the
+    /// local file. Quarantined frees are discarded (their slots stay marked
+    /// used — a leak, never corruption); the free map restarts empty, which
+    /// the allocator treats as "unknown = full" (safe, file only grows).
+    /// Callers must hold no other pool borrow; in-flight readers finish
+    /// against the old frames via their own buffers.
+    pub fn invalidate(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let frames = inner.frames.len();
+        let file = PageFile::open(&inner.file.path.clone())?;
+        let mut fr = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            fr.push(Frame {
+                page: None,
+                image: None,
+                cooling: false,
+            });
+        }
+        *inner = Inner {
+            file,
+            frames: fr,
+            index: HashMap::new(),
+            cooling: VecDeque::new(),
+            quarantine: Vec::new(),
+            pending_free: HashMap::new(),
+            free_map: HashMap::new(),
+            stats: PoolStats::default(),
+            rng: 0x9E3779B97F4A7C15,
+        };
+        Ok(())
+    }
+
     // -- internal helpers (inner lock held) --------------------------------
 
     fn next_rand(inner: &mut Inner) -> usize {

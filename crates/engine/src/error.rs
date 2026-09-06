@@ -24,6 +24,7 @@ pub enum Error {
     DatabaseNotFound(String),
     DatabaseExists(String),
     QueryTimeout,
+    ReadOnlyReplica,
 }
 
 impl fmt::Display for Error {
@@ -55,6 +56,10 @@ impl fmt::Display for Error {
             Error::IndexExists(i) => write!(f, "index '{i}' already exists"),
             Error::ForeignKeyViolation(m) => write!(f, "foreign key constraint fails: {m}"),
             Error::InvalidSchema(m) => write!(f, "invalid schema: {m}"),
+            Error::ReadOnlyReplica => write!(
+                f,
+                "The server is running with the --read-only option so it cannot execute this statement"
+            ),
         }
     }
 }

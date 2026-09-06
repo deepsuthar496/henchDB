@@ -23,6 +23,7 @@ use engine::{Database, Datum, Output, PRODUCT_NAME, PRODUCT_TAGLINE, VERSION};
 mod auth;
 mod metrics;
 mod mock_innodb;
+mod replication;
 mod wire;
 
 /// Global shutdown flag: set by SIGINT/SIGTERM handlers and COM_SHUTDOWN.
@@ -45,6 +46,16 @@ struct ServerOpts {
     /// Prometheus exporter port (0 = disabled).
     metrics_port: u16,
     allow_metrics: bool,
+    /// Replication primary port (0 = disabled).
+    repl_port: u16,
+    allow_repl: bool,
+    /// Replica mode: stream from this primary (host:port) read-only.
+    replica_of: Option<String>,
+    /// Replication credentials (replica side).
+    repl_user: String,
+    repl_password: String,
+    /// Serve read-only without a primary (manual `--read-only`).
+    read_only: bool,
 }
 
 impl ServerOpts {
@@ -60,6 +71,7 @@ impl ServerOpts {
         let allow_legacy = !args.iter().any(|a| a == "--no-legacy");
         let allow_pg = !args.iter().any(|a| a == "--no-pg");
         let allow_metrics = !args.iter().any(|a| a == "--no-metrics");
+        let allow_repl = !args.iter().any(|a| a == "--no-repl");
         ServerOpts {
             port,
             max_connections,
@@ -75,6 +87,14 @@ impl ServerOpts {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(9100),
             allow_metrics,
+            repl_port: arg_value(args, "--repl-port")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3308),
+            allow_repl,
+            replica_of: arg_value(args, "--replica-of"),
+            repl_user: arg_value(args, "--repl-user").unwrap_or_else(|| "root".into()),
+            repl_password: arg_value(args, "--repl-password").unwrap_or_default(),
+            read_only: args.iter().any(|a| a == "--read-only"),
         }
     }
 }
@@ -322,7 +342,7 @@ fn main() {
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
             eprintln!("usage: server [serve|passwd|bench|dump|restore] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics]");
+            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
             eprintln!("  restore --backup backup.hdb [--dir data] [--force]");
@@ -684,6 +704,13 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;
     let db = Arc::new(Database::open(dir)?);
     install_signal_handlers();
+    // Replica mode: read-only serving plus a background WAL stream from the
+    // primary. `--read-only` alone serves a static read-only copy.
+    let replica_mode = opts.replica_of.is_some();
+    if replica_mode || opts.read_only {
+        db.set_read_only(true);
+        println!("read-only mode: writes rejected with ERR 1290");
+    }
     // SEC2: TLS is all-or-nothing at startup — one side without the other
     // is a misconfiguration, and unreadable files must never silently
     // downgrade to plaintext.
@@ -821,6 +848,55 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
             }
             None => {}
         }
+    }
+    // Physical replication primary (Priority 8): dedicated WAL-stream port.
+    // Disabled in replica mode (a replica's local WAL is empty by design)
+    // and via `--no-repl` / `--repl-port 0`.
+    if !replica_mode && opts.allow_repl && opts.repl_port != 0 {
+        match replication::primary::bind_repl(opts.repl_port) {
+            Some((rl, rport)) => {
+                if rport != opts.repl_port {
+                    eprintln!("replication: port {} busy, listening on {rport} instead", opts.repl_port);
+                }
+                println!("replication primary listening on 0.0.0.0:{rport}");
+                let handle = std::thread::spawn({
+                    let db = db.clone();
+                    let draining = draining.clone();
+                    let auth_path = auth_path.clone();
+                    move || {
+                        replication::primary::serve_primary(
+                            db,
+                            rl,
+                            auth_path,
+                            draining,
+                            &SHUTDOWN_REQUESTED,
+                        )
+                    }
+                });
+                handles.push(handle);
+            }
+            None => {}
+        }
+    }
+    // Replica stream thread: keeps the read-only copy caught up.
+    if let Some(primary) = opts.replica_of.clone() {
+        println!("replica mode: streaming from {primary}");
+        let handle = std::thread::spawn({
+            let db = db.clone();
+            let draining = draining.clone();
+            let dir = dir.to_path_buf();
+            let user = opts.repl_user.clone();
+            let password = opts.repl_password.clone();
+            move || {
+                replication::replica::run_replica(
+                    db,
+                    replication::replica::ReplicaOpts { primary, user, password, dir },
+                    draining,
+                    &SHUTDOWN_REQUESTED,
+                )
+            }
+        });
+        handles.push(handle);
     }
     // Nonblocking accept so SIGINT/SIGTERM and COM_SHUTDOWN are honored
     // within ~100ms even with zero traffic.

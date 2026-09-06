@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog;
@@ -41,6 +41,7 @@ pub(crate) mod fk;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub(crate) mod query;
+pub(crate) mod replica;
 
 #[cfg(test)]
 mod tests;
@@ -132,6 +133,9 @@ pub struct Database {
     /// process registry behind `SHOW PROCESSLIST` (see `metrics.rs`).
     /// Plain field — interior mutability via atomics, no lock on `&self`.
     metrics: Metrics,
+    /// Replica read-only mode: rejects all WAL-appending statements with
+    /// `Error::ReadOnlyReplica`. Set once at startup (`--replica-of`).
+    read_only: AtomicBool,
 }
 
 /// Default overflow-pool size: 8 frames x 256 KiB = 2 MiB resident. Small
@@ -217,6 +221,7 @@ impl Database {
             commit_epoch: AtomicU64::new(1),
             versions: RwLock::new(mvcc::VersionState::new()),
             metrics: Metrics::new(),
+            read_only: AtomicBool::new(false),
         })
     }
 
@@ -302,6 +307,10 @@ impl Database {
     // ------------------------------------------------------------------
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<Output> {
+        // Replica governance first: rejected writes never reach the
+        // executor, the WAL, or the metrics counters.
+        if self.read_only.load(Ordering::Relaxed) && replica::is_write_statement(sql.trim()) {            return Err(Error::ReadOnlyReplica);
+        }
         let _guard = self.epoch.pin();
         let t0 = std::time::Instant::now();
         let res = self.execute_inner(session, sql);

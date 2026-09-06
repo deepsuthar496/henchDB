@@ -115,6 +115,11 @@ struct WalShared {
     synced_bytes: std::sync::atomic::AtomicU64,
     /// Cumulative microseconds spent inside sync_data (fsync latency).
     sync_us: std::sync::atomic::AtomicU64,
+    /// Log generation for replication: bumped on every checkpoint reset
+    /// (offsets restart at the header, so replicas key their position by
+    /// (generation, offset)). Persisted in a `wal.gen` sidecar next to the
+    /// log so primary restarts don't alias a new history onto old offsets.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 pub struct CommitterGuard<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -129,6 +134,38 @@ pub struct Wal {
     shared: Arc<WalShared>,
     path: PathBuf,
     syncer: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Sidecar file holding the log generation (see `WalShared::generation`).
+/// Missing/unparsable sidecar means generation 0 (pre-replication logs).
+fn generation_path(log_path: &Path) -> PathBuf {
+    let mut s = log_path.as_os_str().to_owned();
+    s.push(".gen");
+    PathBuf::from(s)
+}
+
+fn read_generation(log_path: &Path) -> u64 {
+    let Ok(bytes) = std::fs::read(generation_path(log_path)) else {
+        return 0;
+    };
+    if bytes.len() != 8 {
+        return 0;
+    }
+    u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
+}
+
+fn write_generation(log_path: &Path, generation: u64) -> Result<()> {
+    let tmp = generation_path(log_path);
+    // Write-then-sync the single word; a torn sidecar reads back as 0,
+    // which only ever forces a (safe) replica re-snapshot.
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(&generation.to_le_bytes())?;
+    f.sync_data()?;
+    Ok(())
 }
 
 impl Wal {
@@ -148,6 +185,7 @@ impl Wal {
         }
         let len = file.metadata()?.len();
         let sync_file = file.try_clone()?;
+        let generation = read_generation(path);
         let shared = Arc::new(WalShared {
             file: Mutex::new(file),
             sync_file: Mutex::new(sync_file),
@@ -160,6 +198,7 @@ impl Wal {
             syncs: std::sync::atomic::AtomicU64::new(0),
             synced_bytes: std::sync::atomic::AtomicU64::new(0),
             sync_us: std::sync::atomic::AtomicU64::new(0),
+            generation: std::sync::atomic::AtomicU64::new(generation),
         });
         let worker_shared = shared.clone();
         let syncer = std::thread::Builder::new()
@@ -198,10 +237,105 @@ impl Wal {
         self.shared.sync_us.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Current log generation (replication epochs; see field docs).
+    pub fn generation(&self) -> u64 {
+        self.shared.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wait (up to `timeout`) for the durable prefix to advance past
+    /// `offset`. Returns the current durable offset — the replication
+    /// feeder's wake-up call (spurious wakeups just re-poll).
+    pub fn wait_durable_change(
+        &self,
+        offset: u64,
+        timeout: std::time::Duration,
+    ) -> u64 {
+        use std::sync::atomic::Ordering;
+        let shared = &*self.shared;
+        if shared.durable.load(Ordering::Acquire) > offset {
+            return shared.durable.load(Ordering::Acquire);
+        }
+        let guard = shared.state.lock().unwrap();
+        let _ = shared.work.wait_timeout(guard, timeout);
+        shared.durable.load(Ordering::Acquire)
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.shared
             .written
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// End offset known durably on disk. Replication streams only the
+    /// durable prefix, so every streamed byte is a complete framed record.
+    pub fn durable_offset(&self) -> u64 {
+        self.shared
+            .durable
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Read up to `max_len` raw log bytes starting at absolute `from`.
+    /// Returns `(bytes, end)` with `end = from + bytes.len()`. The caller
+    /// must keep `end <= durable_offset()` so torn tails are impossible;
+    /// out-of-range `from` is an error (replica must re-bootstrap).
+    pub fn read_range(&self, from: u64, max_len: usize) -> Result<(Vec<u8>, u64)> {
+        const HEADER_LEN: u64 = 8;
+        if from < HEADER_LEN {
+            return Err(Error::Corrupted("wal range below header".into()));
+        }
+        let file = self.shared.file.lock().unwrap();
+        let mut clone = file.try_clone()?;
+        drop(file);
+        clone.seek(std::io::SeekFrom::Start(from))?;
+        // Clamp to what has actually been written (never read past EOF
+        // into a short buffer that decode would misread as torn).
+        let written = self.next_offset();
+        if from > written {
+            return Err(Error::Corrupted("wal range beyond written".into()));
+        }
+        let avail = (written - from).min(max_len as u64) as usize;
+        let mut buf = vec![0u8; avail];
+        let mut filled = 0usize;
+        while filled < avail {
+            match clone.read(&mut buf[filled..]) {
+                Ok(0) => break, // raced a truncate: return the prefix
+                Ok(n) => filled += n,
+                Err(e) => return Err(Error::Io(e.to_string())),
+            }
+        }
+        buf.truncate(filled);
+        Ok((buf, from + filled as u64))
+    }
+
+    /// Decode framed `[len][crc][payload]` records from a raw byte slice
+    /// (replica side). Returns the records plus bytes consumed; stops
+    /// cleanly at a torn tail so the caller can buffer the remainder.
+    /// CRC failures are hard errors (fail closed, never apply partial).
+    pub fn decode_wal_range(data: &[u8], legacy_cols: bool) -> Result<(Vec<Record>, usize)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off < data.len() {
+            if data.len() - off < 8 {
+                break; // torn header: wait for more bytes
+            }
+            let len =
+                u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            if len > 1 << 30 {
+                return Err(Error::Corrupted("WAL record too large".into()));
+            }
+            if data.len() - off - 8 < len {
+                break; // torn payload: wait for more bytes
+            }
+            let payload = &data[off + 8..off + 8 + len];
+            if crc32(payload) != crc {
+                return Err(Error::Corrupted("WAL crc mismatch".into()));
+            }
+            let mut poff = 0usize;
+            out.push(decode_record(payload, &mut poff, legacy_cols)?);
+            off += 8 + len;
+        }
+        Ok((out, off))
     }
 
     /// Append records without waiting for durability; returns (start, end)
@@ -340,6 +474,15 @@ impl Wal {
         // ensure no commits are in flight (checkpoint runs under the commit
         // lock in an idle window).
         const HEADER_LEN: u64 = 8; // magic(4) + version(4)
+        // Bump the generation BEFORE truncating: a crash between the two
+        // leaves the generation ahead of content, which only ever forces a
+        // (safe) replica re-snapshot, never silent divergence.
+        let generation = self
+            .shared
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        write_generation(&self.path, generation)?;
         let mut file = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -367,6 +510,9 @@ impl Wal {
                 .durable
                 .store(HEADER_LEN, std::sync::atomic::Ordering::Release);
         }
+        // Wake replication feeders: their offsets just went stale (they
+        // detect generation/offset mismatch and re-bootstrap).
+        self.shared.work.notify_all();
         Ok(())
     }
 

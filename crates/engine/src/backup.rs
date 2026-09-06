@@ -317,6 +317,43 @@ impl Database {
     /// then write `snapshot.bin` (valid HDBS), `auth.bin`, and `pages.bin`,
     /// and verify with `Database::open`.
     pub fn restore<R: Read>(reader: &mut R, target_dir: &Path) -> Result<RestoreStats> {
+        let (decoded, bytes_read) = decode_archive(reader)?;
+        let total_rows: u64 = decoded.tables.iter().map(|(_, r)| r.len() as u64).sum();
+        // All validated: materialize the directory.
+        std::fs::create_dir_all(target_dir)?;
+        {
+            let f = std::fs::File::create(target_dir.join("snapshot.bin"))?;
+            let mut bw = std::io::BufWriter::with_capacity(128 * 1024, f);
+            catalog::encode_snapshot(&mut bw, &decoded.databases, &decoded.tables)?;
+            bw.flush()?;
+        }
+        if !decoded.auth.is_empty() {
+            std::fs::write(target_dir.join("auth.bin"), &decoded.auth)?;
+        }
+        if !decoded.pages.is_empty() {
+            std::fs::write(target_dir.join("pages.bin"), &decoded.pages)?;
+        }
+        // Verify the restored catalog opens cleanly.
+        drop(Database::open(target_dir)?);
+        Ok(RestoreStats { tables: decoded.tables.len(), rows: total_rows, bytes_read })
+    }
+}
+
+/// A fully validated backup archive, decoded but not yet materialized.
+/// Replication snapshot-apply consumes this directly into the live
+/// database instead of writing files.
+pub struct DecodedBackup {
+    pub databases: Vec<String>,
+    pub tables: Vec<(TableDef, Vec<(Vec<u8>, Vec<u8>)>)>,
+    pub pages: Vec<u8>,
+    /// Raw `auth.bin` image (replication ignores it: replicas keep their
+    /// own user store; `restore` writes it to the target dir).
+    pub auth: Vec<u8>,
+}
+
+/// Decode + validate an archive (`&mut &[u8]` works for in-memory images).
+/// Returns the archive and total bytes consumed.
+pub fn decode_archive<R: Read>(reader: &mut R) -> Result<(DecodedBackup, u64)> {
         let mut r = CrcReader::new(reader);
         // Fixed header.
         let magic = r.take_raw(4)?;
@@ -430,27 +467,11 @@ impl Database {
             return Err(Error::Corrupted("backup payload CRC mismatch".into()));
         }
         let bytes_read = r.count;
-
-        // All validated: materialize the directory.
-        std::fs::create_dir_all(target_dir)?;
-        {
-            let f = std::fs::File::create(target_dir.join("snapshot.bin"))?;
-            let mut bw = std::io::BufWriter::with_capacity(128 * 1024, f);
-            catalog::encode_snapshot(&mut bw, &databases, &tables)?;
-            bw.flush()?;
-        }
-        if !auth.is_empty() {
-            std::fs::write(target_dir.join("auth.bin"), &auth)?;
-        }
-        if !pages.is_empty() {
-            std::fs::write(target_dir.join("pages.bin"), &pages)?;
-        }
-        // Verify the restored catalog opens cleanly.
-        drop(Database::open(target_dir)?);
-        Ok(RestoreStats { tables: tables.len(), rows: total_rows, bytes_read })
+        Ok((
+            DecodedBackup { databases, tables, pages, auth },
+            bytes_read,
+        ))
     }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
