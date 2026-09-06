@@ -214,6 +214,72 @@ fn passwd_cmd(dir: &Path, args: &[String]) -> engine::Result<()> {
     Ok(())
 }
 
+/// Offline physical backup: opens `<dir>` (the server must be STOPPED —
+/// an online backup would race the live WAL), streams an HDBB archive.
+fn dump_cmd(dir: &Path, args: &[String]) -> engine::Result<()> {
+    let out = arg_value(args, "--out").unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("backup_{ts}.hdb")
+    });
+    let db = Database::open(dir)?;
+    let file = std::fs::File::create(&out)?;
+    let mut bw = std::io::BufWriter::with_capacity(128 * 1024, file);
+    let stats = db.dump(&mut bw)?;
+    drop(bw);
+    println!(
+        "backup complete: {} databases, {} tables, {} rows, {} bytes in {:.2}s -> {}",
+        stats.databases,
+        stats.tables,
+        stats.rows,
+        stats.bytes_written,
+        stats.duration.as_secs_f64(),
+        out
+    );
+    Ok(())
+}
+
+/// Restore an HDBB archive into `--dir`. Refuses non-empty targets unless
+/// `--force` is given (which wipes the directory first).
+fn restore_cmd(args: &[String]) -> engine::Result<()> {
+    let backup = arg_value(args, "--backup").ok_or_else(|| {
+        engine::Error::Io("restore: --backup <file> is required".into())
+    })?;
+    let dir = arg_value(args, "--dir").unwrap_or_else(|| "data".to_string());
+    let dir = Path::new(&dir);
+    let force = args.iter().any(|a| a == "--force");
+    if dir.exists() {
+        let non_empty = std::fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if non_empty && !force {
+            return Err(engine::Error::Io(format!(
+                "restore: target '{}' is not empty (use --force to overwrite)",
+                dir.display()
+            )));
+        }
+        if force {
+            std::fs::remove_dir_all(dir)?;
+        }
+    }
+    let mut f = std::io::BufReader::with_capacity(
+        128 * 1024,
+        std::fs::File::open(&backup)
+            .map_err(|e| engine::Error::Io(format!("restore: cannot open '{backup}': {e}")))?,
+    );
+    let stats = Database::restore(&mut f, dir)?;
+    println!(
+        "restore complete: {} tables, {} rows ({} bytes read) -> {}",
+        stats.tables,
+        stats.rows,
+        stats.bytes_read,
+        dir.display()
+    );
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = arg_value(&args, "--dir").unwrap_or_else(|| "data".to_string());
@@ -223,6 +289,8 @@ fn main() {
             serve(Path::new(&dir), opts)
         }
         Some("passwd") => passwd_cmd(Path::new(&dir), &args),
+        Some("dump") => dump_cmd(Path::new(&dir), &args),
+        Some("restore") => restore_cmd(&args),
         Some("gcbench") => {
             let threads: usize = arg_value(&args, "--threads")
                 .and_then(|t| t.parse().ok())
@@ -244,9 +312,11 @@ fn main() {
         }
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
-            eprintln!("usage: server [serve|passwd|bench] [--dir data] [--port 3307] [--rows 50000]");
+            eprintln!("usage: server [serve|passwd|bench|dump|restore] [--dir data] [--port 3307] [--rows 50000]");
             eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
+            eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
+            eprintln!("  restore --backup backup.hdb [--dir data] [--force]");
             std::process::exit(2);
         }
         _ => shell(Path::new(&dir)),

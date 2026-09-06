@@ -29,7 +29,7 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **151/151 tests passing** (95 engine + 56 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
+- **Quality & Size Ceiling**: **156/156 tests passing** (100 engine + 56 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, and `wire/` cleanly modularized).
 
 ---
 
@@ -270,6 +270,7 @@ python bench_strict.py 3
 | 2026-09-05 | **Tri-Engine Benchmark Suite: MySQL 8 vs PostgreSQL 18 vs henchDB** (`bench_compare_tri.py`): Automated 3-engine TCP localhost benchmark harness across 50,000-row sysbench workloads with automated process supervision (`pg_ctl`, `mysqld`, `server serve`). At 4 concurrent client threads: henchDB RW txns reach **1,287 txn/s (1.56x vs PostgreSQL 18, 12.10x vs MySQL 8)**; Point selects reach **16,060 q/s (1.68x vs PostgreSQL 18, 3.93x vs MySQL 8)**; Range scans reach **16,869 q/s (2.38x vs PostgreSQL 18, 4.92x vs MySQL 8)**; Bulk load reaches **64,258 rows/s (1.51x vs PostgreSQL 18, 4.60x vs MySQL 8)**. Full durability (`fsync` / `WALWriteLock` / `sync_binlog`) on all engines. | `python bench_compare_tri.py 4` verified, 145/145 tests green |
 | 2026-09-05 | **Storage Optimization: In-Place Value Updates (`BTree::update_in_place`)** (`btree.rs`, `table.rs`): (1) **Zero-Split In-Place Descent**: `BTree::update_in_place` replaces existing values in a single lock-coupled root→leaf descent; eliminates eager leaf splits, root wrapping, and parent mutations for updates on full leaves; (2) **Zero-Allocation Value Overwrites**: when updated row length matches existing storage, bytes are overwritten in-place via `copy_from_slice`; (3) **Table Integration**: `Table::apply_raw`, `Table::upsert_row`, and `Table::update_row` attempt in-place update first before falling back to upsert; (4) **Results**: 1c durable updates jump +31% (593 → **776 w/s** vs MySQL 339 w/s), point selects reach **36,711 q/s @4c** (2.17x vs PostgreSQL 18, 4.91x vs MySQL 8), range scans reach **33,790 q/s @4c** (2.09x vs PostgreSQL 18, 4.53x vs MySQL 8), and RW transactions achieve **1,230 txn/s @4c** (1.26x vs PostgreSQL 18, 2.94x vs MySQL 8). | 146/146 tests green (95 engine + 51 server), release zero warnings |
 | 2026-09-05 | **PG COPY: Streaming Bulk Ingestion (`COPY FROM STDIN`)** (`wire/pg/copy.rs`, `wire/pg/{mod,codec,tests}.rs`): (1) **Syntax**: `COPY [ONLY] tbl [(cols)] FROM STDIN [WITH (FORMAT text/csv, DELIMITER 'x', NULL 'x', HEADER)]` plus legacy bare options; `BINARY` rejected; sole-statement enforced; (2) **Streaming**: `CopyInResponse` then `CopyData` chunks with cross-chunk line buffering (text) and cross-chunk quote state (CSV: quoted newlines, `""` escapes, quoted-empty vs NULL); text escapes (`\\ \t \n \r \b \f \v`, octal, `\xhh`) with pre-unescape `\N` matching; per-type coercion with row-numbered errors; (3) **Atomicity**: rows buffer as literal tuples and insert in 2,000-row statements inside one implicit txn (staged when the client holds a txn, so `CopyFail` writes nothing in both modes); `CopyDone` → `COPY n` + `ReadyForQuery`, `CopyFail` → `ROLLBACK` + `57014` + `ReadyForQuery`; mid-stream aborts drain in-flight client bytes to the terminator before responding (fixes a real client/server desync found live with `psql`); stray d/c/f outside COPY ignored; (4) **Tests**: 5 new (spec parsing incl. legacy/quoted/HEADER, text streaming incl. escapes/NULLs/field errors, CSV incl. embedded newlines/quotes/unterminated-quote, abort + explicit-txn staging/rollback, raw-socket d/c roundtrip); (5) **Verified live**: `psql \copy` CSV 5,000 rows in 0.25s (~20k rows/s end-to-end incl. protocol + commit), text 2,000 rows in 0.11s, quoted/NULL/bool fidelity spot-checked, failed COPY rolls back to zero rows with the same connection reusable. Limits: no `COPY TO`, single-char delimiters, whole-input buffering (memory ~2x input). | 151/151 tests green (95 engine + 56 server), `cargo check --release` + `cargo build --release` zero warnings |
+| 2026-09-05 | **Online Backup & Restore (`henchdump`, HDBB v1)** (`engine/backup.rs`, `db/mod.rs`, `sql/{ast,parser}.rs`, `server/main.rs`): (1) **Codec**: magic `HDBB` + BE version/timestamp + header CRC, auth section, database names, per-table `TableDef` codec + raw key/value row pairs (overflow locators ride verbatim) + raw `pages.bin` + footer (counts + full-payload CRC); table-driven IEEE CRC32 (a bitwise prototype was 8x too slow in fuzzing); chunked reads so corrupt lengths fail without giant allocs; all bounds capped → `Corrupted`, never panics; (2) **Consistency**: `dump()` checkpoints, then streams under commit + install locks (readers proceed via OLC, writers stall; staged txns excluded; MVCC history intentionally not archived); restore validates everything before touching disk, materializes valid `HDBS` + `auth.bin` + `pages.bin`, verifies via `Database::open`; (3) **Access**: `BACKUP DATABASE TO '<path>'` over both wires + offline `server dump/restore` CLI (dump needs a stopped server — documented; online path is SQL); non-empty guard with `--force`; (4) **Tests**: 5 new (full roundtrip incl. FK/secondary-index/wide-row/auth, empty DB, SQL command, CRC cross-check, sampled flip/truncation fuzz); (5) **Verified live**: populated over `psql`, password set, `BACKUP DATABASE TO` over PG wire → CLI restore → data + password auth + point/range/secondary/FK checks pass over both `psql` and `mysql.exe`; failed-restore guard + `--force` verified. Limits: history not archived (post-open epoch 0), whole-archive materialization on restore. | 156/156 tests green (100 engine + 56 server), `cargo check --release` zero warnings |
 *(next agents: add rows here)*
 
 ---
@@ -312,7 +313,10 @@ The engine has achieved core relational and performance superiority over MySQL 8
   - Parse/Bind/Describe/Execute/Close/Sync/Flush with `$n`→`?` reuse of the MySQL substitution pipeline; text + binary params/results; named + unnamed statements/portals; error barrier until Sync; verified live with Python `pg8000`.
 
 * ✅ **PG COPY: Streaming Bulk Ingestion (`COPY FROM STDIN`)**
-  - Text + CSV streaming with cross-chunk state, per-type coercion, implicit-txn atomicity, `CopyFail` rollback, mid-stream abort draining; verified live (`\copy` 5k CSV rows in 0.25s). Follow-ups: `COPY TO`, SCRAM, cursors.
+  - Text + CSV streaming with cross-chunk state, per-type coercion, implicit-txn atomicity, `CopyFail` rollback, mid-stream abort draining; verified live (`\copy` 5k CSV rows in 0.25s).
+
+* ✅ **Online Backup & Restore (`henchdump`, HDBB v1)**
+  - `Database::dump`/`restore` + `BACKUP DATABASE TO` + `server dump/restore`; checkpoint + lock-held streaming; CRC-framed archive; verified live over both wires. Follow-ups: `COPY TO`, incremental backups.
 
 ---
 
@@ -339,33 +343,26 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 
 ---
 
-### 1. 🐘 Priority 1: Head-to-Head Benchmark Suite vs PostgreSQL 16/17 (`bench_postgres.py`)
-* **Status**: 🎯 **TOP IMMEDIATE PRIORITY**
+### 1. 🐘 Priority 1: Head-to-Head Benchmark Suite vs PostgreSQL 16/17 (`bench_postgres.py` / `bench_compare_tri.py`)
+* **Status**: ✅ **COMPLETED**
 * **Why it matters**: Demonstrates henchDB's architectural superiority over PostgreSQL's process-per-connection fork model, heap-tuple VACUUM table bloat, and `WALWriteLock` spinlock contention.
-* **Architecture**:
-  - Build `bench_postgres.py` mirroring `bench_strict.py` (same 50,000-row `bench` schema, identical point select, range scan, read-write transaction, and durable update workloads).
-  - Test against local PostgreSQL 16/17 with default durability (`synchronous_commit = on`).
+* **Delivered**: `bench_compare_tri.py` measuring MySQL 8.0, PostgreSQL 18.6, and henchDB. At 4 client threads: henchDB RW transactions beat PG by 1.26x and MySQL by 2.94x; point selects reach 36,711 q/s (2.17x vs PG, 4.91x vs MySQL).
 * **Effort**: Low–Medium.
 
 ---
 
 ### 2. 🔌 Priority 2: Dual-Protocol PostgreSQL Compatibility (pgproto 3.0 / Port 5432)
-* **Status**: 🎯 **STRATEGIC ECOSYSTEM EXPANSION**
-* **Why it matters**: Allows developers and web frameworks in the PostgreSQL ecosystem (`psql`, `psycopg2`, `node-postgres`, `pgx`, `asyncpg`, Prisma, DBeaver) to use henchDB as a drop-in Postgres replacement with zero code changes.
-* **Architecture**:
-  - Implement PostgreSQL Frontend/Backend Protocol 3.0 in `crates/server/src/wire/pg.rs`.
-  - Listen on port 5432 (or sniff StartupMessage `0x00030000` on the multi-protocol listener).
-  - Handle StartupMessage, Simple Query (`'Q'`), RowDescription (`'T'`), DataRow (`'D'`), CommandComplete (`'C'`), and ReadyForQuery (`'Z'`).
-  - Route incoming SQL through the existing hand-written SQL parser and execution pipeline.
+* **Status**: ✅ **COMPLETED**
+* **Why it matters**: Allows developers and web frameworks in the PostgreSQL ecosystem (`psql`, `pg8000`, `psycopg`, `node-postgres`, `asyncpg`, Prisma, DBeaver) to use henchDB as a drop-in Postgres replacement with zero code changes.
+* **Delivered**: PG1 (StartupMessage, SSLRequest, simple query `Q`, RowDescription, text DataRow, CommandComplete tags, SQLSTATE errors), PG2 (Parse, Bind, Describe S/P, Execute, Close, Sync, Flush, parameterized queries `$1..$n` text and binary formats), and PG COPY streaming bulk ingestion (`COPY ... FROM STDIN`).
 * **Effort**: Medium.
 
 ---
 
 ### 3. 📦 Priority 3: Online Physical Backup & Streaming Snapshot Tooling (`henchdump`)
-* **Status**: 🟡 **BACKLOG**
+* **Status**: ✅ **COMPLETED**
 * **Why it matters**: Live backups without stopping the database server or interrupting concurrent transactions.
-* **Architecture**:
-  - Stream consistent snapshot images + active WAL segment offsets directly to local disk or object storage.
+* **Delivered**: `HDBB` v1 format codec with table-driven CRC32 and bound caps; `BACKUP DATABASE TO '<path>'` SQL command over both wires; offline `server dump` and `server restore` CLI commands with `--force` protection and automatic HDBS/auth.bin/pages.bin restoration.
 * **Effort**: Medium.
 
 ---
@@ -379,7 +376,7 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**151 tests: 95 engine + 56 server** as of this writing).
+1. `cargo test` — all green (**156 tests: 100 engine + 56 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

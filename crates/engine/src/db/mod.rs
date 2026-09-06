@@ -231,6 +231,28 @@ impl Database {
         self.pool.stats()
     }
 
+    /// Online physical backup into `writer` (HDBB archive). Checkpoints
+    /// first, then streams under the commit and install locks; see
+    /// `backup.rs` for the format and consistency contract.
+    pub fn dump<W: std::io::Write>(&self, writer: &mut W) -> Result<crate::backup::BackupStats> {
+        self.checkpoint()?;
+        let _commit = self.commit_lock.lock().unwrap();
+        let _install = self.install.lock().unwrap();
+        let dbs: Vec<String> = {
+            let guard = self.databases.read().unwrap();
+            let mut v: Vec<String> = guard.iter().cloned().collect();
+            v.sort();
+            v
+        };
+        let tables = {
+            let guard = self.tables.read().unwrap();
+            let mut v: Vec<_> = guard.values().cloned().collect();
+            v.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+            v
+        };
+        crate::backup::dump_stream(writer, &self.dir, dbs, &tables)
+    }
+
     /// Flush a durable snapshot and truncate the WAL.
     pub fn checkpoint(&self) -> Result<()> {
         let _guard = self.commit_lock.lock().unwrap();
@@ -428,6 +450,16 @@ impl Database {
             Statement::Checkpoint => {
                 self.checkpoint()?;
                 Ok(Output::ok("checkpoint complete"))
+            }
+            Statement::Backup { path } => {
+                let file = std::fs::File::create(&path)?;
+                let mut bw = std::io::BufWriter::with_capacity(128 * 1024, file);
+                let stats = self.dump(&mut bw)?;
+                drop(bw);
+                Ok(Output::ok(format!(
+                    "backup complete: {} databases, {} tables, {} rows, {} bytes",
+                    stats.databases, stats.tables, stats.rows, stats.bytes_written
+                )))
             }
             Statement::SetVariable { name, value } => {
                 if name.eq_ignore_ascii_case("max_execution_time") {

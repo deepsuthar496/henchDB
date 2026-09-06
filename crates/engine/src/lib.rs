@@ -6,6 +6,7 @@
 //! constant plus crate/folder names.
 
 pub mod btree;
+pub mod backup;
 pub mod catalog;
 pub mod db;
 pub mod epoch;

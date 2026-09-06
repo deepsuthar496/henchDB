@@ -176,6 +176,9 @@ pub enum Statement {
     },
     ShowTables,
     Checkpoint,
+    Backup {
+        path: String,
+    },
     CreateIndex {
         name: String,
         table: String,

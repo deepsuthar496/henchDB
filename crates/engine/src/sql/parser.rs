@@ -164,6 +164,17 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Checkpoint)
             }
+            Some("BACKUP") => {
+                self.pos += 1;
+                self.expect_kw("DATABASE")?;
+                self.expect_kw("TO")?;
+                match self.parse_literal_operand()? {
+                    Datum::Text(path) => Ok(Statement::Backup { path }),
+                    other => Err(Error::ParseError(format!(
+                        "BACKUP path must be a string literal, got {other:?}"
+                    ))),
+                }
+            }
             Some("SET") => {
                 self.pos += 1;
                 let name = self.expect_ident()?;
