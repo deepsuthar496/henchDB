@@ -56,6 +56,8 @@ struct ServerOpts {
     repl_password: String,
     /// Serve read-only without a primary (manual `--read-only`).
     read_only: bool,
+    /// Continuous WAL archiving directory for PITR (Priority 10).
+    wal_archive_dir: Option<String>,
 }
 
 impl ServerOpts {
@@ -95,6 +97,7 @@ impl ServerOpts {
             repl_user: arg_value(args, "--repl-user").unwrap_or_else(|| "root".into()),
             repl_password: arg_value(args, "--repl-password").unwrap_or_default(),
             read_only: args.iter().any(|a| a == "--read-only"),
+            wal_archive_dir: arg_value(args, "--wal-archive-dir"),
         }
     }
 }
@@ -271,10 +274,18 @@ fn dump_cmd(dir: &Path, args: &[String]) -> engine::Result<()> {
 }
 
 /// Restore an HDBB archive into `--dir`. Refuses non-empty targets unless
-/// `--force` is given (which wipes the directory first).
+/// `--force` is given (which wipes the directory first). With
+/// `--archive-dir`, rolls WAL segments forward after the base restore and
+/// stops at `--target-time "YYYY-MM-DD [HH:MM:SS]"` or `--target-txn <id>`.
 fn restore_cmd(args: &[String]) -> engine::Result<()> {
-    let backup = arg_value(args, "--backup").ok_or_else(|| {
-        engine::Error::Io("restore: --backup <file> is required".into())
+    // `--backup <file>` or a bare positional path (both accepted).
+    let backup = arg_value(args, "--backup").or_else(|| {
+        args.iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-'))
+            .cloned()
+    }).ok_or_else(|| {
+        engine::Error::Io("restore: --backup <file> (or a positional backup path) is required".into())
     })?;
     let dir = arg_value(args, "--dir").unwrap_or_else(|| "data".to_string());
     let dir = Path::new(&dir);
@@ -292,6 +303,44 @@ fn restore_cmd(args: &[String]) -> engine::Result<()> {
         if force {
             std::fs::remove_dir_all(dir)?;
         }
+    }
+    if let Some(archive_dir) = arg_value(args, "--archive-dir") {
+        let target = engine::pitr::PitrTarget {
+            time: match arg_value(args, "--target-time") {
+                Some(ts) => Some(engine::pitr::parse_target_time(&ts)?),
+                None => None,
+            },
+            txn: match arg_value(args, "--target-txn") {
+                Some(n) => Some(n.parse::<u64>().map_err(|_| {
+                    engine::Error::Io(format!("restore: bad --target-txn '{n}'"))
+                })?),
+                None => None,
+            },
+        };
+        let stats = engine::pitr::restore_pitr(
+            Path::new(&backup),
+            dir,
+            Path::new(&archive_dir),
+            &target,
+        )?;
+        println!(
+            "base backup restored -> {}",
+            dir.display()
+        );
+        println!(
+            "archive: {} segment(s) discovered, {} replayed",
+            stats.segments_scanned, stats.segments_replayed
+        );
+        let stop = match (stats.stopped_at_txn, stats.stopped_at_time) {
+            (Some(t), _) => format!("halted before txn {t}"),
+            (_, Some(ts)) => format!("halted past timestamp {ts}"),
+            _ => "replayed to end of archive".to_string(),
+        };
+        println!(
+            "recovery complete: {} transaction(s) replayed ({} bytes), {stop}",
+            stats.txns_replayed, stats.bytes_replayed
+        );
+        return Ok(());
     }
     let mut f = std::io::BufReader::with_capacity(
         128 * 1024,
@@ -342,10 +391,10 @@ fn main() {
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
             eprintln!("usage: server [serve|passwd|bench|dump|restore] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only]");
+            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only] [--wal-archive-dir <dir>]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
-            eprintln!("  restore --backup backup.hdb [--dir data] [--force]");
+            eprintln!("  restore --backup backup.hdb [--dir data] [--force] [--archive-dir <dir> [--target-time \"YYYY-MM-DD [HH:MM:SS]\" | --target-txn <id>]]");
             std::process::exit(2);
         }
         _ => shell(Path::new(&dir)),
@@ -704,6 +753,12 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;
     let db = Arc::new(Database::open(dir)?);
     install_signal_handlers();
+    // Continuous WAL archiving (PITR): checkpoints persist the truncated
+    // durable prefix into HDBA segments under this directory.
+    if let Some(adir) = &opts.wal_archive_dir {
+        db.set_archive_dir(Path::new(adir))?;
+        println!("wal archiving: enabled (dir: {adir})");
+    }
     // Replica mode: read-only serving plus a background WAL stream from the
     // primary. `--read-only` alone serves a static read-only copy.
     let replica_mode = opts.replica_of.is_some();

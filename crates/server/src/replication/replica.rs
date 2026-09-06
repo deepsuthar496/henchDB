@@ -117,7 +117,11 @@ fn stream_once(
         Some(other) => return Err(CodecError(format!("expected handshake ack, got {other:?}"))),
         None => return Err(CodecError("handshake ack timeout".into())),
     };
-    let legacy_cols = wal_version < engine::wal::WAL_FORMAT_VERSION;
+    // Column-codec generations predate the WAL version counter's later
+    // bumps (v4 only extends Commit payloads): only versions below 3 use
+    // the legacy column layout. Comparing against WAL_FORMAT_VERSION here
+    // would mis-decode v3 streams once the log moves to v4+.
+    let legacy_cols = wal_version < 3;
     db.metrics().set_repl_status("STREAMING");
     write_frame(
         &mut stream,
@@ -268,6 +272,6 @@ fn txn_of(rec: &engine::wal::Record) -> u64 {
         | engine::wal::Record::DropIndex { txn, .. }
         | engine::wal::Record::CreateDatabase { txn, .. }
         | engine::wal::Record::DropDatabase { txn, .. }
-        | engine::wal::Record::Commit { txn } => *txn,
+        | engine::wal::Record::Commit { txn, .. } => *txn,
     }
 }

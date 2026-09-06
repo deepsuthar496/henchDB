@@ -114,7 +114,7 @@ pub(crate) struct StagedWrite {
 pub struct Database {
     databases: RwLock<HashSet<String>>,
     tables: RwLock<HashMap<String, Arc<Table>>>,
-    wal: Wal,
+    pub(crate) wal: Wal,
     dir: PathBuf,
     /// Off-page overflow pool for wide rows (Priority 2). Shared by all
     /// tables; the `pages.bin` file persists next to WAL/snapshot so
@@ -143,6 +143,12 @@ pub struct Database {
     /// Replica read-only mode: rejects all WAL-appending statements with
     /// `Error::ReadOnlyReplica`. Set once at startup (`--replica-of`).
     read_only: AtomicBool,
+    /// WAL archive directory for PITR (Priority 10): when set, every
+    /// checkpoint copies the discarded durable WAL prefix into an immutable
+    /// `HDBA` segment before truncating. Set once at startup
+    /// (`--wal-archive-dir`); `None` disables archiving. Owned by
+    /// `archive.rs` (`set_archive_dir` lives there per the file ceiling).
+    pub(crate) archive_dir: Mutex<Option<PathBuf>>,
 }
 
 /// Default overflow-pool size: 8 frames x 256 KiB = 2 MiB resident. Small
@@ -192,7 +198,7 @@ impl Database {
         let mut pending: HashMap<u64, Vec<Record>> = HashMap::new();
         for rec in wal.read_all()? {
             match rec {
-                Record::Commit { txn } => {
+                Record::Commit { txn, .. } => {
                     if let Some(batch) = pending.remove(&txn) {
                         apply_records(&mut databases, &mut tables, &pool, &epoch, batch)?;
                     }
@@ -229,7 +235,13 @@ impl Database {
             versions: RwLock::new(mvcc::VersionState::new()),
             metrics: Metrics::new(),
             read_only: AtomicBool::new(false),
+            archive_dir: Mutex::new(None),
         })
+    }
+
+    /// Archive directory, if enabled.
+    pub fn archive_dir(&self) -> Option<PathBuf> {
+        self.archive_dir.lock().unwrap().clone()
     }
 
     pub fn new_session(&self) -> Session {
@@ -299,6 +311,10 @@ impl Database {
             bw.into_inner().map_err(|e| Error::Io(e.to_string()))?.sync_data()?;
         }
         fs::rename(&tmp, self.dir.join("snapshot.bin"))?;
+        // PITR: persist the about-to-be-truncated durable prefix first (see
+        // `archive.rs`; an archive failure aborts before the truncate, and
+        // open() redoes the intact WAL idempotently).
+        self.archive_checkpoint_prefix()?;
         self.wal.reset()?;
         // Re-base the install frontier: offsets restart after the truncate.
         let frontier = self.wal.next_offset();
@@ -783,7 +799,7 @@ impl Database {
                 key: key.clone(),
                 row: enc.clone(),
             },
-            Record::Commit { txn: txn_id },
+            Record::Commit { txn: txn_id, ts: Some(crate::wal::unix_now()) },
         ];
 
         let (start, end, commit_epoch) = {
@@ -972,12 +988,25 @@ impl Database {
     /// from the sequencer's point of view. Used by DDL, whose "install" is
     /// the catalog update that already happened.
     fn wal_commit(&self, records: Vec<Record>) -> Result<()> {
-        let (start, end) = {
+        let (start, end, n) = {
             let _guard = self.commit_lock.lock().unwrap();
-            self.wal.append_records(&records)?
+            // DDL builds its Commit without a timestamp; stamp it here so
+            // every durable commit carries PITR time (ordering follows the
+            // commit lock).
+            let now = crate::wal::unix_now();
+            let stamped: Vec<Record> = records
+                .into_iter()
+                .map(|r| match r {
+                    Record::Commit { txn, ts: None } => Record::Commit { txn, ts: Some(now) },
+                    other => other,
+                })
+                .collect();
+            let n = stamped.len();
+            let (start, end) = self.wal.append_records(&stamped)?;
+            (start, end, n)
         };
         self.metrics
-            .record_wal(records.len(), end.saturating_sub(start));
+            .record_wal(n, end.saturating_sub(start));
         self.wal.wait_durable(end)?;
         let mut frontier = self.install.lock().unwrap();
         while *frontier != start {
@@ -1062,7 +1091,7 @@ impl Database {
                 }
             }
         }
-        records.push(Record::Commit { txn: txn_id });
+        records.push(Record::Commit { txn: txn_id, ts: Some(crate::wal::unix_now()) });
 
         let has_inserts = staged.values().any(|w| w.is_insert);
 
@@ -1389,7 +1418,7 @@ fn txn_of(rec: &Record) -> u64 {
         | Record::DropIndex { txn, .. }
         | Record::CreateDatabase { txn, .. }
         | Record::DropDatabase { txn, .. }
-        | Record::Commit { txn } => *txn,
+        | Record::Commit { txn, .. } => *txn,
     }
 }
 

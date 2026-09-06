@@ -292,7 +292,11 @@ fn replica_reconnects_and_resumes_from_offset() {
     wait_for("initial catch-up to 500", Duration::from_secs(30), || {
         count(&rdb, "t") == 500
     });
-    let snap_mtime = std::fs::metadata(rdir.join("snapshot.bin"))
+    let snap_path = rdir.join("snapshot.bin");
+    wait_for("snapshot.bin exists", Duration::from_secs(10), || {
+        snap_path.exists()
+    });
+    let snap_mtime = std::fs::metadata(&snap_path)
         .unwrap()
         .modified()
         .unwrap();

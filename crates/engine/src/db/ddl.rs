@@ -34,7 +34,7 @@ impl Database {
                 txn,
                 name: name.to_string(),
             },
-            Record::Commit { txn },
+            Record::Commit { txn, ts: None },
         ])?;
         Ok(Output::ok(format!("database '{name}' created")))
     }
@@ -63,7 +63,7 @@ impl Database {
                 txn,
                 name: name.to_string(),
             },
-            Record::Commit { txn },
+            Record::Commit { txn, ts: None },
         ])?;
         Ok(Output::ok(format!("database '{name}' dropped")))
     }
@@ -159,7 +159,7 @@ impl Database {
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
             Record::CreateTable { txn, def },
-            Record::Commit { txn },
+            Record::Commit { txn, ts: None },
         ])?;
         Ok(Output::ok(format!("table '{name}' created")))
     }
@@ -179,7 +179,7 @@ impl Database {
                 txn,
                 name: key,
             },
-            Record::Commit { txn },
+            Record::Commit { txn, ts: None },
         ])?;
         Ok(Output::ok(format!("table '{name}' dropped")))
     }
@@ -202,7 +202,7 @@ impl Database {
                 name: name.clone(),
                 column,
             },
-            Record::Commit { txn },
+            Record::Commit { txn, ts: None },
         ])?;
         Ok(Output::ok(format!("index '{name}' created on '{table_name}'")))
     }
@@ -220,7 +220,7 @@ impl Database {
                 table: key,
                 name: name.clone(),
             },
-            Record::Commit { txn },
+            Record::Commit { txn, ts: None },
         ])?;
         Ok(Output::ok(format!("index '{name}' dropped from '{table_name}'")))
     }

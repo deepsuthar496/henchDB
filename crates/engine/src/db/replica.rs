@@ -294,7 +294,7 @@ mod tests {
                 key: key.clone(),
                 row: crate::table::Table::encode_row(&[crate::types::Datum::Int(1)]),
             },
-            Record::Commit { txn: 7 },
+            Record::Commit { txn: 7, ts: None },
         ];
         db.apply_replica_batch(batch.clone()).unwrap();
         // Redo is idempotent.

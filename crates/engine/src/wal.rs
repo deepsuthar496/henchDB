@@ -26,8 +26,10 @@ use std::io::Seek;
 
 pub const WAL_MAGIC: &[u8; 4] = b"HDBW";
 /// v2 adds the per-column AUTO_INCREMENT byte to table defs (F7). v3 adds
-/// default column values and datetime/timestamp coltypes.
-pub const WAL_FORMAT_VERSION: u32 = 3;
+/// default column values and datetime/timestamp coltypes. v4 appends an
+/// optional trailing commit timestamp (u64 unix seconds) to Commit payloads
+/// (PITR); v1-v3 commits (9-byte payloads) decode with `ts: None`.
+pub const WAL_FORMAT_VERSION: u32 = 4;
 
 const KIND_PUT: u8 = 1;
 const KIND_DELETE: u8 = 2;
@@ -56,6 +58,10 @@ pub enum Record {
     },
     Commit {
         txn: u64,
+        /// Wall-clock commit time (unix seconds), stamped by the commit
+        /// path. `None` for pre-v4 log records and hand-built test batches;
+        /// PITR treats those as always-included (no time to compare).
+        ts: Option<u64>,
     },
     CreateTable {
         txn: u64,
@@ -154,7 +160,9 @@ fn read_generation(log_path: &Path) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
 }
 
-fn write_generation(log_path: &Path, generation: u64) -> Result<()> {
+/// Crash-safe write of the `wal.gen` sidecar (pub(crate) so PITR can seal
+/// a rolled-forward directory with the next generation).
+pub(crate) fn write_generation(log_path: &Path, generation: u64) -> Result<()> {
     let tmp = generation_path(log_path);
     // Write-then-sync the single word; a torn sidecar reads back as 0,
     // which only ever forces a (safe) replica re-snapshot.
@@ -166,6 +174,16 @@ fn write_generation(log_path: &Path, generation: u64) -> Result<()> {
     f.write_all(&generation.to_le_bytes())?;
     f.sync_data()?;
     Ok(())
+}
+
+/// Wall-clock time (unix seconds) for commit stamping. Second precision
+/// matches the `--target-time` CLI granularity; ordering within a second
+/// still follows WAL offset order.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Wal {
@@ -534,7 +552,7 @@ impl Wal {
         let mut vb = [0u8; 4];
         reader.read_exact(&mut vb)?;
         let version = u32::from_le_bytes(vb);
-        if version != 1 && version != 2 && version != WAL_FORMAT_VERSION {
+        if version < 1 || version > WAL_FORMAT_VERSION {
             return Err(Error::Corrupted(format!("WAL version {version}")));
         }
         let legacy_cols = version < 3;
@@ -586,9 +604,15 @@ fn encode_record(rec: &Record, out: &mut Vec<u8>) {
             put_str(out, table);
             put_bytes(out, key);
         }
-        Record::Commit { txn } => {
+        Record::Commit { txn, ts } => {
             out.push(KIND_COMMIT);
             out.extend_from_slice(&txn.to_le_bytes());
+            // Trailing timestamp section (v4): older readers stop after the
+            // txn id because Commit payloads are length-framed; older
+            // writers emit 9-byte payloads which decode as `ts: None`.
+            if let Some(ts) = ts {
+                out.extend_from_slice(&ts.to_le_bytes());
+            }
         }
         Record::CreateTable { txn, def } => {
             out.push(KIND_CREATE_TABLE);
@@ -655,7 +679,16 @@ fn decode_record(buf: &[u8], off: &mut usize, legacy_cols: bool) -> Result<Recor
             let key = take_bytes(buf, off)?;
             Record::Delete { txn, table, key }
         }
-        KIND_COMMIT => Record::Commit { txn },
+        KIND_COMMIT => {
+            let ts = if buf.len() - *off >= 8 {
+                let t = u64::from_le_bytes(buf[*off..*off + 8].try_into().unwrap());
+                *off += 8;
+                Some(t)
+            } else {
+                None
+            };
+            Record::Commit { txn, ts }
+        }
         KIND_CREATE_TABLE => Record::CreateTable {
             txn,
             def: decode_table_def(buf, off, legacy_cols)?,
@@ -996,6 +1029,29 @@ mod tests {
     }
 
     #[test]
+    fn commit_ts_roundtrip_and_legacy_absent() {
+        // v4 commit with timestamp round-trips through the framing.
+        let mut buf = Vec::new();
+        encode_record(&Record::Commit { txn: 42, ts: Some(1_700_000_001) }, &mut buf);
+        let (recs, consumed) = Wal::decode_wal_range(&buf, false).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert!(matches!(
+            &recs[..],
+            [Record::Commit { txn: 42, ts: Some(1_700_000_001) }]
+        ));
+        // Pre-v4 9-byte Commit payload decodes with ts: None (length-based,
+        // so old logs stay readable after the version bump).
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&9u32.to_le_bytes());
+        let mut payload = vec![KIND_COMMIT];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        legacy.extend_from_slice(&crc32(&payload).to_le_bytes());
+        legacy.extend_from_slice(&payload);
+        let (recs, _) = Wal::decode_wal_range(&legacy, false).unwrap();
+        assert!(matches!(&recs[..], [Record::Commit { txn: 7, ts: None }]));
+    }
+
+    #[test]
     fn wal_roundtrip_and_recovery() {
         let dir = std::env::temp_dir().join(format!("hdbwal_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1026,7 +1082,7 @@ mod tests {
                 key: vec![1, 2],
                 row: vec![3, 4],
             },
-            Record::Commit { txn: 7 },
+            Record::Commit { txn: 7, ts: None },
         ])
         .unwrap();
         drop(wal);
@@ -1034,7 +1090,7 @@ mod tests {
         let recs = wal2.read_all().unwrap();
         assert_eq!(recs.len(), 3);
         assert!(matches!(recs[0], Record::CreateTable { .. }));
-        assert!(matches!(recs[2], Record::Commit { txn: 7 }));
+        assert!(matches!(recs[2], Record::Commit { txn: 7, .. }));
         wal2.reset().unwrap();
         assert_eq!(wal2.read_all().unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1066,7 +1122,7 @@ mod tests {
         wal.append_batch(&[
             Record::CreateTable { txn: 1, def },
             Record::Put { txn: 1, table: "t".into(), key: vec![1], row: vec![2] },
-            Record::Commit { txn: 1 },
+            Record::Commit { txn: 1, ts: Some(1_700_000_000) },
         ]).unwrap();
         drop(wal);
 

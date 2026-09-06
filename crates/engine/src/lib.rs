@@ -7,6 +7,7 @@
 
 pub mod btree;
 pub mod backup;
+pub mod archive;
 pub mod catalog;
 pub mod db;
 pub mod epoch;
@@ -14,6 +15,7 @@ pub mod error;
 pub mod latch;
 pub mod metrics;
 pub mod page;
+pub mod pitr;
 pub mod sql;
 pub mod stats;
 pub mod table;
