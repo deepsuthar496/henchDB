@@ -175,6 +175,11 @@ pub enum Statement {
         snapshot: bool,
     },
     ShowTables,
+    ShowStatus {
+        like: Option<String>,
+    },
+    ShowEngineStatus,
+    ShowProcesslist,
     Checkpoint,
     Backup {
         path: String,

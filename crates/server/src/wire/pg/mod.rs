@@ -30,6 +30,7 @@ use engine::Database;
 use super::canned::{normalize_dialect, split_statements};
 use super::tls::{self, ConnStream};
 use super::ConnCtx;
+use super::ProcGuard;
 use crate::auth::{self, UserStore};
 
 use codec::*;
@@ -270,6 +271,9 @@ fn pg_session(
     w.write_all(&init)?;
     w.flush()?;
     println!("pg connected: {peer} as '{authed_user}'");
+    // Processlist entry for SHOW PROCESSLIST / Threads_connected.
+    let peer_host = peer.ip().to_string();
+    let proc = ProcGuard::register(&db, &authed_user, &peer_host);
 
     // Idle timeout from here on (handshake already completed).
     let _ = reader.get_mut().set_read_timeout(ctx.idle_timeout);
@@ -299,11 +303,13 @@ fn pg_session(
                 pg.stmts.remove("");
                 pg.portals.remove("");
                 let sql = read_cstring(&payload).unwrap_or_default();
+                db.note_command(proc.id(), &session.current_db, "Query", &sql);
                 if copy::is_copy_from_stdin(&sql) {
                     run_copy_in(&db, &mut session, &sql, reader, ctx)?;
                 } else {
                     run_simple(&db, &mut session, &sql, reader)?;
                 }
+                db.note_idle(proc.id());
             }
             MSG_PARSE => {
                 let w = reader.get_mut();
@@ -371,17 +377,27 @@ fn pg_session(
             MSG_EXECUTE => {
                 let w = reader.get_mut();
                 match parse_execute_msg(&payload) {
-                    Some(m) => match pg.on_execute(&db, &mut session, &m) {
-                        Ok(resp) => {
-                            w.write_all(&resp)?;
-                            w.flush()?;
+                    Some(m) => {
+                        let info = if m.portal.is_empty() {
+                            String::new()
+                        } else {
+                            format!("portal {}", m.portal)
+                        };
+                        db.note_command(proc.id(), &session.current_db, "Execute", &info);
+                        let res = pg.on_execute(&db, &mut session, &m);
+                        db.note_idle(proc.id());
+                        match res {
+                            Ok(resp) => {
+                                w.write_all(&resp)?;
+                                w.flush()?;
+                            }
+                            Err((code, msg)) => {
+                                pg.failed = true;
+                                w.write_all(&error_response(&code, &msg))?;
+                                w.flush()?;
+                            }
                         }
-                        Err((code, msg)) => {
-                            pg.failed = true;
-                            w.write_all(&error_response(&code, &msg))?;
-                            w.flush()?;
-                        }
-                    },
+                    }
                     None => {
                         pg.failed = true;
                         w.write_all(&error_response("08P01", "malformed Execute message"))?;

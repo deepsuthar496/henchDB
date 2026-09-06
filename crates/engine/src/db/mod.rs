@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog;
 use crate::error::{Error, Result};
+use crate::metrics::{Metrics, StmtKind};
 use crate::page::{BufferPool, MAX_VALUE_LEN};
 use crate::sql::{eval_expr, parse_sql, Expr, Statement};
 use crate::table::Table;
@@ -34,6 +35,7 @@ use mvcc::SnapshotPin;
 use plan::{access_path, AccessPath};
 
 pub(crate) mod ddl;
+pub(crate) mod diag;
 pub(crate) mod fk;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
@@ -125,6 +127,10 @@ pub struct Database {
     commit_epoch: AtomicU64,
     /// MVCC version buffer + snapshot registry (F3). Empty in plain OLTP.
     versions: RwLock<mvcc::VersionState>,
+    /// Atomic telemetry: query/latency/WAL/connection counters + the
+    /// process registry behind `SHOW PROCESSLIST` (see `metrics.rs`).
+    /// Plain field — interior mutability via atomics, no lock on `&self`.
+    metrics: Metrics,
 }
 
 /// Default overflow-pool size: 8 frames x 256 KiB = 2 MiB resident. Small
@@ -209,6 +215,7 @@ impl Database {
             epoch,
             commit_epoch: AtomicU64::new(1),
             versions: RwLock::new(mvcc::VersionState::new()),
+            metrics: Metrics::new(),
         })
     }
 
@@ -295,6 +302,18 @@ impl Database {
 
     pub fn execute(&self, session: &mut Session, sql: &str) -> Result<Output> {
         let _guard = self.epoch.pin();
+        let t0 = std::time::Instant::now();
+        let res = self.execute_inner(session, sql);
+        // Telemetry (hot path: atomics only). Classification from the first
+        // keyword covers fast-path and parsed statements uniformly; errors
+        // count like MySQL (attempted statements are still queries).
+        let kind = StmtKind::classify(sql.trim());
+        self.metrics
+            .record_query(kind, t0.elapsed().as_micros() as u64);
+        res
+    }
+
+    fn execute_inner(&self, session: &mut Session, sql: &str) -> Result<Output> {
         let trimmed = sql.trim();
         if trimmed.eq_ignore_ascii_case("begin") || trimmed.eq_ignore_ascii_case("begin;") {
             return self.execute_stmt(session, Statement::Begin);
@@ -409,16 +428,19 @@ impl Database {
                     id,
                     staged: HashMap::new(),
                 });
+                self.metrics.txn_begin();
                 Ok(Output::ok("BEGIN"))
             }
             Statement::Commit => {
                 let txn = session.txn.take().ok_or(Error::TxnNotActive)?;
+                self.metrics.txn_end();
                 self.commit_txn(txn.id, txn.staged)?;
                 self.snapshot_end(session);
                 Ok(Output::ok("COMMIT"))
             }
             Statement::Rollback => {
                 session.txn.take().ok_or(Error::TxnNotActive)?;
+                self.metrics.txn_end();
                 self.snapshot_end(session);
                 Ok(Output::ok("ROLLBACK"))
             }
@@ -498,6 +520,9 @@ impl Database {
                     message: "OK".into(),
                 })
             }
+            Statement::ShowStatus { like } => Ok(self.show_status(like.as_deref())),
+            Statement::ShowEngineStatus => Ok(self.show_engine_status()),
+            Statement::ShowProcesslist => Ok(self.show_processlist()),
             Statement::CreateTable { name, columns, foreign_keys } => {
                 self.exec_create_table(session, name, columns, foreign_keys)
             }
@@ -740,6 +765,8 @@ impl Database {
             let offsets = self.wal.append_records(&records)?;
             (offsets.0, offsets.1, commit_epoch)
         };
+        self.metrics
+            .record_wal(records.len(), end.saturating_sub(start));
 
         self.wal.wait_durable(end)?;
 
@@ -897,6 +924,8 @@ impl Database {
             let _guard = self.commit_lock.lock().unwrap();
             self.wal.append_records(&records)?
         };
+        self.metrics
+            .record_wal(records.len(), end.saturating_sub(start));
         self.wal.wait_durable(end)?;
         let mut frontier = self.install.lock().unwrap();
         while *frontier != start {
@@ -1017,6 +1046,8 @@ impl Database {
             }
             (offsets.0, offsets.1, commit_epoch)
         };
+        self.metrics
+            .record_wal(records.len(), end.saturating_sub(start));
 
         // Phase B: group commit — one fsync by the syncer covers us plus
         // every other commit appended while the fsync was running.

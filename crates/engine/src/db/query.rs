@@ -67,6 +67,26 @@ impl Database {
                 Ok(cols)
             }
             Statement::ShowTables => Ok(vec![("table".into(), ColumnType::Text)]),
+            Statement::ShowDatabases => Ok(vec![("Database".into(), ColumnType::Text)]),
+            Statement::ShowStatus { .. } => Ok(vec![
+                ("Variable_name".into(), ColumnType::Text),
+                ("Value".into(), ColumnType::Text),
+            ]),
+            Statement::ShowEngineStatus => Ok(vec![
+                ("Type".into(), ColumnType::Text),
+                ("Name".into(), ColumnType::Text),
+                ("Status".into(), ColumnType::Text),
+            ]),
+            Statement::ShowProcesslist => Ok(vec![
+                ("Id".into(), ColumnType::BigInt),
+                ("User".into(), ColumnType::Text),
+                ("Host".into(), ColumnType::Text),
+                ("db".into(), ColumnType::Text),
+                ("Command".into(), ColumnType::Text),
+                ("Time".into(), ColumnType::BigInt),
+                ("State".into(), ColumnType::Text),
+                ("Info".into(), ColumnType::Text),
+            ]),
             _ => Ok(vec![]),
         }
     }

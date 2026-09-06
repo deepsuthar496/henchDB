@@ -68,12 +68,16 @@ crates/engine/src/
   catalog.rs          table registry + snapshot (checkpoint) file codec
   db/                 Database facade split per §9 ceiling: mod (sessions,
                       txns, commit pipeline, recovery), ddl (databases, tables,
-                      indexes), query (SELECT/JOIN/
+                      indexes), diag (SHOW STATUS/ENGINE/PROCESSLIST,
+                      Prometheus assembly), query (SELECT/JOIN/
                       GROUP BY execution), plan (access paths), tests/ (suites:
                       core, joins, fk, txn)
+  metrics.rs          atomic telemetry (counters, latency histogram, process
+                      registry, Prometheus renderer; prefix from PRODUCT_NAME)
   sql.rs              hand-written lexer + recursive-descent parser + AST
 crates/server/src/
   main.rs             CLI: interactive shell | `serve` (TCP) | `bench` | `gcbench` | `benchmock`
+  metrics.rs          std-only Prometheus HTTP exporter (GET /metrics, /health)
   mock_innodb.rs      mock InnoDB-style data path for architecture micro-benchmarks
 bench_compare.py      real MySQL 8 vs henchDB harness (same Python client, both over TCP)
 mysql/, mysql_data/   local MySQL 8.0.46 (portable, port 3307) used by bench_compare.py
@@ -90,7 +94,7 @@ you upgrade a component, update the row and the module doc comment.
 |---|---|---|
 | Index | Typed OLC B+ tree, `MAX_KEYS=128`, borrow/merge on delete (`MIN_KEYS=64`) + root collapse + EBR retire | Prefix + 4-byte-head SIMD search, swizzled tree nodes (`research.md` §Storage); value overflow paging is done (see Storage row) |
 | Storage | 256 KiB slotted pages + 64-bit swips + write-through cooling pool (`page.rs`); rows >1 KiB spill off-page with epoch-quarantined reuse; snapshot v2 carries key/value pairs, WAL carries full rows | Swizzled tree nodes, page GC / free-space persistence across restart, write-back batching, io_uring `IOPOLL` (Linux-only, `cfg`-gate it) |
-| Reads | Optimistic version snapshot + validate, restart on mismatch | Same (EBR now retires merged-away tree nodes) |
+| Reads | Optimistic version snapshot + validate, restart on mismatch | Same, over immutable epoch-quarantined COW snapshots (formally data-race-free; EBR retires superseded bodies + merged-away nodes) |
 | Writes | Session-staged write set; commit takes one commit lock, validates, WAL-batches, installs (allocating an MVCC commit epoch); installs record superseded rows while snapshot readers are active | Per-core WAL shards, Early Lock Release, column-granular versioning (RCC) |
 | Durability | Single WAL file, CRC32 per record, per-txn redo on recovery, snapshot + WAL truncate checkpoint. **Group commit implemented**: commits append under a short lock, one background syncer batches concurrent commits into one fsync (200us collection window), installs happen strictly in WAL-offset order (install frontier + condvar); DDL goes through the same sequencer via `Database::wal_commit` | Per-core WAL buffers (shard the current WAL), io_uring `IOPOLL` (Linux-only, `cfg`-gate it), parallel replay |
 | Concurrency | Single commit lock (serializes installs) | Lock-free commit pipelines; keep commit lock only as the correctness fallback |
@@ -109,18 +113,17 @@ the roadmap item instead):
 - **No in-place update primitive**: `upsert` = get + remove + insert (three
   descents). The mock comparison shows this is the single-thread update
   bottleneck; add an in-place value replacement when the value size fits.
-- **Optimistic reads are torn-read-prone by design**: node bodies are read
-  without latches; writers bump the version on unlock so torn reads fail
-  validation and restart. Every read that indexes into Vecs must clamp the
-  index (keys/vals are updated non-atomically) — see `get()` in btree.rs.
-  Formally the UnsafeCell reads are a benign race per the OLC protocol.
+- **Optimistic reads see immutable snapshots, never torn state**: node bodies
+  are epoch-quarantined COW snapshots (see `btree.rs` module doc); readers pin
+  the op's epoch and validate latch versions for logical consistency. Index
+  clamps in `get()`/`range()` guard stale (not torn) snapshots.
 - **No MVCC snapshots for long readers**: readers see committed state; a
   reader that starts mid-commit can see either before or after, never a torn
   state (commit installs are atomic per tree via the OLC latches).
-- The B+ tree's node bodies use `UnsafeCell` with OLC as the safety argument
-  (module doc in `btree.rs`). A formally race-free variant (relaxed atomics
-  or COW nodes) is acceptable to pursue; keeping plain `RwLock` per node is
-  NOT acceptable — it defeats the zero-invalidation read path.
+- The B+ tree's node bodies are immutable COW snapshots swapped via
+  `AtomicPtr` with the OLC latch as the publication guard (module doc in
+  `btree.rs`). Keeping plain `RwLock` per node is NOT acceptable — it defeats
+  the zero-invalidation read path.
 
 ## 5. Format stability rules
 
@@ -191,7 +194,9 @@ the roadmap item instead):
   refresh `README.md` numbers/chart if headlines changed — same commit.
 - **File size ceiling**: When any source file approaches or exceeds 1,500 lines, divide it into logically scoped submodules within a directory module (e.g. `wire/` or `exec/`) to preserve agent context window efficiency, maintainability, and clean separation of concerns, without sacrificing performance (preserving zero-copy references and inlining).
 - **Security baseline** (extend, never regress): memory-safe Rust only
-  (UnsafeCell confined to `btree.rs` per its module doc); the 16 MiB frame
+  (the only `unsafe` is the epoch-quarantined COW deref in `btree.rs` plus
+  the encapsulated raw-pointer retire/drop in `epoch.rs`, each with a
+  module-level safety argument); the 16 MiB frame
   guard on the wire protocol; recovery must fail with `Error::Corrupted`,
   never panic, on corrupt input. Roadmap: parser fuzzing, codec corruption
   corpus tests, auth, TLS, resource limits — see `PROGRESS.md` §6.2. No new

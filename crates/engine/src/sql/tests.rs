@@ -73,6 +73,26 @@ fn parse_database_ddl_and_use() {
     let s = parse_sql("SHOW DATABASES;").unwrap();
     assert_eq!(s, Statement::ShowDatabases);
 
+    let s = parse_sql("SHOW STATUS;").unwrap();
+    assert_eq!(s, Statement::ShowStatus { like: None });
+
+    let s = parse_sql("SHOW STATUS LIKE 'Com_%';").unwrap();
+    assert_eq!(
+        s,
+        Statement::ShowStatus {
+            like: Some("Com_%".into())
+        }
+    );
+
+    let s = parse_sql("SHOW ENGINE STATUS;").unwrap();
+    assert_eq!(s, Statement::ShowEngineStatus);
+
+    let s = parse_sql("SHOW ENGINE INNODB STATUS;").unwrap();
+    assert_eq!(s, Statement::ShowEngineStatus);
+
+    let s = parse_sql("SHOW PROCESSLIST;").unwrap();
+    assert_eq!(s, Statement::ShowProcesslist);
+
     let s = parse_sql("DROP DATABASE IF EXISTS app_db;").unwrap();
     assert_eq!(
         s,

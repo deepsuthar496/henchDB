@@ -224,6 +224,7 @@ impl Database {
             staged: HashMap::new(),
         });
         session.snapshot = Some(SnapshotPin { id, read_epoch });
+        self.metrics.txn_begin();
         Ok(Output::ok("BEGIN"))
     }
 
@@ -253,6 +254,12 @@ impl Database {
         let mut vs = self.versions.write().unwrap();
         vs.chains.retain(|(t, _), _| !t.starts_with(prefix));
         vs.committed.retain(|(t, _), _| !t.starts_with(prefix));
+    }
+
+    /// (version chains, active snapshots) for engine diagnostics.
+    pub(crate) fn snapshot_counts(&self) -> (usize, usize) {
+        let vs = self.versions.read().unwrap();
+        (vs.chains.len(), vs.snapshots.len())
     }
 
     /// (chain keys, total entries, active snapshots) — test observability.

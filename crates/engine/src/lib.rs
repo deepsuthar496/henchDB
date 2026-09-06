@@ -12,6 +12,7 @@ pub mod db;
 pub mod epoch;
 pub mod error;
 pub mod latch;
+pub mod metrics;
 pub mod page;
 pub mod sql;
 pub mod table;

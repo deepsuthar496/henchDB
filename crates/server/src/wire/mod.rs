@@ -94,6 +94,31 @@ fn execute_statements<W: std::io::Write>(
     Ok(())
 }
 
+/// RAII processlist entry: registers the connection on creation,
+/// unregisters on drop (all exits covered). Shared by the MySQL, PG, and
+/// legacy frontends.
+pub(crate) struct ProcGuard {
+    db: Arc<Database>,
+    id: u64,
+}
+
+impl ProcGuard {
+    pub(crate) fn register(db: &Arc<Database>, user: &str, host: &str) -> Self {
+        let id = db.register_process(user, host);
+        ProcGuard { db: db.clone(), id }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for ProcGuard {
+    fn drop(&mut self) {
+        self.db.unregister_process(self.id);
+    }
+}
+
 /// Per-connection server policy, built by `serve` in main.rs.
 pub struct ConnCtx {
     /// Path to `auth.bin` (reloaded per connection, so `passwd` applies live).
@@ -281,6 +306,8 @@ pub fn handle_mysql_connection(
     write_packet(reader.get_mut(), &ok_payload(0, ""), &mut sseq)?;
     reader.get_mut().flush()?;
     println!("mysql connected: {peer} as '{authed_user}'");
+    // Processlist entry for SHOW PROCESSLIST / Threads_connected.
+    let proc = ProcGuard::register(&db, &authed_user, &peer_host);
     // Idle timeout from here on (handshake already completed); a quiet
     // connection is reaped instead of held forever.
     if let Some(d) = ctx.idle_timeout {
@@ -372,7 +399,9 @@ pub fn handle_mysql_connection(
                 // resultset/OK per statement.
                 let batch = split_statements(sql);
                 let batch = if batch.is_empty() { vec![sql.to_string()] } else { batch };
+                db.note_command(proc.id(), &session.current_db, "Query", batch.first().map(String::as_str).unwrap_or(sql));
                 execute_statements(&db, &mut session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, false)?;
+                db.note_idle(proc.id());
             }
             COM_STMT_PREPARE => {
                 let sql = String::from_utf8_lossy(&payload[1..]).into_owned();
@@ -445,7 +474,9 @@ pub fn handle_mysql_connection(
                                 ps.reset_long_data();
                                 let batch = split_statements(&final_sql);
                                 let batch = if batch.is_empty() { vec![final_sql] } else { batch };
+                                db.note_command(proc.id(), &session.current_db, "Execute", batch.first().map(String::as_str).unwrap_or(""));
                                 execute_statements(&db, &mut session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, true)?;
+                                db.note_idle(proc.id());
                             }
                             Err(msg) => write_err_msg(reader.get_mut(), &mut out_seq, 1064, &msg)?,
                         }

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use engine::{Database, Datum, Output, PRODUCT_NAME, PRODUCT_TAGLINE, VERSION};
 
 mod auth;
+mod metrics;
 mod mock_innodb;
 mod wire;
 
@@ -41,6 +42,9 @@ struct ServerOpts {
     /// PostgreSQL wire port (PG1, 0 = disabled).
     pg_port: u16,
     allow_pg: bool,
+    /// Prometheus exporter port (0 = disabled).
+    metrics_port: u16,
+    allow_metrics: bool,
 }
 
 impl ServerOpts {
@@ -55,6 +59,7 @@ impl ServerOpts {
         };
         let allow_legacy = !args.iter().any(|a| a == "--no-legacy");
         let allow_pg = !args.iter().any(|a| a == "--no-pg");
+        let allow_metrics = !args.iter().any(|a| a == "--no-metrics");
         ServerOpts {
             port,
             max_connections,
@@ -66,6 +71,10 @@ impl ServerOpts {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(5432),
             allow_pg,
+            metrics_port: arg_value(args, "--metrics-port")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(9100),
+            allow_metrics,
         }
     }
 }
@@ -313,7 +322,7 @@ fn main() {
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
             eprintln!("usage: server [serve|passwd|bench|dump|restore] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg]");
+            eprintln!("  serve --max-connections 200 --idle-timeout 28800 [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
             eprintln!("  restore --backup backup.hdb [--dir data] [--force]");
@@ -701,8 +710,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
         if opts.allow_legacy { "on" } else { "off" });
     println!("connect: mysql -h 127.0.0.1 -P {} -u root", opts.port);
     let active = Arc::new(Mutex::new(0usize));
-    let registry = ConnRegistry::default();
-    // One process-wide drain flag shared by every connection: COM_SHUTDOWN
+    let registry = ConnRegistry::default();    // One process-wide drain flag shared by every connection: COM_SHUTDOWN
     // sets it from any wire thread; signals set the static below, which the
     // accept loop merges in.
     let draining = Arc::new(AtomicBool::new(false));
@@ -792,6 +800,26 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                 handles.push(pg);
             }
             None => eprintln!("pg: ports {}-{} all busy, postgresql wire disabled", opts.pg_port, opts.pg_port.saturating_add(8)),
+        }
+    }
+    // Prometheus exporter (Priority 6): std-only HTTP on its own port.
+    // `--no-metrics` or `--metrics-port 0` disables it outright; busy ports
+    // degrade to disabled, never to a dead server.
+    if opts.allow_metrics && opts.metrics_port != 0 {
+        match metrics::bind_metrics(opts.metrics_port) {
+            Some((ml, mport)) => {
+                if mport != opts.metrics_port {
+                    eprintln!("metrics: port {} busy, listening on {mport} instead", opts.metrics_port);
+                }
+                println!("metrics listening on 0.0.0.0:{mport} (GET /metrics, GET /health)");
+                let handle = std::thread::spawn({
+                    let db = db.clone();
+                    let draining = draining.clone();
+                    move || metrics::serve_metrics(db, ml, draining, &SHUTDOWN_REQUESTED)
+                });
+                handles.push(handle);
+            }
+            None => {}
         }
     }
     // Nonblocking accept so SIGINT/SIGTERM and COM_SHUTDOWN are honored
@@ -920,6 +948,8 @@ fn handle_connection(
     let mut session = db.new_session();
     let mut buf = Vec::with_capacity(256);
     let mut resp = Vec::with_capacity(256);
+    // Processlist entry so legacy connections appear in SHOW PROCESSLIST.
+    let proc = wire::ProcGuard::register(&db, "legacy", &peer.to_string());
     loop {
         // Read frame: 4-byte BE length + payload.
         let mut hdr = [0u8; 4];
@@ -946,10 +976,12 @@ fn handle_connection(
             }
         };
 
+        db.note_command(proc.id(), &session.current_db, "Query", sql.trim());
         let payload = match db.execute(&mut session, sql.trim()) {
             Ok(out) => format_output(&out),
             Err(e) => format!("ERR {e}"),
         };
+        db.note_idle(proc.id());
         let bytes = payload.as_bytes();
         resp.clear();
         resp.extend_from_slice(&(bytes.len() as u32).to_be_bytes());

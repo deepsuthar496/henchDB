@@ -153,9 +153,31 @@ impl Parser {
                     Ok(Statement::ShowTables)
                 } else if self.eat_kw("DATABASES") || self.eat_kw("SCHEMAS") {
                     Ok(Statement::ShowDatabases)
+                } else if self.eat_kw("STATUS") {
+                    // SHOW STATUS [LIKE '<pattern>']
+                    let like = if self.eat_kw("LIKE") {
+                        match self.parse_literal_operand()? {
+                            Datum::Text(p) => Some(p),
+                            other => {
+                                return Err(Error::ParseError(format!(
+                                    "SHOW STATUS LIKE needs a string pattern, got {other:?}"
+                                )))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(Statement::ShowStatus { like })
+                } else if self.eat_kw("ENGINE") {
+                    // SHOW ENGINE STATUS | SHOW ENGINE INNODB STATUS
+                    self.eat_kw("INNODB");
+                    self.expect_kw("STATUS")?;
+                    Ok(Statement::ShowEngineStatus)
+                } else if self.eat_kw("PROCESSLIST") {
+                    Ok(Statement::ShowProcesslist)
                 } else {
                     Err(Error::ParseError(format!(
-                        "expected TABLES or DATABASES after SHOW, got {:?}",
+                        "expected TABLES, DATABASES, STATUS, ENGINE STATUS or PROCESSLIST after SHOW, got {:?}",
                         self.peek()
                     )))
                 }

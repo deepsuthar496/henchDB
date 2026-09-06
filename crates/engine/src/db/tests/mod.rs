@@ -47,8 +47,7 @@ fn crud_roundtrip() {
 }
 
 #[test]
-fn query_execution_timeout() {
-    let dir = std::env::temp_dir().join(format!("hdbtimeout_{}", std::process::id()));
+fn query_execution_timeout() {    let dir = std::env::temp_dir().join(format!("hdbtimeout_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let db = Database::open(&dir).unwrap();
     let mut s = db.new_session();
@@ -527,5 +526,122 @@ fn schema_defaults_and_datetime_types() {
     let dt_micros = crate::types::parse_datetime_str("2026-10-01 18:30:00").unwrap();
     assert_eq!(out.rows[0][1], Datum::DateTime(dt_micros));
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn show_status_counts_and_filters() {
+    let dir = std::env::temp_dir().join(format!("hdbshow_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute(&mut s, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    db.execute(&mut s, "SELECT * FROM t").unwrap();
+    db.execute(&mut s, "UPDATE t SET v = 11 WHERE id = 1").unwrap();
+    db.execute(&mut s, "DELETE FROM t WHERE id = 2").unwrap();
+    db.execute(&mut s, "BEGIN").unwrap();
+    db.execute(&mut s, "INSERT INTO t VALUES (3, 30)").unwrap();
+    db.execute(&mut s, "COMMIT").unwrap();
+    db.execute(&mut s, "BEGIN").unwrap();
+    db.execute(&mut s, "ROLLBACK").unwrap();
+
+    let num = |out: &Output, name: &str| {
+        out.rows
+            .iter()
+            .find(|r| r[0] == Datum::Text(name.into()))
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .get(1)
+            .cloned()
+            .unwrap()
+            .to_string()
+            .parse::<u64>()
+            .unwrap()
+    };
+
+    // Two-column shape, MySQL variable names.
+    let out = db.execute(&mut s, "SHOW STATUS").unwrap();
+    assert_eq!(
+        out.columns,
+        vec!["Variable_name".to_string(), "Value".to_string()]
+    );
+    assert_eq!(num(&out, "Com_select"), 1);
+    assert_eq!(num(&out, "Com_insert"), 2);
+    assert_eq!(num(&out, "Com_update"), 1);
+    assert_eq!(num(&out, "Com_delete"), 1);
+    assert_eq!(num(&out, "Com_commit"), 1);
+    assert_eq!(num(&out, "Com_rollback"), 1);
+    assert_eq!(num(&out, "Com_ddl"), 1);
+    // Queries counts every executed statement; the running SHOW counts
+    // itself only after its output is built, so it sees exactly 10 here.
+    let queries = num(&out, "Queries");
+    assert_eq!(queries, 10, "Queries={queries}");
+    // WAL accounting saw the DML commits + DDL.
+    assert!(num(&out, "Innodb_os_log_written") > 0);
+    assert!(num(&out, "Innodb_os_log_fsyncs") > 0);
+
+    // LIKE filtering (case-insensitive, % wildcard).
+    let out = db.execute(&mut s, "SHOW STATUS LIKE 'Com_%'").unwrap();
+    assert!(!out.rows.is_empty());
+    assert!(out
+        .rows
+        .iter()
+        .all(|r| matches!(&r[0], Datum::Text(n) if n.starts_with("Com_"))));
+    let out = db.execute(&mut s, "SHOW STATUS LIKE 'com_s%'").unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Datum::Text("Com_select".into()));
+    let out = db.execute(&mut s, "SHOW STATUS LIKE 'Nope%'").unwrap();
+    assert!(out.rows.is_empty());
+
+    // Transactions gauge: none open now.
+    let out = db.execute(&mut s, "SHOW STATUS LIKE 'Threads_running'").unwrap();
+    assert_eq!(out.rows[0][1], Datum::Text("0".into()));
+    db.execute(&mut s, "BEGIN").unwrap();
+    let out = db.execute(&mut s, "SHOW STATUS LIKE 'Threads_running'").unwrap();
+    assert_eq!(out.rows[0][1], Datum::Text("1".into()));
+    db.execute(&mut s, "ROLLBACK").unwrap();
+
+    // ENGINE STATUS blob shape + INNODB spelling.
+    let out = db.execute(&mut s, "SHOW ENGINE STATUS").unwrap();
+    assert_eq!(
+        out.columns,
+        vec!["Type".to_string(), "Name".to_string(), "Status".to_string()]
+    );
+    assert_eq!(out.rows.len(), 1);
+    let blob = match &out.rows[0][2] {
+        Datum::Text(t) => t,
+        other => panic!("Status not text: {other:?}"),
+    };
+    for section in ["BUFFER POOL", "WAL / GROUP COMMIT", "B+ TREES", "MVCC", "CONNECTIONS"] {
+        assert!(blob.contains(section), "missing {section}");
+    }
+    let out = db.execute(&mut s, "SHOW ENGINE INNODB STATUS").unwrap();
+    assert_eq!(out.rows.len(), 1);
+
+    // Process registry: register/note like the server does.
+    let pid = db.register_process("root", "127.0.0.1");
+    db.note_command(pid, "test", "Query", "SELECT * FROM t");
+    let out = db.execute(&mut s, "SHOW PROCESSLIST").unwrap();
+    assert_eq!(
+        out.columns,
+        ["Id", "User", "Host", "db", "Command", "Time", "State", "Info"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][1], Datum::Text("root".into()));
+    assert_eq!(out.rows[0][2], Datum::Text("127.0.0.1".into()));
+    assert_eq!(out.rows[0][4], Datum::Text("Query".into()));
+    db.note_idle(pid);
+    db.unregister_process(pid);
+    let out = db.execute(&mut s, "SHOW PROCESSLIST").unwrap();
+    assert!(out.rows.is_empty());
+
+    // Prometheus text carries live values.
+    let text = db.prometheus_text();
+    assert!(text.contains("queries_total{type=\"select\"} 1"));
+    assert!(text.contains("buffer_pool_hit_ratio"));
+    assert!(text.contains("btree_splits_total"));
     let _ = fs::remove_dir_all(&dir);
 }

@@ -224,7 +224,7 @@ impl Table {
         }
     }
 
-    fn tree_epoch_manager(&self) -> Option<Arc<crate::epoch::EpochManager>> {
+    fn tree_epoch_manager(&self) -> Arc<crate::epoch::EpochManager> {
         self.tree.epoch_manager()
     }
 
@@ -553,10 +553,8 @@ impl Table {
         }
         let tree = BTree::new();
         // New index trees inherit the table's epoch attachment so their
-        // merged-away nodes retire too.
-        if let Some(ep) = self.tree_epoch_manager() {
-            tree.set_epoch_manager(ep);
-        }
+        // retired bodies and merged-away nodes quarantine too.
+        tree.set_epoch_manager(self.tree_epoch_manager());
         let pk_idx = self.def.schema.pk_idx;
         for (_, row) in self.scan()? {
             let sec_val = &row[col_idx];
@@ -747,6 +745,23 @@ impl Table {
 
     pub fn tree(&self) -> &BTree {
         &self.tree
+    }
+
+    /// Telemetry rollup over the primary tree plus every secondary index
+    /// tree (for `SHOW ENGINE STATUS` / Prometheus).
+    pub fn tree_stats(&self) -> crate::btree::TreeStats {
+        let mut acc = self.tree.stats();
+        if let Ok(indexes) = self.indexes.read() {
+            for idx in indexes.iter() {
+                let s = idx.tree.stats();
+                acc.splits += s.splits;
+                acc.merges += s.merges;
+                acc.in_place += s.in_place;
+                acc.height = acc.height.max(s.height);
+                acc.nodes += s.nodes;
+            }
+        }
+        acc
     }
 }
 

@@ -113,6 +113,8 @@ struct WalShared {
     syncs: std::sync::atomic::AtomicU64,
     /// Bytes covered by those syncs (batch-size proxy).
     synced_bytes: std::sync::atomic::AtomicU64,
+    /// Cumulative microseconds spent inside sync_data (fsync latency).
+    sync_us: std::sync::atomic::AtomicU64,
 }
 
 pub struct CommitterGuard<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -157,6 +159,7 @@ impl Wal {
             state: Mutex::new(false),
             syncs: std::sync::atomic::AtomicU64::new(0),
             synced_bytes: std::sync::atomic::AtomicU64::new(0),
+            sync_us: std::sync::atomic::AtomicU64::new(0),
         });
         let worker_shared = shared.clone();
         let syncer = std::thread::Builder::new()
@@ -188,6 +191,11 @@ impl Wal {
             self.shared.syncs.load(std::sync::atomic::Ordering::Relaxed),
             self.shared.synced_bytes.load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    /// Cumulative microseconds spent inside `sync_data` (fsync latency).
+    pub fn fsync_us(&self) -> u64 {
+        self.shared.sync_us.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn next_offset(&self) -> u64 {
@@ -289,9 +297,13 @@ fn syncer_loop(shared: Arc<WalShared>) {
         let target = shared.written.load(Ordering::Acquire);
         {
             let sync_file = shared.sync_file.lock().unwrap();
+            let t0 = std::time::Instant::now();
             if sync_file.sync_data().is_err() {
                 return; // disk gone: leave `durable` behind so waiters error out
             }
+            shared
+                .sync_us
+                .fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         // Clamp to `written`: a checkpoint reset may have truncated the log
         // while this iteration was in flight.

@@ -18,6 +18,7 @@
 //!    the epoch in which the object was retired (`min_active_epoch > retired_epoch`).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -69,18 +70,26 @@ impl Drop for Retired {
 
 /// The centralized Epoch Manager.
 pub struct EpochManager {
+    /// Unique id: thread-local participants are keyed by this, so one thread
+    /// can pin several managers (e.g. a standalone tree plus a database tree)
+    /// without their epochs aliasing each other.
+    id: u64,
     global_epoch: AtomicU64,
     participants: Mutex<Vec<Arc<Participant>>>,
     retired: Mutex<Vec<Retired>>,
 }
 
+static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+
 thread_local! {
-    static LOCAL_PARTICIPANT: RefCell<Option<Arc<Participant>>> = const { RefCell::new(None) };
+    static LOCAL_PARTICIPANTS: RefCell<Option<HashMap<u64, Arc<Participant>>>> =
+        const { RefCell::new(None) };
 }
 
 impl EpochManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            id: NEXT_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
             global_epoch: AtomicU64::new(1),
             participants: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
@@ -97,38 +106,42 @@ impl EpochManager {
 
     /// Obtain or register the thread-local participant handle.
     pub fn local_participant(&self) -> Arc<Participant> {
-        LOCAL_PARTICIPANT.with(|cell| {
+        LOCAL_PARTICIPANTS.with(|cell| {
             let mut opt = cell.borrow_mut();
-            if let Some(p) = opt.as_ref() {
+            let map = opt.get_or_insert_with(HashMap::new);
+            if let Some(p) = map.get(&self.id) {
                 p.clone()
             } else {
                 let p = self.register_thread();
-                *opt = Some(p.clone());
+                map.insert(self.id, p.clone());
                 p
             }
         })
     }
 
-    /// Enter an epoch-protected read phase.
+    /// Enter an epoch-protected read phase. Pins nest: the previous epoch is
+    /// restored when the guard drops, so an inner pin (e.g. a tree op inside
+    /// `Database::execute`, which already holds a pin) never unpins the outer
+    /// phase early.
     #[inline]
     pub fn pin(&self) -> Guard {
-        let p_ptr: *const Participant = LOCAL_PARTICIPANT.with(|cell| {
+        let p_ptr: *const Participant = LOCAL_PARTICIPANTS.with(|cell| {
             let mut opt = cell.borrow_mut();
-            if let Some(p) = opt.as_ref() {
+            let map = opt.get_or_insert_with(HashMap::new);
+            if let Some(p) = map.get(&self.id) {
                 Arc::as_ptr(p)
             } else {
                 let p = self.register_thread();
                 let ptr = Arc::as_ptr(&p);
-                *opt = Some(p);
+                map.insert(self.id, p);
                 ptr
             }
         });
         let e = self.global_epoch.load(Ordering::Acquire);
-        unsafe {
-            (*p_ptr).active_epoch.store(e, Ordering::Release);
-        }
+        let prev = unsafe { (*p_ptr).active_epoch.swap(e, Ordering::AcqRel) };
         Guard {
             participant: p_ptr,
+            prev,
         }
     }
 
@@ -143,6 +156,30 @@ impl EpochManager {
         let mut queue = self.retired.lock().unwrap();
         queue.push(Retired {
             ptr,
+            drop_fn: dropper::<T>,
+            epoch,
+        });
+    }
+
+    /// Retire an object already owned as a raw pointer (e.g. from
+    /// `Box::into_raw`). The pointer must not be dereferenced or freed by the
+    /// caller afterwards; it drops via `Box::from_raw` once all threads pinned
+    /// at retirement time have moved on. Shared (`&`) reads through the
+    /// pointer remain valid until then, which is what makes epoch-quarantined
+    /// copy-on-write reads memory-safe.
+    ///
+    /// # Safety
+    /// `ptr` must have been produced by `Box::into_raw(Box::new(v))` for some
+    /// `T: Send`, must not be null, and must not be retired twice.
+    pub unsafe fn retire_raw<T: 'static + Send>(&self, ptr: *mut T) {
+        debug_assert!(!ptr.is_null());
+        unsafe fn dropper<T>(p: *mut ()) {
+            drop(Box::from_raw(p as *mut T));
+        }
+        let epoch = self.global_epoch.load(Ordering::Acquire);
+        let mut queue = self.retired.lock().unwrap();
+        queue.push(Retired {
+            ptr: ptr as *mut (),
             drop_fn: dropper::<T>,
             epoch,
         });
@@ -195,9 +232,11 @@ impl EpochManager {
     }
 }
 
-/// RAII Guard for an active epoch critical section.
+/// RAII Guard for an active epoch critical section. Restores the participant's
+/// previous epoch on drop (pins nest; an inner guard never unpins an outer one).
 pub struct Guard {
     participant: *const Participant,
+    prev: u64,
 }
 
 impl Drop for Guard {
@@ -206,7 +245,7 @@ impl Drop for Guard {
         unsafe {
             (*self.participant)
                 .active_epoch
-                .store(INACTIVE_EPOCH, Ordering::Release);
+                .store(self.prev, Ordering::Release);
         }
     }
 }

@@ -32,24 +32,35 @@
 //! while acquiring the child latch, then the sibling latch. This is
 //! deadlock-free: same-level latches are only ever taken while the common
 //! parent is exclusively held (serializing all such writers), and every
-//! other path acquires latches strictly root→leaf, one at a time.
+//! other path acquires latches strictly root→leaf, one at a time. Whole
+//! fix-up passes additionally serialize against each other on the tree's
+//! fix mutex, so a pass never descends into a node a concurrent pass just
+//! unlinked (leaf entry removal and reads stay fully concurrent).
 //!
 //! # Memory-model note
 //!
-//! Node bodies live in `UnsafeCell`. Writers mutate only through
-//! [`WriteGuard`], which exists exactly while the node's exclusive latch is
-//! held. Optimistic readers read the body between a version snapshot and its
-//! re-validation, per the OLC protocol: any read that overlaps a writer fails
-//! validation and is discarded. This is the standard production OLC pattern
-//! (LeanStore-style); a formally race-free variant (relaxed atomic loads for
-//! header fields, or immutable copy-on-write nodes) is a roadmap item.
+//! Node bodies are immutable, epoch-quarantined copy-on-write snapshots.
+//! Each node holds an atomic pointer to its current body; a writer holding
+//! the node's exclusive latch clones the body, mutates the private clone,
+//! and publishes it with a single atomic swap. The superseded body is never
+//! mutated again — only retired through the [`EpochManager`], which frees it
+//! once every thread pinned at retirement time has moved on. Optimistic
+//! readers therefore dereference memory that cannot be mutated or freed
+//! under them: the read fast path is formally data-race-free (no `UnsafeCell`
+//! anywhere on this path) while staying lock-free — readers take no latches
+//! and write no shared cache lines. Per-op epoch pins cost two thread-local
+//! atomics, and latch version snapshot/validate still guards *logical*
+//! consistency (a concurrent split/merge restarts the traversal).
+//!
+//! Writers that never mutate (`height`, `node_count`, fix-up probes) use the
+//! same [`WriteGuard`] but only its shared view: the private clone is built
+//! lazily on first mutable access, so read-only latches allocate nothing.
 
-use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::epoch::EpochManager;
+use crate::epoch::{EpochManager, Guard as EpochGuard};
 use crate::latch::HybridLatch;
 
 /// Split threshold per node. (Future: fixed 256 KiB slotted pages with
@@ -61,6 +72,7 @@ const MAX_KEYS: usize = 128;
 /// their sum stays under MAX_KEYS.
 const MIN_KEYS: usize = MAX_KEYS / 2;
 
+#[derive(Clone)]
 enum NodeBody {
     Leaf {
         keys: Vec<Vec<u8>>,
@@ -78,14 +90,27 @@ enum NodeBody {
 
 pub struct Node {
     latch: HybridLatch,
-    body: UnsafeCell<NodeBody>,
+    /// Atomic pointer to the current immutable body. Writers publish a new
+    /// body with one atomic swap while the exclusive latch is held; the old
+    /// body is retired through the epoch manager, never mutated or freed
+    /// while a pinned reader may reference it.
+    ptr: AtomicPtr<NodeBody>,
 }
 
-// SAFETY: `body` is mutated only through `WriteGuard`, which exists only
-// while `latch` is exclusively held; readers follow the OLC protocol (see
-// module docs). The tree is shared across threads via `Arc<Node>`.
-unsafe impl Send for Node {}
-unsafe impl Sync for Node {}
+// `AtomicPtr` is `Send + Sync` and `NodeBody` is owned-value data, so the
+// auto impls hold; no manual `Send`/`Sync` needed.
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // The node itself is dropped only when no `Arc` (and hence no reader
+        // traversing through one) references it, so the current body has no
+        // outstanding readers. Superseded bodies were retired separately.
+        let raw = *self.ptr.get_mut();
+        if !raw.is_null() {
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
+}
 
 impl Node {
     fn new_leaf() -> Arc<Node> {
@@ -97,62 +122,109 @@ impl Node {
         vals: Vec<Vec<u8>>,
         next: Option<Arc<Node>>,
     ) -> Arc<Node> {
-        Arc::new(Node {
-            latch: HybridLatch::new(),
-            body: UnsafeCell::new(NodeBody::Leaf { keys, vals, next }),
-        })
+        Self::with_body(NodeBody::Leaf { keys, vals, next })
     }
 
     fn new_internal(keys: Vec<Vec<u8>>, children: Vec<Arc<Node>>) -> Arc<Node> {
+        Self::with_body(NodeBody::Internal { keys, children })
+    }
+
+    fn with_body(body: NodeBody) -> Arc<Node> {
         Arc::new(Node {
             latch: HybridLatch::new(),
-            body: UnsafeCell::new(NodeBody::Internal { keys, children }),
+            ptr: AtomicPtr::new(Box::into_raw(Box::new(body))),
         })
     }
 
-    /// Snapshot of the node body for optimistic readers. Call only between
+    /// Shared view of the current body snapshot. The result is valid as long
+    /// as the caller is protected: either an epoch pin covering the whole
+    /// operation (read fast path — the body cannot be freed while pinned) or
+    /// the node's exclusive latch (writers — no other writer can swap).
+    fn load(&self) -> &NodeBody {
+        // SAFETY: bodies behind this pointer are immutable once published;
+        // the pointer is only swapped (never mutated in place) and the old
+        // body is freed solely via epoch retirement, which waits out every
+        // thread pinned at retirement time. Callers uphold the pin/latch
+        // contract documented above.
+        unsafe { &*self.ptr.load(Ordering::Acquire) }
+    }
+
+    /// Snapshot of the node body for optimistic readers. Call only while an
+    /// epoch pin covering the operation is alive, between
     /// `latch.optimistic()` and `latch.validate(version)`.
     fn body(&self) -> &NodeBody {
-        // SAFETY: see struct-level safety comment; immutably shared read.
-        unsafe { &*self.body.get() }
+        self.load()
     }
 
     fn key_count(&self) -> usize {
-        match self.body() {
+        match self.load() {
             NodeBody::Leaf { keys, .. } => keys.len(),
             NodeBody::Internal { keys, .. } => keys.len(),
         }
     }
 
-    fn lock(&self) -> WriteGuard<'_> {
+    fn lock(&self, epoch: &Arc<EpochManager>) -> WriteGuard<'_> {
         self.latch.lock_exclusive();
-        WriteGuard { node: self }
+        WriteGuard {
+            node: self,
+            owned: None,
+            epoch: epoch.clone(),
+            dirty: false,
+        }
     }
 }
 
-/// RAII exclusive latch: mutation is possible only while this guard exists;
-/// dropping it releases the latch and bumps the version.
+/// RAII exclusive latch with lazy copy-on-write: shared access reads the
+/// published snapshot in place (no allocation); the first mutable access
+/// clones it into a private buffer, and dropping a dirty guard atomically
+/// publishes the buffer and retires the superseded body. Dropping always
+/// releases the latch and bumps the version.
 struct WriteGuard<'a> {
     node: &'a Node,
+    owned: Option<NodeBody>,
+    epoch: Arc<EpochManager>,
+    dirty: bool,
+}
+
+impl WriteGuard<'_> {
+    /// Private working copy, cloning the snapshot on first mutation.
+    fn owned_mut(&mut self) -> &mut NodeBody {
+        if self.owned.is_none() {
+            self.owned = Some(self.node.load().clone());
+        }
+        self.dirty = true;
+        self.owned.as_mut().expect("just cloned")
+    }
 }
 
 impl Deref for WriteGuard<'_> {
     type Target = NodeBody;
     fn deref(&self) -> &NodeBody {
-        // SAFETY: exclusive latch held.
-        unsafe { &*self.node.body.get() }
+        // Exclusive latch held: no writer can swap under us, so borrowing the
+        // published snapshot directly is stable for the guard's lifetime.
+        self.owned.as_ref().unwrap_or_else(|| self.node.load())
     }
 }
 
 impl DerefMut for WriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut NodeBody {
-        // SAFETY: exclusive latch held.
-        unsafe { &mut *self.node.body.get() }
+        self.owned_mut()
     }
 }
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        if self.dirty {
+            if let Some(body) = self.owned.take() {
+                let old = self
+                    .node
+                    .ptr
+                    .swap(Box::into_raw(Box::new(body)), Ordering::AcqRel);
+                // The old body is immutable from here on; readers pinned
+                // during the swap keep it alive via EBR quarantine.
+                unsafe { self.epoch.retire_raw(old) };
+            }
+        }
         self.node.latch.unlock_exclusive();
     }
 }
@@ -161,10 +233,24 @@ pub struct BTree {
     root: Mutex<Arc<Node>>,
     /// Monotonic structural-change counter, exposed for diagnostics.
     splits: AtomicU64,
-    /// Epoch manager for merged-away nodes. `None` keeps `BTree` usable
-    /// standalone (merges still unlink; the dropped `Arc` frees memory once
-    /// stale readers release it); `Database` always attaches one.
-    epoch: Mutex<Option<Arc<EpochManager>>>,
+    /// Sibling merges on delete (subset of structural changes, telementry).
+    merges: AtomicU64,
+    /// Successful zero-split in-place value updates (telemetry).
+    in_place: AtomicU64,
+    /// Epoch manager quarantining superseded node bodies (every write swaps
+    /// in a new body and retires the old one) and merged-away nodes.
+    /// Always present — even standalone trees need quarantine for their
+    /// lock-free readers; `Database` replaces it with its shared manager.
+    epoch: Mutex<Arc<EpochManager>>,
+    /// Serializes fix-up passes (and root collapses) against each other.
+    /// Merges unlink nodes; two interleaved passes could descend into a node
+    /// the other just evicted and then restructure its live-shared children
+    /// from a stale sibling view, corrupting separators. One pass at a time
+    /// keeps every unlink + relink atomic with respect to other fix-ups,
+    /// while leaf entry removal (`delete_rec`) and all reads stay fully
+    /// concurrent. Lock order is always fix → node latches → root mutex;
+    /// no path takes a node latch before the fix mutex, so no deadlock.
+    fix: Mutex<()>,
 }
 
 enum Descend {
@@ -175,36 +261,55 @@ enum Descend {
     Restart,
 }
 
+/// Per-tree counters for `SHOW ENGINE STATUS` / Prometheus.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TreeStats {
+    pub splits: u64,
+    pub merges: u64,
+    pub in_place: u64,
+    pub height: usize,
+    pub nodes: usize,
+}
+
 impl BTree {
     pub fn new() -> Self {
         BTree {
             root: Mutex::new(Node::new_leaf()),
             splits: AtomicU64::new(0),
-            epoch: Mutex::new(None),
+            merges: AtomicU64::new(0),
+            in_place: AtomicU64::new(0),
+            epoch: Mutex::new(EpochManager::new()),
+            fix: Mutex::new(()),
         }
     }
 
-    /// Attach the database's epoch manager so merged-away nodes retire
-    /// through EBR (called by `Database::open` for every table, mirroring
-    /// the page-pool attachment).
+    /// Attach the database's epoch manager so retired bodies and merged-away
+    /// nodes quarantine through the shared EBR domain (called by
+    /// `Database::open` for every table, mirroring the page-pool attachment).
     pub fn set_epoch_manager(&self, manager: Arc<EpochManager>) {
-        *self.epoch.lock().unwrap() = Some(manager);
+        *self.epoch.lock().unwrap() = manager;
     }
 
-    /// Attached epoch manager, if any (used to propagate to new indexes).
-    pub(crate) fn epoch_manager(&self) -> Option<Arc<EpochManager>> {
+    /// Attached epoch manager (used to propagate to new indexes).
+    pub(crate) fn epoch_manager(&self) -> Arc<EpochManager> {
         self.epoch.lock().unwrap().clone()
     }
 
-    /// Reclaim retired nodes whose epochs have passed (no-op without an
-    /// attached manager). Returns the reclaimed count.
+    /// This tree's epoch manager (short alias for the hot paths).
+    fn manager(&self) -> Arc<EpochManager> {
+        self.epoch.lock().unwrap().clone()
+    }
+
+    /// Pin the calling thread for one tree operation: every body snapshot
+    /// dereferenced below is quarantined until the returned guard drops.
+    fn pin_op(&self) -> EpochGuard {
+        self.manager().pin()
+    }
+
+    /// Reclaim retired bodies and nodes whose epochs have passed. Returns the
+    /// reclaimed count.
     pub fn reclaim(&self) -> usize {
-        self.epoch
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|ep| ep.try_reclaim())
-            .unwrap_or(0)
+        self.manager().try_reclaim()
     }
 
     fn current_root(&self) -> Arc<Node> {
@@ -219,8 +324,10 @@ impl BTree {
     // Optimistic read path
     // ------------------------------------------------------------------
 
-    /// Point lookup. Zero writes to shared memory on the hot path.
+    /// Point lookup. Zero writes to shared memory on the hot path: one
+    /// epoch pin per call plus latch version snapshots.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let _pin = self.pin_op();
         'restart: loop {
             let mut node = self.current_root();
             loop {
@@ -228,9 +335,9 @@ impl BTree {
                 match node.body() {
                     NodeBody::Leaf { keys, vals, .. } => {
                         let idx = lower_bound(keys, key);
-                        // A concurrent insert updates keys before vals; clamp
-                        // to both lengths so a torn read cannot go out of
-                        // range (validation below rejects torn reads anyway).
+                        // One immutable snapshot: keys/vals are mutually
+                        // consistent; the length check only guards a stale
+                        // snapshot (validation below restarts on races).
                         let n = keys.len().min(vals.len());
                         let val = if idx < n && keys[idx] == key {
                             Some(vals[idx].clone())
@@ -243,10 +350,10 @@ impl BTree {
                         continue 'restart;
                     }
                     NodeBody::Internal { keys, children } => {
-                        // Clamp: a concurrent split may have mutated this node
-                        // between our key read and this read. If the state we
-                        // used was torn, validate() below fails and we restart;
-                        // clamping only prevents an out-of-range index panic.
+                        // Same stale-snapshot guard: validate() below fails
+                        // and restarts if a concurrent writer replaced this
+                        // node mid-read; clamping only avoids indexing past
+                        // a snapshot taken at the boundary.
                         let idx = lower_bound(keys, key).min(children.len() - 1);
                         let child = children[idx].clone();
                         if !node.latch.validate(version) {
@@ -268,6 +375,7 @@ impl BTree {
         end: Option<&[u8]>,
         end_incl: bool,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let _pin = self.pin_op();
         let mut out = Vec::new();
         // Descend to the first leaf.
         let mut node = self.current_root();
@@ -286,7 +394,7 @@ impl BTree {
                         Some(k) => lower_bound(keys, k),
                         None => 0,
                     }
-                    .min(children.len() - 1); // clamp against concurrent splits
+                    .min(children.len() - 1); // clamp against a stale snapshot
                     let child = children[idx].clone();
                     if !node.latch.validate(version) {
                         node = self.current_root();
@@ -348,12 +456,35 @@ impl BTree {
         self.splits.load(Ordering::Relaxed)
     }
 
+    /// Sibling merges performed by delete fix-ups (telemetry).
+    pub fn merge_count(&self) -> u64 {
+        self.merges.load(Ordering::Relaxed)
+    }
+
+    /// Successful zero-split in-place value updates (telemetry).
+    pub fn in_place_count(&self) -> u64 {
+        self.in_place.load(Ordering::Relaxed)
+    }
+
+    /// Single-tree telemetry rollup for diagnostics.
+    pub fn stats(&self) -> TreeStats {
+        TreeStats {
+            splits: self.split_count(),
+            merges: self.merge_count(),
+            in_place: self.in_place_count(),
+            height: self.height(),
+            nodes: self.node_count(),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Write path (top-down lock coupling)
     // ------------------------------------------------------------------
 
     /// Insert `key -> val`. Returns false if the key already existed.
     pub fn insert(&self, key: &[u8], val: &[u8]) -> bool {
+        let epoch = self.manager();
+        let _pin = epoch.pin();
         loop {
             // Ensure the root is non-full before descending; a full root is
             // wrapped in a fresh parent (atomic under the root mutex, old
@@ -370,7 +501,7 @@ impl BTree {
                 drop(guard);
             }
             let root = self.current_root();
-            match insert_rec(&root, key, val, self) {
+            match insert_rec(&root, key, val, self, &epoch) {
                 Descend::Done(inserted) => return inserted,
                 Descend::Restart => continue, // stale full root; loop re-wraps
             }
@@ -380,6 +511,8 @@ impl BTree {
     /// Insert or replace in a single descent. Replaces value in-place when key exists.
     /// Returns the previous value if one existed.
     pub fn upsert(&self, key: &[u8], val: &[u8]) -> Option<Vec<u8>> {
+        let epoch = self.manager();
+        let _pin = epoch.pin();
         loop {
             if self.current_root().key_count() >= MAX_KEYS {
                 let mut guard = self.root.lock().unwrap();
@@ -393,7 +526,7 @@ impl BTree {
                 drop(guard);
             }
             let root = self.current_root();
-            match upsert_rec(&root, key, val, self) {
+            match upsert_rec(&root, key, val, self, &epoch) {
                 UpsertDescend::Done(prev) => return prev,
                 UpsertDescend::Restart => continue,
             }
@@ -405,16 +538,24 @@ impl BTree {
     /// Returns Some(previous_value) if key existed and was updated in-place,
     /// or None if key was not found.
     pub fn update_in_place(&self, key: &[u8], val: &[u8]) -> Option<Vec<u8>> {
+        let epoch = self.manager();
+        let _pin = epoch.pin();
         let root = self.current_root();
-        update_in_place_rec(&root, key, val)
+        let prev = update_in_place_rec(&root, key, val, &epoch);
+        if prev.is_some() {
+            self.in_place.fetch_add(1, Ordering::Relaxed);
+        }
+        prev
     }
 
     /// Remove `key`, returning the removed value. Underflowing nodes are
     /// rebalanced (borrow or merge) and empty internal roots collapse, so
     /// heavy deletion shrinks the tree instead of leaving sparse leaves.
     pub fn remove(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let epoch = self.manager();
+        let _pin = epoch.pin();
         let root = self.current_root();
-        let removed = delete_rec(&root, key)?;
+        let removed = delete_rec(&root, key, &epoch)?;
         // One fix-up descent per merge level; merges strictly reduce the
         // node count, so this terminates.
         while self.fix_pass(key) {}
@@ -428,10 +569,12 @@ impl BTree {
     /// Pointer swaps happen under the root mutex, so concurrent readers see
     /// either the old or the new root — both fully valid trees.
     fn collapse_root(&self) {
+        let _fix = self.fix.lock().unwrap();
+        let epoch = self.manager();
         loop {
             let cur = self.current_root();
             let single = {
-                let g = cur.lock();
+                let g = cur.lock(&epoch);
                 match &*g {
                     NodeBody::Internal { children, .. } if children.len() == 1 => {
                         Some(children[0].clone())
@@ -454,9 +597,11 @@ impl BTree {
     /// first underflowed node found. Returns true when a merge removed a
     /// child (ancestors may now underflow — the caller repeats).
     fn fix_pass(&self, key: &[u8]) -> bool {
+        let _fix = self.fix.lock().unwrap();
+        let epoch = self.manager();
         let mut parent_arc = self.current_root();
         loop {
-            let mut p_guard = parent_arc.lock();
+            let mut p_guard = parent_arc.lock(&epoch);
             // Latch the path child while holding the parent (root→leaf).
             let idx = match &*p_guard {
                 NodeBody::Leaf { .. } => return false, // root leaf: always legal
@@ -475,7 +620,7 @@ impl BTree {
                 NodeBody::Internal { children, .. } => children[idx].clone(),
                 NodeBody::Leaf { .. } => unreachable!(),
             };
-            let c_guard = child.lock();
+            let c_guard = child.lock(&epoch);
             let child_is_leaf = matches!(&*c_guard, NodeBody::Leaf { .. });
             let underflowed = if child_is_leaf {
                 match &*c_guard {
@@ -510,6 +655,7 @@ impl BTree {
     /// and `c_guard` (child at `idx`) are latched; the sibling latch is
     /// taken last. Returns true when a merge removed a child.
     fn fix_child(&self, p_guard: &mut WriteGuard<'_>, idx: usize, c_guard: WriteGuard<'_>) -> bool {
+        let epoch = self.manager();
         // Locate a sibling; prefer the right one (merging into the left
         // keeps `next`-chain edits to a single pointer).
         let (sib_idx, merge_into_left) = match &**p_guard {
@@ -526,7 +672,7 @@ impl BTree {
             NodeBody::Internal { children, .. } => children[sib_idx].clone(),
             NodeBody::Leaf { .. } => unreachable!(),
         };
-        let mut s_guard = sibling.lock();
+        let mut s_guard = sibling.lock(&epoch);
         // Sibling fullness decides borrow vs merge.
         let sib_count = match &*s_guard {
             NodeBody::Leaf { keys, .. } => keys.len(),
@@ -671,21 +817,22 @@ impl BTree {
         // The loser leaves the tree here: no path can reach it anymore.
         // Its Arc goes through EBR so in-flight optimistic readers (which
         // may still hold clones) stay memory-safe; the allocation itself
-        // frees once the last clone drops.
-        if let Some(ep) = tree.epoch.lock().unwrap().as_ref() {
-            ep.retire(evicted);
-        }
+        // frees once the last clone drops. Superseded bodies publish the
+        // same way via the guards' drops above.
+        tree.manager().retire(evicted);
         tree.bump_splits();
+        tree.merges.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Leftmost-descent height (root alone = 1). Test/diagnostic helper.
     pub fn height(&self) -> usize {
+        let epoch = self.manager();
         let mut h = 0usize;
         let mut node = self.current_root();
         loop {
             h += 1;
             let next = {
-                let g = node.lock();
+                let g = node.lock(&epoch);
                 match &*g {
                     NodeBody::Leaf { .. } => None,
                     NodeBody::Internal { children, .. } => children.first().cloned(),
@@ -700,16 +847,17 @@ impl BTree {
 
     /// Total node count (test/diagnostic helper; briefly latches each node).
     pub fn node_count(&self) -> usize {
-        fn count(node: &Node) -> usize {
-            let g = node.lock();
+        let epoch = self.manager();
+        fn count(node: &Node, epoch: &Arc<EpochManager>) -> usize {
+            let g = node.lock(epoch);
             match &*g {
                 NodeBody::Leaf { .. } => 1,
                 NodeBody::Internal { children, .. } => {
-                    1 + children.iter().map(|c| count(c)).sum::<usize>()
+                    1 + children.iter().map(|c| count(c, epoch)).sum::<usize>()
                 }
             }
         }
-        count(&self.current_root())
+        count(&self.current_root(), &epoch)
     }
 }
 
@@ -724,8 +872,14 @@ enum UpsertDescend {
     Restart,
 }
 
-fn upsert_rec(node: &Arc<Node>, key: &[u8], val: &[u8], tree: &BTree) -> UpsertDescend {
-    let mut g = node.lock();
+fn upsert_rec(
+    node: &Arc<Node>,
+    key: &[u8],
+    val: &[u8],
+    tree: &BTree,
+    epoch: &Arc<EpochManager>,
+) -> UpsertDescend {
+    let mut g = node.lock(epoch);
     match &mut *g {
         NodeBody::Leaf { keys, vals, .. } => {
             let idx = lower_bound(keys, key);
@@ -743,18 +897,23 @@ fn upsert_rec(node: &Arc<Node>, key: &[u8], val: &[u8], tree: &BTree) -> UpsertD
         NodeBody::Internal { keys, children } => {
             let mut idx = lower_bound(keys, key);
             if children[idx].key_count() >= MAX_KEYS {
-                split_child_in_place(keys, children, idx, tree);
+                split_child_in_place(keys, children, idx, tree, epoch);
                 idx = lower_bound(keys, key);
             }
             let child = children[idx].clone();
             drop(g);
-            upsert_rec(&child, key, val, tree)
+            upsert_rec(&child, key, val, tree, epoch)
         }
     }
 }
 
-fn update_in_place_rec(node: &Arc<Node>, key: &[u8], val: &[u8]) -> Option<Vec<u8>> {
-    let mut g = node.lock();
+fn update_in_place_rec(
+    node: &Arc<Node>,
+    key: &[u8],
+    val: &[u8],
+    epoch: &Arc<EpochManager>,
+) -> Option<Vec<u8>> {
+    let mut g = node.lock(epoch);
     match &mut *g {
         NodeBody::Leaf { keys, vals, .. } => {
             let idx = lower_bound(keys, key);
@@ -778,7 +937,7 @@ fn update_in_place_rec(node: &Arc<Node>, key: &[u8], val: &[u8]) -> Option<Vec<u
             let idx = lower_bound(keys, key);
             let child = children[idx].clone();
             drop(g);
-            update_in_place_rec(&child, key, val)
+            update_in_place_rec(&child, key, val, epoch)
         }
     }
 }
@@ -787,8 +946,14 @@ fn update_in_place_rec(node: &Arc<Node>, key: &[u8], val: &[u8]) -> Option<Vec<u
 /// the node's exclusive latch and releases it on all paths (via the guard).
 /// The caller guarantees the node was non-full when it decided to descend; a
 /// stale clone that turns out full returns `Restart`.
-fn insert_rec(node: &Arc<Node>, key: &[u8], val: &[u8], tree: &BTree) -> Descend {
-    let mut g = node.lock();
+fn insert_rec(
+    node: &Arc<Node>,
+    key: &[u8],
+    val: &[u8],
+    tree: &BTree,
+    epoch: &Arc<EpochManager>,
+) -> Descend {
+    let mut g = node.lock(epoch);
     match &mut *g {
         NodeBody::Leaf { keys, vals, .. } => {
             if keys.len() >= MAX_KEYS {
@@ -807,18 +972,18 @@ fn insert_rec(node: &Arc<Node>, key: &[u8], val: &[u8], tree: &BTree) -> Descend
             if children[idx].key_count() >= MAX_KEYS {
                 // Split the full child while we hold this node's latch, so
                 // readers of this node are blocked for the whole transition.
-                split_child_in_place(keys, children, idx, tree);
+                split_child_in_place(keys, children, idx, tree, epoch);
                 idx = lower_bound(keys, key);
             }
             let child = children[idx].clone();
             // NOTE: no assert that the child is non-full here — key_count()
-            // is an unsynchronized optimistic read and may transiently
-            // disagree with a concurrent writer. A full leaf is handled by
+            // is a pinned snapshot read and may transiently disagree with a
+            // concurrent writer. A full leaf is handled by
             // Descend::Restart; an internal node one key over threshold is
             // harmless (order and search are unaffected) and gets split by
             // its parent on the next descent.
             drop(g); // release parent latch before descending (lock coupling)
-            insert_rec(&child, key, val, tree)
+            insert_rec(&child, key, val, tree, epoch)
         }
     }
 }
@@ -831,10 +996,11 @@ fn split_child_in_place(
     p_children: &mut Vec<Arc<Node>>,
     idx: usize,
     tree: &BTree,
+    epoch: &Arc<EpochManager>,
 ) {
     let child = p_children[idx].clone();
     let (sep, right) = {
-        let mut cg = child.lock();
+        let mut cg = child.lock(epoch);
         match &mut *cg {
             NodeBody::Leaf { keys, vals, next } => {
                 let mid = keys.len() / 2;
@@ -861,8 +1027,12 @@ fn split_child_in_place(
     tree.bump_splits();
 }
 
-fn delete_rec(node: &Arc<Node>, key: &[u8]) -> Option<Vec<u8>> {
-    let mut g = node.lock();
+fn delete_rec(
+    node: &Arc<Node>,
+    key: &[u8],
+    epoch: &Arc<EpochManager>,
+) -> Option<Vec<u8>> {
+    let mut g = node.lock(epoch);
     match &mut *g {
         NodeBody::Leaf { keys, vals, .. } => {
             let idx = lower_bound(keys, key);
@@ -878,7 +1048,7 @@ fn delete_rec(node: &Arc<Node>, key: &[u8]) -> Option<Vec<u8>> {
             let idx = lower_bound(keys, key);
             let child = children[idx].clone();
             drop(g); // release parent latch before descending (lock coupling)
-            delete_rec(&child, key)
+            delete_rec(&child, key, epoch)
         }
     }
 }
@@ -1121,9 +1291,12 @@ mod tests {
             "merges should have retired nodes"
         );
         drop(guard);
-        // Unpinned: the next pump drains the queue.
+        // Unpinned: retirements from the delete loop are reclaimable. (The
+        // final op's own pin may hold that op's retirements back, so pump
+        // once unpinned to drain everything.)
         t.remove(&4_000i64.to_be_bytes());
         assert_eq!(t.len(), 999);
+        t.reclaim();
         assert_eq!(epoch.pending_count(), 0);
         assert_eq!(t.reclaim(), 0);
         for i in 4_001..5_000i64 {
@@ -1168,5 +1341,140 @@ mod tests {
         let missing = 99_999u64.to_be_bytes();
         assert_eq!(t.update_in_place(&missing, &b"dummy"[..]), None);
         assert_eq!(t.len(), 5_000);
+    }
+
+    /// Mixed hammer: writers cycle insert/upsert/update_in_place/remove over
+    /// a shared keyspace (splitting, swapping bodies, borrowing, merging)
+    /// while readers run point lookups and full scans. Bodies are immutable
+    /// snapshots, so no reader can fault on a reallocated Vec; completion
+    /// without panic plus exact post-join state proves it.
+    #[test]
+    fn cow_mixed_read_write_hammer() {
+        let t = Arc::new(BTree::new());
+        for i in 0..4_000u64 {
+            let k = i.to_be_bytes();
+            t.insert(&k, &k);
+        }
+        let mut handles = vec![];
+        // Writers: disjoint quarters, churn values then delete odds.
+        for w in 0..4u64 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..1_000u64 {
+                    let k = (w * 1_000 + i).to_be_bytes();
+                    let v = (i * 7 + w).to_be_bytes();
+                    t.upsert(&k, &v);
+                    assert!(t.update_in_place(&k, &v).is_some());
+                    if i % 2 == 1 {
+                        assert_eq!(t.remove(&k), Some(v.to_vec()));
+                    }
+                }
+            }));
+        }
+        // Readers: hot point reads + scans + ranges through all the churn.
+        for _ in 0..4 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..400 {
+                    let n = t.scan_all().len();
+                    assert!(n <= 4_000);
+                    let _ = t.get(&1_234u64.to_be_bytes());
+                    let _ = t.range(None, true, None, true).len();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Even keys survive with their last writer's value; odds are gone.
+        assert_eq!(t.len(), 2_000);
+        for w in 0..4u64 {
+            for i in 0..1_000u64 {
+                let k = (w * 1_000 + i).to_be_bytes();
+                if i % 2 == 0 {
+                    let v = (i * 7 + w).to_be_bytes();
+                    assert_eq!(t.get(&k), Some(v.to_vec()), "at {k:?}");
+                } else {
+                    assert_eq!(t.get(&k), None, "at {k:?}");
+                }
+            }
+        }
+    }
+
+    /// Focused on the old fault: same-length `update_in_place` used to scribble
+    /// into a shared `Vec` while optimistic readers walked it. Hammer exactly
+    /// that shape — many threads rewriting the same keys' values in place
+    /// while others read — and require zero faults plus value coherence
+    /// (every observed value is a fully-written generation, never garbage).
+    #[test]
+    fn cow_in_place_rewrite_vs_hot_reads() {
+        let t = Arc::new(BTree::new());
+        for i in 0..500u64 {
+            let k = i.to_be_bytes();
+            t.insert(&k, &[0u8; 8]);
+        }
+        let mut handles = vec![];
+        for w in 0..4u64 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                for gen in 1..=200u64 {
+                    for i in 0..500u64 {
+                        let k = i.to_be_bytes();
+                        // Same-length values: old code took the raw
+                        // `copy_from_slice` path on the shared Vec.
+                        let vv = [((gen + w) & 0xff) as u8; 8];
+                        assert!(t.update_in_place(&k, &vv).is_some());
+                    }
+                }
+            }));
+        }
+        for _ in 0..4 {
+            let t = t.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..2_000 {
+                    for i in (0..500u64).step_by(50) {
+                        let got = t.get(&i.to_be_bytes()).expect("present");
+                        // 8 uniform bytes from some generation: any torn
+                        // snapshot would show mixed bytes.
+                        assert_eq!(got.len(), 8);
+                        assert!(got.iter().all(|&b| b == got[0]), "torn: {got:?}");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(t.len(), 500);
+    }
+
+    /// Retired bodies must drain: after churn with an attached manager, a
+    /// reclaim pump empties the quarantine (no unbounded growth), and the
+    /// tree stays exact.
+    #[test]
+    fn cow_retired_bodies_reclaim() {
+        let epoch = EpochManager::new();
+        let t = BTree::new();
+        t.set_epoch_manager(epoch.clone());
+        for i in 0..2_000u64 {
+            let k = i.to_be_bytes();
+            t.insert(&k, &k);
+        }
+        for i in 0..2_000u64 {
+            let k = i.to_be_bytes();
+            let v = (i + 1).to_be_bytes();
+            t.upsert(&k, &v);
+        }
+        assert!(epoch.pending_count() > 0, "writes must quarantine bodies");
+        // No pins held: repeated pumps must fully drain.
+        for _ in 0..8 {
+            t.reclaim();
+        }
+        assert_eq!(epoch.pending_count(), 0);
+        for i in 0..2_000u64 {
+            let k = i.to_be_bytes();
+            let v = (i + 1).to_be_bytes();
+            assert_eq!(t.get(&k), Some(v.to_vec()), "at {i}");
+        }
     }
 }
