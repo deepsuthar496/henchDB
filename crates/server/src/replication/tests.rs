@@ -73,6 +73,18 @@ fn error_codes_for_read_only() {
 }
 
 #[test]
+fn error_codes_for_promote() {
+    assert_eq!(
+        crate::wire::packet::mysql_error_for(&engine::Error::InvalidOperation("x".into())),
+        (1317, "HY000")
+    );
+    assert_eq!(
+        crate::wire::pg::codec::sqlstate(&engine::Error::InvalidOperation("x".into())),
+        "55000"
+    );
+}
+
+#[test]
 fn error_codes_for_subqueries() {
     assert_eq!(
         crate::wire::packet::mysql_error_for(&engine::Error::InvalidQuery("x".into())),
@@ -140,11 +152,33 @@ fn primary_replica_streaming_e2e() {
         )
     });
 
+    // Wait for the replica to finish bootstrapping the initial 200 rows via snapshot
+    wait_for("replica initial snapshot 200", Duration::from_secs(30), || {
+        count(&rdb, "t") == 200
+    });
+
     // -- Live writes stream after the snapshot. --
     load_rows(&pdb, "t", 200, 800);
-    wait_for("replica catch-up to 1000", Duration::from_secs(30), || {
-        count(&rdb, "t") == 1000
-    });
+    // Trajectory samples so a timeout explains itself (frozen vs slow).
+    {
+        let t0 = Instant::now();
+        let mut samples = Vec::new();
+        while count(&rdb, "t") != 1000 {
+            std::thread::sleep(Duration::from_millis(250));
+            if samples.len() < 120 {
+                samples.push((
+                    t0.elapsed().as_secs(),
+                    count(&pdb, "t"),
+                    pdb.wal_durable(),
+                    rdb.metrics().snapshot().repl_applied,
+                ));
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "timed out waiting for replica: catch-up to 1000, trajectory (t, p_count, p_durable, r_applied) {samples:?}"
+            );
+        }
+    }
 
     // Identical results, spot-checked across the key space.
     {
@@ -347,4 +381,284 @@ fn replica_reconnects_and_resumes_from_offset() {
 
 fn db_execute(db: &Database, s: &mut engine::Session, sql: &str) {
     db.execute(s, sql).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Priority 12: promotion & failover.
+// ---------------------------------------------------------------------------
+
+fn spawn_primary(
+    db: &Arc<Database>,
+    auth_path: std::path::PathBuf,
+) -> (std::thread::JoinHandle<()>, u16, Arc<AtomicBool>) {
+    let (pl, port) = primary::bind_repl(0).expect("bind repl");
+    let draining = Arc::new(AtomicBool::new(false));
+    let global = leak_flag();
+    let db2 = db.clone();
+    let draining2 = draining.clone();
+    let handle = std::thread::spawn(move || {
+        primary::serve_primary(db2, pl, auth_path, draining2, global)
+    });
+    (handle, port, draining)
+}
+
+fn spawn_replica(
+    db: &Arc<Database>,
+    primary: &str,
+    dir: &std::path::Path,
+) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let draining = Arc::new(AtomicBool::new(false));
+    let global = leak_flag();
+    let db2 = db.clone();
+    let draining2 = draining.clone();
+    let opts = ReplicaOpts {
+        primary: primary.to_string(),
+        user: "root".into(),
+        password: "".into(),
+        dir: dir.to_path_buf(),
+    };
+    let handle = std::thread::spawn(move || {
+        replica::run_replica(db2, opts, draining2, global)
+    });
+    (handle, draining)
+}
+
+fn status_val(db: &Database, name: &str) -> String {
+    let out = db
+        .execute(&mut db.new_session(), &format!("SHOW STATUS LIKE '{name}'"))
+        .unwrap();
+    assert_eq!(out.rows.len(), 1, "missing status {name}");
+    out.rows[0][1].to_string()
+}
+
+/// Generation sampled after it stops moving (a snapshot-apply's trailing
+/// checkpoint can still be in flight when row counts first converge).
+fn stable_generation(db: &Database) -> u64 {
+    let t0 = Instant::now();
+    let mut last = db.wal_generation();
+    loop {
+        assert!(t0.elapsed() < Duration::from_secs(15), "generation never settled");
+        std::thread::sleep(Duration::from_millis(300));
+        let cur = db.wal_generation();
+        if cur == last {
+            return cur;
+        }
+        last = cur;
+    }
+}
+
+#[test]
+fn promote_offline_flips_replica_to_read_write() {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let pdir = base.join(format!("hdbpo_p_{pid}"));
+    let rdir = base.join(format!("hdbpo_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let pdb = primary_db(&pdir);
+    {
+        let mut s = pdb.new_session();
+        db_execute(&pdb, &mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    }
+    load_rows(&pdb, "t", 0, 300);
+    let (pt, pport, pdrain) = spawn_primary(&pdb, pdir.join("auth.bin"));
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, rdrain) = spawn_replica(&rdb, &format!("127.0.0.1:{pport}"), &rdir);
+    wait_for("replica sync 300", Duration::from_secs(30), || count(&rdb, "t") == 300);
+
+    // Stop the replica world (feeder + handle) before offline promotion;
+    // joining first quiesces any trailing apply checkpoint, so the
+    // generation sampled below is stable.
+    rdrain.store(true, Ordering::Relaxed);
+    rt.join().unwrap();
+    let gen_before = rdb.wal_generation();
+    drop(rdb);
+
+    // Offline promote on the stopped directory.
+    let db = Database::open(&rdir).unwrap();
+    db.promote_offline().unwrap();
+    assert_eq!(db.wal_generation(), gen_before + 1);
+    assert!(!db.is_read_only());
+    db.execute(&mut db.new_session(), "INSERT INTO t VALUES (300, 900)").unwrap();
+    drop(db);
+
+    // Reopen: read-write persisted, all rows present.
+    let db2 = Database::open(&rdir).unwrap();
+    assert!(!db2.is_read_only());
+    assert_eq!(count(&db2, "t"), 301);
+    drop(db2);
+
+    pdrain.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+#[test]
+fn promote_live_runtime_stops_feeder_and_enables_writes() {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let pdir = base.join(format!("hdbpl_p_{pid}"));
+    let rdir = base.join(format!("hdbpl_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let pdb = primary_db(&pdir);
+    {
+        let mut s = pdb.new_session();
+        db_execute(&pdb, &mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    }
+    load_rows(&pdb, "t", 0, 200);
+    let (pt, pport, pdrain) = spawn_primary(&pdb, pdir.join("auth.bin"));
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    rdb.set_replica_upstream(&format!("127.0.0.1:{pport}"));
+    let (rt, _) = spawn_replica(&rdb, &format!("127.0.0.1:{pport}"), &rdir);
+    wait_for("replica sync 200", Duration::from_secs(30), || count(&rdb, "t") == 200);
+    let gen_before = stable_generation(&rdb);
+    assert_eq!(status_val(&rdb, "Replica_Role"), "Replica");
+
+    // Live promotion through the SQL surface (parser + gate + fence).
+    let out = rdb.execute(&mut rdb.new_session(), "PROMOTE").unwrap();
+    assert!(out.message.contains("promoted to primary"), "{}", out.message);
+    // The feeder thread observes the flip and detaches on its own.
+    rt.join().unwrap();
+    assert!(!rdb.is_read_only());
+    assert_eq!(rdb.wal_generation(), gen_before + 1);
+    assert_eq!(status_val(&rdb, "Replica_Role"), "Primary");
+    assert_eq!(status_val(&rdb, "Rpl_replica_status"), "PROMOTED");
+    // The fence is sealed on disk with the promotion marker.
+    let seal = std::fs::read_to_string(rdir.join("repl.offset")).unwrap();
+    assert!(
+        seal.contains("promoted") && seal.starts_with(&format!("{} ", gen_before + 1)),
+        "bad seal: {seal}"
+    );
+    // Immediate local writes, then more streamed history stays put.
+    rdb.execute(&mut rdb.new_session(), "INSERT INTO t VALUES (200, 600)").unwrap();
+    assert_eq!(count(&rdb, "t"), 201);
+
+    pdrain.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+#[test]
+fn cascading_replication_after_promotion() {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let pdir = base.join(format!("hdbcas_p_{pid}"));
+    let r1dir = base.join(format!("hdbcas_r1_{pid}"));
+    let r2dir = base.join(format!("hdbcas_r2_{pid}"));
+    for d in [&pdir, &r1dir, &r2dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    // P streams to R1 and R2.
+    let pdb = primary_db(&pdir);
+    {
+        let mut s = pdb.new_session();
+        db_execute(&pdb, &mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    }
+    load_rows(&pdb, "t", 0, 200);
+    let (pt, pport, pdrain) = spawn_primary(&pdb, pdir.join("auth.bin"));
+    let paddr = format!("127.0.0.1:{pport}");
+
+    let r1db = Arc::new(Database::open(&r1dir).unwrap());
+    r1db.set_read_only(true);
+    let (rt1, _) = spawn_replica(&r1db, &paddr, &r1dir);
+    let r2db = Arc::new(Database::open(&r2dir).unwrap());
+    r2db.set_read_only(true);
+    let (rt2, rdrain2) = spawn_replica(&r2db, &paddr, &r2dir);
+    wait_for("r1 sync 200", Duration::from_secs(30), || count(&r1db, "t") == 200);
+    wait_for("r2 sync 200", Duration::from_secs(30), || count(&r2db, "t") == 200);
+
+    // P dies. R1 promotes and keeps serving (it needs an auth store for
+    // its own subscribers; snapshots never carried one).
+    pdrain.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+    crate::auth::UserStore::load_or_bootstrap(&r1dir.join("auth.bin")).unwrap();
+    r1db.execute(&mut r1db.new_session(), "PROMOTE").unwrap();
+    rt1.join().unwrap();
+    assert!(!r1db.is_read_only());
+    // Post-promotion writes on the new primary.
+    load_rows(&r1db, "t", 200, 50);
+    assert_eq!(count(&r1db, "t"), 250);
+    let (r1t, r1port, r1drain) = spawn_primary(&r1db, r1dir.join("auth.bin"));
+
+    // R2 repoints to R1 (new generation, new upstream): snapshot bootstrap
+    // across the promotion boundary, then plain chunk streaming.
+    rdrain2.store(true, Ordering::Relaxed);
+    rt2.join().unwrap();
+    let (rt2b, rdrain2b) =
+        spawn_replica(&r2db, &format!("127.0.0.1:{r1port}"), &r2dir);
+    wait_for("r2 cascade to 250", Duration::from_secs(30), || count(&r2db, "t") == 250);
+    // Spot-check a post-promotion row came over intact.
+    let out = r2db
+        .execute(&mut r2db.new_session(), "SELECT v FROM t WHERE id = 240")
+        .unwrap();
+    assert_eq!(out.rows[0][0], engine::Datum::Int(720));
+    // The promoter was never rolled back by its own subscriber.
+    assert_eq!(count(&r1db, "t"), 250);
+
+    rdrain2b.store(true, Ordering::Relaxed);
+    r1drain.store(true, Ordering::Relaxed);
+    rt2b.join().unwrap();
+    r1t.join().unwrap();
+    for d in [&pdir, &r1dir, &r2dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn stale_primary_snapshot_refused_after_promotion() {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let pdir = base.join(format!("hdbfen_p_{pid}"));
+    let rdir = base.join(format!("hdbfen_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let pdb = primary_db(&pdir);
+    {
+        let mut s = pdb.new_session();
+        db_execute(&pdb, &mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    }
+    load_rows(&pdb, "t", 0, 100);
+    let (pt, pport, pdrain) = spawn_primary(&pdb, pdir.join("auth.bin"));
+    let paddr = format!("127.0.0.1:{pport}");
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, _) = spawn_replica(&rdb, &paddr, &rdir);
+    wait_for("replica sync 100", Duration::from_secs(30), || count(&rdb, "t") == 100);
+
+    // Promote (feeder detaches + seals), then write past the old history.
+    rdb.execute(&mut rdb.new_session(), "PROMOTE").unwrap();
+    rt.join().unwrap();
+    load_rows(&rdb, "t", 100, 10);
+    assert_eq!(count(&rdb, "t"), 110);
+    let seal = std::fs::read_to_string(rdir.join("repl.offset")).unwrap();
+
+    // Reconnect the feeder to the SAME stale primary: it must refuse
+    // (never connect-usefully), leaving all 110 rows intact.
+    let (rt2, rdrain2) = spawn_replica(&rdb, &paddr, &rdir);
+    wait_for("refusal observed", Duration::from_secs(20), || {
+        status_val(&rdb, "Rpl_replica_status") == "DISCONNECTED"
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(count(&rdb, "t"), 110, "stale primary overwrote promoted state");
+    // The seal is untouched by refusals.
+    assert_eq!(std::fs::read_to_string(rdir.join("repl.offset")).unwrap(), seal);
+
+    rdrain2.store(true, Ordering::Relaxed);
+    rt2.join().unwrap();
+    pdrain.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
 }

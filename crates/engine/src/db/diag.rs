@@ -67,6 +67,9 @@ impl Database {
         extra.mvcc_chains = chains;
         extra.mvcc_snapshots = snapshots;
         extra.master_wal_offset = self.wal.next_offset();
+        extra.replica_role = self.replica_role().to_string();
+        extra.replica_generation = self.wal.generation();
+        extra.replica_upstream = self.replica_upstream();
         extra
     }
 

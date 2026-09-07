@@ -313,6 +313,34 @@ pub(crate) fn dump_stream<W: Write>(
 }
 
 impl Database {
+    /// Stream the live catalog + rows + pool + auth without checkpointing
+    /// first (no WAL truncate, no generation bump). Used by replication
+    /// snapshot serving: the image is a consistent point-in-time read (held
+    /// under the commit and install locks, like `dump`), and the replica
+    /// continues from the returned log head with idempotent redo, so no
+    /// fresh-head truncate is required. Skipping the checkpoint also keeps
+    /// the sender's generation stable, so serving snapshots never
+    /// invalidates other connected replicas (and never erodes fencing).
+    pub fn dump_live<W: Write>(&self, writer: &mut W) -> Result<(BackupStats, u64)> {
+        let _commit = self.commit_lock.lock().unwrap();
+        let _install = self.install.lock().unwrap();
+        let durable = self.wal_durable();
+        let dbs: Vec<String> = {
+            let guard = self.databases.read().unwrap();
+            let mut v: Vec<String> = guard.iter().cloned().collect();
+            v.sort();
+            v
+        };
+        let tables = {
+            let guard = self.tables.read().unwrap();
+            let mut v: Vec<_> = guard.values().cloned().collect();
+            v.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+            v
+        };
+        let stats = dump_stream(writer, &self.dir, dbs, &tables)?;
+        Ok((stats, durable))
+    }
+
     /// Restore an archive into `target_dir`: validate everything first,
     /// then write `snapshot.bin` (valid HDBS), `auth.bin`, and `pages.bin`,
     /// and verify with `Database::open`.

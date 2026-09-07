@@ -258,14 +258,16 @@ fn handle_replica(
     }
 }
 
-/// Checkpoint the primary, stream the whole archive, and continue from the
-/// fresh log head. Writers stall briefly under the checkpoint lock; every
-/// other connected replica re-bootstraps on its next poll (documented v1
-/// cost of on-demand snapshots).
+/// Stream a consistent HDBB image WITHOUT checkpointing: the image is a
+/// point-in-time read under the commit/install locks and the replica
+/// continues from the mid-log head with idempotent redo, so no truncate is
+/// needed. Deliberately generation-stable: serving snapshots must not bump
+/// the log (which would re-bootstrap every other connected replica and
+/// erode promotion fencing). Writers stall briefly under the dump locks;
+/// replicas racing the image converge via idempotent replay.
 fn send_snapshot(db: &Arc<Database>, stream: &mut TcpStream) -> Result<(), CodecError> {
     let mut image = Vec::new();
-    db.dump(&mut image).map_err(|e| CodecError(e.to_string()))?;
-    let end_offset = db.wal_durable();
+    let (_, end_offset) = db.dump_live(&mut image).map_err(|e| CodecError(e.to_string()))?;
     let generation = db.wal_generation();
     write_frame(
         stream,

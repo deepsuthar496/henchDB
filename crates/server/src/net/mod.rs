@@ -107,6 +107,7 @@ impl Broker {
 
     /// Mark a parked, unqueued connection as having a job in flight.
     /// `false` when already queued or gone (caller skips the submit).
+    #[cfg(test)]
     pub fn try_mark_queued(&self, id: u64) -> bool {
         let mut g = self.inner.lock().unwrap();
         match g.conns.get_mut(&id) {
@@ -161,16 +162,32 @@ impl Broker {
         self.inner.lock().unwrap().conns.len()
     }
 
-    /// What the poller found on one connection.
+    /// What the poller found on one connection. Probe failures take three
+    /// consecutive bad sweeps to reap (a single failed peek says nothing
+    /// about the connection's health under socket pressure); successes
+    /// reset the count.
     pub fn snapshot(&self) -> Vec<(u64, PeekAction)> {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         let mut out = Vec::new();
-        for (id, conn) in g.conns.iter() {
+        for (id, conn) in g.conns.iter_mut() {
+            if conn.queued {
+                continue;
+            }
             match conn.has_pending_input() {
-                Ok(true) => out.push((*id, PeekAction::Data)),
-                Ok(false) => {}
-                // Peek error (reset/closed socket): reap it.
-                Err(_) => out.push((*id, PeekAction::Close)),
+                Ok(true) => {
+                    conn.probe_fails = 0;
+                    conn.queued = true;
+                    out.push((*id, PeekAction::Data));
+                }
+                Ok(false) => {
+                    conn.probe_fails = 0;
+                }
+                Err(_) => {
+                    conn.probe_fails = conn.probe_fails.saturating_add(1);
+                    if conn.probe_fails >= 3 {
+                        out.push((*id, PeekAction::Close));
+                    }
+                }
             }
         }
         out

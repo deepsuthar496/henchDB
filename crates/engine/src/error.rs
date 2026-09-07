@@ -27,6 +27,8 @@ pub enum Error {
     ReadOnlyReplica,
     InvalidQuery(String),
     ExecutionError(String),
+    /// Valid statement, wrong node role (e.g. PROMOTE on a primary).
+    InvalidOperation(String),
 }
 
 impl fmt::Display for Error {
@@ -64,6 +66,7 @@ impl fmt::Display for Error {
             ),
             Error::InvalidQuery(m) => write!(f, "invalid query: {m}"),
             Error::ExecutionError(m) => write!(f, "execution error: {m}"),
+            Error::InvalidOperation(m) => write!(f, "invalid operation: {m}"),
         }
     }
 }

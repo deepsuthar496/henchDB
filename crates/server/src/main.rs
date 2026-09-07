@@ -356,6 +356,43 @@ fn restore_cmd(args: &[String]) -> engine::Result<()> {
     Ok(())
 }
 
+/// Offline promotion of a STOPPED replica directory into an authoritative
+/// primary: fences the log generation and lifts the read-only gate, then
+/// seals the fenced position so a later feeder can never resume from a
+/// stale (older-generation) upstream without a refusing handshake.
+fn promote_cmd(args: &[String]) -> engine::Result<()> {
+    let dir = arg_value(args, "--dir").unwrap_or_else(|| "data".to_string());
+    let dir = Path::new(&dir);
+    if !dir.exists() {
+        return Err(engine::Error::Io(format!(
+            "promote: directory '{}' does not exist",
+            dir.display()
+        )));
+    }
+    let db = Database::open(dir)?;
+    let before = db.wal_generation();
+    db.promote_offline()?;
+    let after = db.wal_generation();
+    // Seal repl.offset at the fenced generation, preserving the recorded
+    // upstream so the host-anchored fence keeps working (mirrors the live
+    // feeder's detach seal; see replication/replica.rs).
+    let host = std::fs::read_to_string(dir.join("repl.offset"))
+        .ok()
+        .and_then(|t| t.split_whitespace().nth(2).map(str::to_string))
+        .unwrap_or_default();
+    let seal = if host.is_empty() {
+        format!("{after} 8 promoted\n")
+    } else {
+        format!("{after} 8 {host} promoted\n")
+    };
+    let _ = std::fs::write(dir.join("repl.offset"), seal);
+    println!(
+        "promoted to primary: generation {before} -> {after} (dir: {})",
+        dir.display()
+    );
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = arg_value(&args, "--dir").unwrap_or_else(|| "data".to_string());
@@ -367,6 +404,7 @@ fn main() {
         Some("passwd") => passwd_cmd(Path::new(&dir), &args),
         Some("dump") => dump_cmd(Path::new(&dir), &args),
         Some("restore") => restore_cmd(&args),
+        Some("promote") => promote_cmd(&args),
         Some("gcbench") => {
             let threads: usize = arg_value(&args, "--threads")
                 .and_then(|t| t.parse().ok())
@@ -388,11 +426,12 @@ fn main() {
         }
         Some(other) if !other.starts_with('-') => {
             eprintln!("unknown command '{other}'");
-            eprintln!("usage: server [serve|passwd|bench|dump|restore] [--dir data] [--port 3307] [--rows 50000]");
+            eprintln!("usage: server [serve|passwd|bench|dump|restore|promote] [--dir data] [--port 3307] [--rows 50000]");
             eprintln!("  serve --max-connections 1024 --wait-timeout 28800 --threads <2xCPU> [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only] [--wal-archive-dir <dir>]");
             eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
             eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
             eprintln!("  restore --backup backup.hdb [--dir data] [--force] [--archive-dir <dir> [--target-time \"YYYY-MM-DD [HH:MM:SS]\" | --target-txn <id>]]");
+            eprintln!("  promote --dir data  (offline: stop the replica first; fences generation + enables writes)");
             std::process::exit(2);
         }
         _ => shell(Path::new(&dir)),
@@ -934,6 +973,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     // Replica stream thread: keeps the read-only copy caught up.
     if let Some(primary) = opts.replica_of.clone() {
         println!("replica mode: streaming from {primary}");
+        db.set_replica_upstream(&primary);
         let handle = std::thread::spawn({
             let db = db.clone();
             let draining = draining.clone();

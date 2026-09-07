@@ -19,9 +19,74 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::Database;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::table::{Table, TableDef};
 use crate::wal::Record;
+
+impl Database {
+    /// Promote a read-only replica to an authoritative read-write primary.
+    ///
+    /// Quiesce protocol (Priority 12):
+    /// 1. Fail fast when already primary (`InvalidOperation`).
+    /// 2. `checkpoint()` makes every applied record durable in the
+    ///    snapshot (the feeder's `pending` map only ever holds
+    ///    *uncommitted* records, which crash semantics discard anyway)
+    ///    and resets the log: generation + 1 (`wal.gen`), offset back to
+    ///    the header. Old primaries and divergent peers can never silently
+    ///    stream into this history (generation fencing; the replica
+    ///    handshake snapshots on any mismatch, and the replica refuses
+    ///    snapshots from older generations).
+    /// 3. The `read_only` gate lifts last, so no local commit can interleave
+    ///    with the fence. The server feeder thread observes the flip and
+    ///    detaches without applying further upstream batches.
+    /// The checkpoint doubles as the promotion milestone record (durable
+    /// point + new generation are both in files afterwards).
+    pub fn promote(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if !self.read_only.load(Ordering::Acquire) {
+            return Err(Error::InvalidOperation("already primary".into()));
+        }
+        self.checkpoint()?;
+        *self.replica_upstream.lock().unwrap() = String::new();
+        self.read_only.store(false, Ordering::Release);
+        self.metrics.set_repl_status("PROMOTED");
+        Ok(())
+    }
+
+    /// Offline variant for `server promote --dir` (stopped node): the
+    /// read-only flag is in-memory only, so a freshly opened directory
+    /// cannot prove it was a replica — fence unconditionally instead of
+    /// failing. Never errors on role, only on I/O. (The checkpoint inside
+    /// already resets the log: generation + 1, offset to header.)
+    pub fn promote_offline(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        self.checkpoint()?;
+        *self.replica_upstream.lock().unwrap() = String::new();
+        self.read_only.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Upstream primary this replica follows (`host:port`, empty when
+    /// none). Set by the server replication client at startup; cleared by
+    /// promotion. Surfaced as `Replica_Upstream_Host` in `SHOW STATUS`.
+    pub fn set_replica_upstream(&self, upstream: &str) {
+        *self.replica_upstream.lock().unwrap() = upstream.to_string();
+    }
+
+    pub fn replica_upstream(&self) -> String {
+        self.replica_upstream.lock().unwrap().clone()
+    }
+
+    /// "Primary" when writable, "Replica" when gated (for status rows).
+    pub fn replica_role(&self) -> &'static str {
+        use std::sync::atomic::Ordering;
+        if self.read_only.load(Ordering::Relaxed) {
+            "Replica"
+        } else {
+            "Primary"
+        }
+    }
+}
 
 /// First-keyword gate for replica mode. Session-local reads and transaction
 /// framing stay allowed (an empty staged txn commits to nothing); anything
@@ -302,6 +367,69 @@ mod tests {
         let mut s = db.new_session();
         let out = db.execute(&mut s, "SELECT * FROM t").unwrap();
         assert_eq!(out.rows.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn status_value(db: &Database, name: &str) -> Option<String> {
+        let out = db.execute(&mut db.new_session(), "SHOW STATUS").unwrap();
+        out.rows.iter().find_map(|r| match &r[..] {
+            [crate::types::Datum::Text(n), crate::types::Datum::Text(v)] if n == name => {
+                Some(v.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn promote_sql_flips_replica_to_primary() {
+        let dir = std::env::temp_dir().join(format!("hdbpromote_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::open(&dir).unwrap();
+        let mut s = db.new_session();
+        db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute(&mut s, "INSERT INTO t VALUES (1, 1)").unwrap();
+        db.set_read_only(true);
+        db.set_replica_upstream("127.0.0.1:9999");
+        let gen_before = db.wal_generation();
+        assert_eq!(status_value(&db, "Replica_Role").as_deref(), Some("Replica"));
+        assert_eq!(
+            status_value(&db, "Replica_Upstream_Host").as_deref(),
+            Some("127.0.0.1:9999")
+        );
+        // PROMOTE passes the read-only gate (not a write verb).
+        let out = db.execute(&mut db.new_session(), "PROMOTE").unwrap();
+        assert!(out.message.contains("promoted to primary"), "{}", out.message);
+        assert!(!db.is_read_only());
+        assert_eq!(db.wal_generation(), gen_before + 1);
+        assert_eq!(status_value(&db, "Replica_Role").as_deref(), Some("Primary"));
+        assert_eq!(status_value(&db, "Replica_Upstream_Host").as_deref(), Some(""));
+        // Writes work immediately and persist across reopen.
+        db.execute(&mut db.new_session(), "INSERT INTO t VALUES (2, 2)").unwrap();
+        drop(db);
+        let db2 = Database::open(&dir).unwrap();
+        assert!(!db2.is_read_only());
+        let out = db2.execute(&mut db2.new_session(), "SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(out.rows[0][0], crate::types::Datum::Int(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn promote_on_primary_is_invalid_operation() {
+        let dir = std::env::temp_dir().join(format!("hdbpromote2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Database::open(&dir).unwrap();
+        let gen_before = db.wal_generation();
+        assert_eq!(
+            db.execute(&mut db.new_session(), "PROMOTE"),
+            Err(Error::InvalidOperation("already primary".into()))
+        );
+        // Failed promotion fences nothing.
+        assert_eq!(db.wal_generation(), gen_before);
+        // Offline promotion never fails on role (fresh opens cannot prove
+        // replica history) but still fences + ensures read-write.
+        db.promote_offline().unwrap();
+        assert_eq!(db.wal_generation(), gen_before + 1);
+        assert!(!db.is_read_only());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -34,16 +34,23 @@ pub fn run_poller(
         for (id, action) in broker.snapshot() {
             match action {
                 PeekAction::Data => {
-                    if broker.try_mark_queued(id) {
-                        if super::submit(&tx, id) {
-                            progress = true;
-                        } else {
-                            broker.unmark(id);
-                        }
+                    if super::submit(&tx, id) {
+                        progress = true;
+                    } else {
+                        broker.unmark(id);
                     }
                 }
                 PeekAction::Close => {
                     if let Some(conn) = broker.remove(id) {
+                        // Abnormal close (not idle-reap, not drain): one line
+                        // per event — parked connections should only die
+                        // this way on real socket errors or peer FIN.
+                        let age = conn.last_active.elapsed().as_secs();
+                        eprintln!(
+                            "poller: reaping {} connection #{id} (idle {age}s, strikes {})",
+                            conn.describe(),
+                            conn.probe_fails
+                        );
                         conn.shutdown_sock();
                         registry.remove(conn.reg_id);
                         progress = true;

@@ -87,7 +87,16 @@ fn worker_loop(
         let ctx = shared.conn_ctx();
         let is_new = matches!(conn.state, ConnState::NewMain(_) | ConnState::NewPg(_));
         let (conn, disposition) = if is_new {
-            establish(&shared, &ctx, &registry, conn)
+            let (conn, disp) = establish(&shared, &ctx, &registry, conn);
+            if matches!(disp, Disposition::Idle)
+                && conn
+                    .as_ref()
+                    .is_some_and(|c| c.has_pending_input().unwrap_or(false))
+            {
+                run_steps(&shared, &ctx, conn.unwrap())
+            } else {
+                (conn, disp)
+            }
         } else {
             run_steps(&shared, &ctx, conn)
         };

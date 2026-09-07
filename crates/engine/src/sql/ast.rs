@@ -232,6 +232,8 @@ pub enum Statement {
     ShowEngineStatus,
     ShowProcesslist,
     Checkpoint,
+    /// Promote a read-only replica to primary (fails on primaries).
+    Promote,
     Backup {
         path: String,
     },

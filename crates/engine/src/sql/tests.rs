@@ -93,6 +93,9 @@ fn parse_database_ddl_and_use() {
     let s = parse_sql("SHOW PROCESSLIST;").unwrap();
     assert_eq!(s, Statement::ShowProcesslist);
 
+    let s = parse_sql("PROMOTE;").unwrap();
+    assert_eq!(s, Statement::Promote);
+
     let s = parse_sql("DROP DATABASE IF EXISTS app_db;").unwrap();
     assert_eq!(
         s,

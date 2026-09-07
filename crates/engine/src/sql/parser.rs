@@ -186,6 +186,10 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Checkpoint)
             }
+            Some("PROMOTE") => {
+                self.pos += 1;
+                Ok(Statement::Promote)
+            }
             Some("BACKUP") => {
                 self.pos += 1;
                 self.expect_kw("DATABASE")?;

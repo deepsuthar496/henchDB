@@ -138,6 +138,10 @@ pub struct EngineExtra {
     pub mvcc_chains: usize,
     /// Primary WAL written offset (log head) for `Rpl_master_wal_offset`.
     pub master_wal_offset: u64,
+    /// Failover role + fencing state for `Replica_*` status rows.
+    pub replica_role: String,
+    pub replica_generation: u64,
+    pub replica_upstream: String,
 }
 
 pub struct Metrics {
@@ -403,6 +407,16 @@ impl Metrics {
                 "Rpl_replica_applied_offset",
                 snap.repl_applied.to_string(),
             ),
+            ("Replica_Role", extra.replica_role.clone()),
+            (
+                "Replica_Generation",
+                extra.replica_generation.to_string(),
+            ),
+            (
+                "Replica_Upstream_Host",
+                extra.replica_upstream.clone(),
+            ),
+            ("Replica_Lag_Bytes", snap.repl_lag.to_string()),
         ];
         all.into_iter()
             .filter(|(name, _)| match like {

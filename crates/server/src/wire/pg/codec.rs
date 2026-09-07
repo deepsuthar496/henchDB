@@ -176,6 +176,7 @@ pub fn sqlstate(e: &engine::Error) -> &'static str {
         engine::Error::ReadOnlyReplica => "25006",
         engine::Error::InvalidQuery(_) => "21000",
         engine::Error::ExecutionError(_) => "21000",
+        engine::Error::InvalidOperation(_) => "55000",
         _ => "XX000",
     }
 }

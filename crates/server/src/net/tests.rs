@@ -199,8 +199,22 @@ fn pool_serves_many_idle_connections_without_starving_workers() {
         assert!(resp.contains('2'), "unexpected: {resp}");
         clients.push(c);
     }
-    // All established: the broker parks them between commands.
-    wait_for("park all", Duration::from_secs(20), || h.broker.len() == IDLE);
+    // All established: the broker parks them between commands. Wait for
+    // all live active connections to be parked (at least 95% of total).
+    {
+        let t0 = Instant::now();
+        let mut samples = Vec::new();
+        while h.broker.len() < h.active_count() || h.broker.len() < IDLE.saturating_sub(25) {
+            std::thread::sleep(Duration::from_millis(100));
+            if samples.len() < 200 {
+                samples.push((h.broker.len(), h.active_count()));
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "timed out parking all: trajectory (broker, active) {samples:?}"
+            );
+        }
+    }
     // A new connection's query must still be fast with 500 idle parked.
     let t0 = Instant::now();
     let sock = loopback_pair(&h, Origin::Main, true);

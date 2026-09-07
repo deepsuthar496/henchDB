@@ -112,19 +112,19 @@ pub(crate) struct StagedWrite {
 }
 
 pub struct Database {
-    databases: RwLock<HashSet<String>>,
-    tables: RwLock<HashMap<String, Arc<Table>>>,
+    pub(crate) databases: RwLock<HashSet<String>>,
+    pub(crate) tables: RwLock<HashMap<String, Arc<Table>>>,
     pub(crate) wal: Wal,
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// Off-page overflow pool for wide rows (Priority 2). Shared by all
     /// tables; the `pages.bin` file persists next to WAL/snapshot so
     /// snapshot locators stay valid across restarts.
     pool: Arc<BufferPool>,
     /// Phase A of commit: validate + append (short critical section, no fsync).
-    commit_lock: Mutex<()>,
+    pub(crate) commit_lock: Mutex<()>,
     /// Phase C: installs happen strictly in WAL-offset order so in-memory
     /// state always matches replayed state. Guarded by `install_cv`.
-    install: Mutex<u64>,
+    pub(crate) install: Mutex<u64>,
     install_cv: std::sync::Condvar,
     /// Keys of commits appended but not yet installed (duplicate-key guard
     /// for concurrent inserts while the commit lock is released for sync).
@@ -143,6 +143,10 @@ pub struct Database {
     /// Replica read-only mode: rejects all WAL-appending statements with
     /// `Error::ReadOnlyReplica`. Set once at startup (`--replica-of`).
     read_only: AtomicBool,
+    /// Upstream primary this replica follows (`host:port`, empty when none).
+    /// Server-side replication client sets it; promotion clears it. Read by
+    /// `SHOW STATUS LIKE 'Replica_%'`.
+    pub(crate) replica_upstream: Mutex<String>,
     /// WAL archive directory for PITR (Priority 10): when set, every
     /// checkpoint copies the discarded durable WAL prefix into an immutable
     /// `HDBA` segment before truncating. Set once at startup
@@ -235,6 +239,7 @@ impl Database {
             versions: RwLock::new(mvcc::VersionState::new()),
             metrics: Metrics::new(),
             read_only: AtomicBool::new(false),
+            replica_upstream: Mutex::new(String::new()),
             archive_dir: Mutex::new(None),
         })
     }
@@ -268,21 +273,7 @@ impl Database {
     /// `backup.rs` for the format and consistency contract.
     pub fn dump<W: std::io::Write>(&self, writer: &mut W) -> Result<crate::backup::BackupStats> {
         self.checkpoint()?;
-        let _commit = self.commit_lock.lock().unwrap();
-        let _install = self.install.lock().unwrap();
-        let dbs: Vec<String> = {
-            let guard = self.databases.read().unwrap();
-            let mut v: Vec<String> = guard.iter().cloned().collect();
-            v.sort();
-            v
-        };
-        let tables = {
-            let guard = self.tables.read().unwrap();
-            let mut v: Vec<_> = guard.values().cloned().collect();
-            v.sort_by(|a, b| a.def.name.cmp(&b.def.name));
-            v
-        };
-        crate::backup::dump_stream(writer, &self.dir, dbs, &tables)
+        self.dump_live(writer).map(|(stats, _)| stats)
     }
 
     /// Flush a durable snapshot and truncate the WAL.
@@ -511,6 +502,18 @@ impl Database {
             Statement::Checkpoint => {
                 self.checkpoint()?;
                 Ok(Output::ok("checkpoint complete"))
+            }
+            Statement::Promote => {
+                // Allowed through the read-only gate (PROMOTE is not a
+                // write verb): on replicas it fences + flips to primary
+                // and the feeder detaches; on primaries it errors.
+                // Any authenticated user may promote (per-user privileges
+                // are the SEC8 follow-up, same as COM_SHUTDOWN).
+                self.promote()?;
+                Ok(Output::ok(format!(
+                    "promoted to primary (generation {})",
+                    self.wal_generation()
+                )))
             }
             Statement::Backup { path } => {
                 let file = std::fs::File::create(&path)?;

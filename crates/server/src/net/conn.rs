@@ -80,6 +80,10 @@ pub(crate) struct Conn {
     /// duplicate submissions: without it two workers could take the same
     /// connection and the loser would block forever on an empty read).
     pub(crate) queued: bool,
+    /// Consecutive failed readiness probes (a single failed probe never
+    /// reaps: transient resource errors must not kill a possibly-live
+    /// connection; only persistent failure does).
+    pub(crate) probe_fails: u8,
     pub(crate) reg_id: u64,
     /// Counted slot; dropping the conn releases it.
     pub(crate) guard: ConnGuard,
@@ -111,7 +115,7 @@ impl Conn {
         guard: ConnGuard,
         db: Arc<Database>,
     ) -> Self {
-        Conn { id: 0, origin, state, admitted, last_active: Instant::now(), queued: false, reg_id, guard, db }
+        Conn { id: 0, origin, state, admitted, last_active: Instant::now(), queued: false, probe_fails: 0, reg_id, guard, db }
     }
 
     pub(crate) fn into_parts(self) -> ConnParts {
@@ -135,7 +139,7 @@ impl Conn {
         guard: ConnGuard,
         db: Arc<Database>,
     ) -> Self {
-        Conn { id, origin, state, admitted, last_active: Instant::now(), queued: false, reg_id, guard, db }
+        Conn { id, origin, state, admitted, last_active: Instant::now(), queued: false, probe_fails: 0, reg_id, guard, db }
     }
 
     /// Toggle blocking mode on the underlying socket(s), whatever the
@@ -157,10 +161,12 @@ impl Conn {
     /// waiting (peek never consumes, so framing is undisturbed). For TLS
     /// this observes ciphertext — a readiness hint only; the worker's
     /// blocking read still bounds partial records by the idle timeout.
-    /// `Ok(0)` (orderly FIN) is reported as an error so the poller reaps
-    /// the dead connection instead of parking it forever: on a
-    /// non-blocking socket, "no data yet" surfaces as `WouldBlock`, never
-    /// as zero.
+    /// `Ok(0)` (orderly FIN) and hard errors (reset/refused) report
+    /// failure so the poller reaps the dead connection. TRANSIENT resource
+    /// errors (out of buffer space under socket pressure) report Ok(false):
+    /// a failed readiness probe must never kill a connection that may
+    /// still be alive — the worker's real I/O is the arbiter, and the next
+    /// sweep retries the probe.
     pub(crate) fn has_pending_input(&self) -> std::io::Result<bool> {
         let mut one = [0u8; 1];
         let sock: &TcpStream = match &self.state {
@@ -176,6 +182,7 @@ impl Conn {
             )),
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) if is_transient_probe_error(&e) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -209,5 +216,21 @@ impl Conn {
             ConnState::Pg(_) => "pg",
             ConnState::Legacy(_) => "legacy",
         }
+    }
+}
+
+/// True for transient socket-resource errors that must not reap a parked
+/// connection (retry on the next sweep instead). Readiness probes compete
+/// with hundreds of sibling sockets; failing one probe says nothing about
+/// the connection's health.
+fn is_transient_probe_error(e: &std::io::Error) -> bool {
+    match e.raw_os_error() {
+        // WSAENOBUFS on Windows, ENOBUFS elsewhere: kernel out of buffer
+        // space (or ephemeral-port pressure) — retry on the next sweep.
+        #[cfg(windows)]
+        Some(10055) => true,
+        #[cfg(not(windows))]
+        Some(105) => true,
+        _ => false,
     }
 }
