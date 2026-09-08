@@ -76,6 +76,11 @@ const MIN_KEYS: usize = MAX_KEYS / 2;
 enum NodeBody {
     Leaf {
         keys: Vec<Vec<u8>>,
+        /// Contiguous 4-byte big-endian key prefixes, strictly parallel to
+        /// `keys` (`heads[i] == key_head(&keys[i])` for every observable
+        /// body). The search filters on this L1-resident array before
+        /// dereferencing heap-allocated key buffers.
+        heads: Vec<u32>,
         vals: Vec<Vec<u8>>,
         /// Sibling chain for range scans. Stale pointers stay safe: the left
         /// half of a split keeps its node identity and gains a next pointer.
@@ -84,8 +89,26 @@ enum NodeBody {
     Internal {
         /// Separator keys: child[i] holds keys < keys[i] (and >= keys[i-1]).
         keys: Vec<Vec<u8>>,
+        /// Prefix cache parallel to `keys` (same contract as the leaf).
+        heads: Vec<u32>,
         children: Vec<Arc<Node>>,
     },
+}
+
+/// First 4 bytes of a key as a big-endian `u32`, zero-padded when the key
+/// is shorter. Order-consistent with full memcmp: `key_head(a) <
+/// key_head(b)` implies `a < b` (the first differing padded byte decides
+/// both orders identically); equal heads fall through to an exact compare.
+fn key_head(key: &[u8]) -> u32 {
+    let mut buf = [0u8; 4];
+    let n = key.len().min(4);
+    buf[..n].copy_from_slice(&key[..n]);
+    u32::from_be_bytes(buf)
+}
+
+/// Build the prefix cache for a key vector (construction / bulk rebuild).
+fn heads_for(keys: &[Vec<u8>]) -> Vec<u32> {
+    keys.iter().map(|k| key_head(k)).collect()
 }
 
 pub struct Node {
@@ -122,11 +145,13 @@ impl Node {
         vals: Vec<Vec<u8>>,
         next: Option<Arc<Node>>,
     ) -> Arc<Node> {
-        Self::with_body(NodeBody::Leaf { keys, vals, next })
+        let heads = heads_for(&keys);
+        Self::with_body(NodeBody::Leaf { keys, heads, vals, next })
     }
 
     fn new_internal(keys: Vec<Vec<u8>>, children: Vec<Arc<Node>>) -> Arc<Node> {
-        Self::with_body(NodeBody::Internal { keys, children })
+        let heads = heads_for(&keys);
+        Self::with_body(NodeBody::Internal { keys, heads, children })
     }
 
     fn with_body(body: NodeBody) -> Arc<Node> {
@@ -338,8 +363,8 @@ impl BTree {
             loop {
                 let version = node.latch.wait_and_version();
                 match node.body() {
-                    NodeBody::Leaf { keys, vals, .. } => {
-                        let idx = lower_bound(keys, key);
+                    NodeBody::Leaf { keys, heads, vals, .. } => {
+                        let idx = lower_bound(keys, heads, key);
                         // One immutable snapshot: keys/vals are mutually
                         // consistent; the length check only guards a stale
                         // snapshot (validation below restarts on races).
@@ -354,12 +379,12 @@ impl BTree {
                         }
                         continue 'restart;
                     }
-                    NodeBody::Internal { keys, children } => {
+                    NodeBody::Internal { keys, heads, children } => {
                         // Same stale-snapshot guard: validate() below fails
                         // and restarts if a concurrent writer replaced this
                         // node mid-read; clamping only avoids indexing past
                         // a snapshot taken at the boundary.
-                        let idx = lower_bound(keys, key).min(children.len() - 1);
+                        let idx = lower_bound(keys, heads, key).min(children.len() - 1);
                         let child = children[idx].clone();
                         if !node.latch.validate(version) {
                             continue 'restart;
@@ -394,9 +419,9 @@ impl BTree {
                     }
                     break;
                 }
-                NodeBody::Internal { keys, children } => {
+                NodeBody::Internal { keys, heads, children } => {
                     let idx = match start {
-                        Some(k) => lower_bound(keys, k),
+                        Some(k) => lower_bound(keys, heads, k),
                         None => 0,
                     }
                     .min(children.len() - 1); // clamp against a stale snapshot
@@ -413,7 +438,7 @@ impl BTree {
         loop {
             let version = node.latch.wait_and_version();
             let (keys, vals, next) = match node.body() {
-                NodeBody::Leaf { keys, vals, next } => (keys.clone(), vals.clone(), next.clone()),
+                NodeBody::Leaf { keys, vals, next, .. } => (keys.clone(), vals.clone(), next.clone()),
                 NodeBody::Internal { .. } => break, // cannot happen at leaf level
             };
             if !node.latch.validate(version) {
@@ -626,7 +651,7 @@ impl BTree {
             // Latch the path child while holding the parent (root→leaf).
             let idx = match &*p_guard {
                 NodeBody::Leaf { .. } => return false, // root leaf: always legal
-                NodeBody::Internal { keys, children } => {
+                NodeBody::Internal { keys, heads, children } => {
                     if children.len() <= 1 {
                         // Single-child root collapses separately; a 1-child
                         // non-root cannot arise from merges (a survivor keeps
@@ -634,7 +659,7 @@ impl BTree {
                         // to fix here either way.
                         return false;
                     }
-                    lower_bound(keys, key).min(children.len() - 1)
+                    lower_bound(keys, heads, key).min(children.len() - 1)
                 }
             };
             let child = match &*p_guard {
@@ -721,50 +746,64 @@ impl BTree {
         let sep = idx.min(sib_idx);
         match (&mut *c_guard, &mut **s_guard) {
             (
-                NodeBody::Leaf { keys: ck, vals: cv, .. },
-                NodeBody::Leaf { keys: sk, vals: sv, .. },
+                NodeBody::Leaf { keys: ck, heads: ch, vals: cv, .. },
+                NodeBody::Leaf { keys: sk, heads: sh, vals: sv, .. },
             ) => {
                 if sib_idx > idx {
                     // First entry of the right sibling appends to the child.
                     let k = sk.remove(0);
+                    let h = sh.remove(0);
                     let v = sv.remove(0);
                     ck.push(k.clone());
+                    ch.push(h);
                     cv.push(v);
-                    if let NodeBody::Internal { keys, .. } = &mut **p_guard {
+                    if let NodeBody::Internal { keys, heads, .. } = &mut **p_guard {
                         keys[sep] = k;
+                        heads[sep] = h;
                     }
                 } else {
                     // Last entry of the left sibling prepends to the child.
                     let k = sk.pop().expect("rich sibling");
+                    let h = sh.pop().expect("rich sibling");
                     let v = sv.pop().expect("rich sibling");
                     ck.insert(0, k);
+                    ch.insert(0, h);
                     cv.insert(0, v);
-                    if let NodeBody::Internal { keys, .. } = &mut **p_guard {
+                    if let NodeBody::Internal { keys, heads, .. } = &mut **p_guard {
                         keys[sep] = sk.last().cloned().unwrap_or_default();
+                        heads[sep] = sh.last().copied().unwrap_or(0);
                     }
                 }
             }
             (
-                NodeBody::Internal { keys: ck, children: cc },
-                NodeBody::Internal { keys: sk, children: sc },
+                NodeBody::Internal { keys: ck, heads: ch, children: cc },
+                NodeBody::Internal { keys: sk, heads: sh, children: sc },
             ) => {
-                if let NodeBody::Internal { keys: pk, .. } = &mut **p_guard {
+                if let NodeBody::Internal { keys: pk, heads: ph, .. } = &mut **p_guard {
                     if sib_idx > idx {
                         // Separator moves down as the child's new last key;
                         // the sibling's first child moves over with it.
                         let down = pk[sep].clone();
+                        let down_h = ph[sep];
                         let up = sk.remove(0);
+                        let up_h = sh.remove(0);
                         let mv = sc.remove(0);
                         ck.push(down);
+                        ch.push(down_h);
                         cc.push(mv);
                         pk[sep] = up;
+                        ph[sep] = up_h;
                     } else {
                         let down = pk[sep].clone();
+                        let down_h = ph[sep];
                         let up = sk.pop().expect("rich sibling");
+                        let up_h = sh.pop().expect("rich sibling");
                         let mv = sc.pop().expect("rich sibling");
                         ck.insert(0, down);
+                        ch.insert(0, down_h);
                         cc.insert(0, mv);
                         pk[sep] = up;
+                        ph[sep] = up_h;
                     }
                 }
             }
@@ -787,45 +826,53 @@ impl BTree {
         let sep = idx.min(sib_idx);
         // The evicted node's Arc: unlinked below, retired at the end.
         let evicted: Arc<Node>;
-        if let NodeBody::Internal { keys: pk, children: pc } = &mut **p_guard {
+        if let NodeBody::Internal { keys: pk, heads: ph, children: pc } = &mut **p_guard {
             match (&mut *c_guard, &mut *s_guard) {
                 (
-                    NodeBody::Leaf { keys: ak, vals: av, next: an },
-                    NodeBody::Leaf { keys: bk, vals: bv, next: bn },
+                    NodeBody::Leaf { keys: ak, heads: ah, vals: av, next: an },
+                    NodeBody::Leaf { keys: bk, heads: bh, vals: bv, next: bn },
                 ) => {
                     if merge_into_left {
                         // Sibling (right) folds into the child (left).
                         ak.append(bk);
+                        ah.append(bh);
                         av.append(bv);
                         *an = bn.take();
                         evicted = pc.remove(sep + 1);
                     } else {
                         // Child (right) folds into the sibling (left).
                         bk.append(ak);
+                        bh.append(ah);
                         bv.append(av);
                         *bn = an.take();
                         evicted = pc.remove(sep + 1);
                         debug_assert!(sep + 1 == idx);
                     }
                     pk.remove(sep);
+                    ph.remove(sep);
                 }
                 (
-                    NodeBody::Internal { keys: ak, children: ac },
-                    NodeBody::Internal { keys: bk, children: bc },
+                    NodeBody::Internal { keys: ak, heads: ah, children: ac },
+                    NodeBody::Internal { keys: bk, heads: bh, children: bc },
                 ) => {
                     if merge_into_left {
                         ak.push(pk[sep].clone());
+                        ah.push(ph[sep]);
                         ak.append(bk);
+                        ah.append(bh);
                         ac.append(bc);
                         evicted = pc.remove(sep + 1);
                     } else {
                         bk.push(pk[sep].clone());
+                        bh.push(ph[sep]);
                         bk.append(ak);
+                        bh.append(ah);
                         bc.append(ac);
                         evicted = pc.remove(sep + 1);
                         debug_assert!(sep + 1 == idx);
                     }
                     pk.remove(sep);
+                    ph.remove(sep);
                 }
                 _ => unreachable!("merge mixes leaf and internal nodes"),
             }
@@ -888,6 +935,34 @@ impl Default for BTree {
     }
 }
 
+#[cfg(test)]
+impl BTree {
+    /// White-box invariant check (tests only): every node's heads cache is
+    /// exactly `heads_for(keys)` and parallel in length. Walks with
+    /// lock-coupled snapshots like `node_count`.
+    fn assert_heads_synced(&self) {
+        fn check(node: &Node, epoch: &Arc<EpochManager>) {
+            let (children, ok) = {
+                let g = node.lock(epoch);
+                let ok = match &*g {
+                    NodeBody::Leaf { keys, heads, .. } => *heads == heads_for(keys),
+                    NodeBody::Internal { keys, heads, .. } => *heads == heads_for(keys),
+                };
+                let children = match &*g {
+                    NodeBody::Leaf { .. } => Vec::new(),
+                    NodeBody::Internal { children, .. } => children.clone(),
+                };
+                (children, ok)
+            };
+            assert!(ok, "heads cache desynchronized from keys");
+            for c in children {
+                check(&c, epoch);
+            }
+        }
+        check(&self.current_root(), &self.manager());
+    }
+}
+
 enum UpsertDescend {
     Done(Option<Vec<u8>>),
     Restart,
@@ -902,8 +977,8 @@ fn upsert_rec(
 ) -> UpsertDescend {
     let mut g = node.lock(epoch);
     match &mut *g {
-        NodeBody::Leaf { keys, vals, .. } => {
-            let idx = lower_bound(keys, key);
+        NodeBody::Leaf { keys, heads, vals, .. } => {
+            let idx = lower_bound(keys, heads, key);
             if idx < keys.len() && keys[idx] == key {
                 let prev = std::mem::replace(&mut vals[idx], val.to_vec());
                 return UpsertDescend::Done(Some(prev));
@@ -912,14 +987,15 @@ fn upsert_rec(
                 return UpsertDescend::Restart;
             }
             keys.insert(idx, key.to_vec());
+            heads.insert(idx, key_head(key));
             vals.insert(idx, val.to_vec());
             UpsertDescend::Done(None)
         }
-        NodeBody::Internal { keys, children } => {
-            let mut idx = lower_bound(keys, key);
+        NodeBody::Internal { keys, heads, children } => {
+            let mut idx = lower_bound(keys, heads, key);
             if children[idx].key_count() >= MAX_KEYS {
-                split_child_in_place(keys, children, idx, tree, epoch);
-                idx = lower_bound(keys, key);
+                split_child_in_place(keys, heads, children, idx, tree, epoch);
+                idx = lower_bound(keys, heads, key);
             }
             let child = children[idx].clone();
             drop(g);
@@ -936,8 +1012,9 @@ fn update_in_place_rec(
 ) -> Option<Vec<u8>> {
     let mut g = node.lock(epoch);
     match &mut *g {
-        NodeBody::Leaf { keys, vals, .. } => {
-            let idx = lower_bound(keys, key);
+        // Values only: keys (and their heads) are untouched.
+        NodeBody::Leaf { keys, heads, vals, .. } => {
+            let idx = lower_bound(keys, heads, key);
             if idx < keys.len() && keys[idx] == key {
                 if vals[idx].len() == val.len() {
                     let prev = vals[idx].clone();
@@ -951,11 +1028,11 @@ fn update_in_place_rec(
                 None
             }
         }
-        NodeBody::Internal { keys, children } => {
+        NodeBody::Internal { keys, heads, children } => {
             if children.is_empty() {
                 return None;
             }
-            let idx = lower_bound(keys, key);
+            let idx = lower_bound(keys, heads, key);
             let child = children[idx].clone();
             drop(g);
             update_in_place_rec(&child, key, val, epoch)
@@ -976,25 +1053,26 @@ fn insert_rec(
 ) -> Descend {
     let mut g = node.lock(epoch);
     match &mut *g {
-        NodeBody::Leaf { keys, vals, .. } => {
+        NodeBody::Leaf { keys, heads, vals, .. } => {
             if keys.len() >= MAX_KEYS {
                 return Descend::Restart; // guard drop releases the latch
             }
-            let idx = lower_bound(keys, key);
+            let idx = lower_bound(keys, heads, key);
             if idx < keys.len() && keys[idx] == key {
                 return Descend::Done(false); // duplicate: no-op
             }
             keys.insert(idx, key.to_vec());
+            heads.insert(idx, key_head(key));
             vals.insert(idx, val.to_vec());
             Descend::Done(true)
         }
-        NodeBody::Internal { keys, children } => {
-            let mut idx = lower_bound(keys, key);
+        NodeBody::Internal { keys, heads, children } => {
+            let mut idx = lower_bound(keys, heads, key);
             if children[idx].key_count() >= MAX_KEYS {
                 // Split the full child while we hold this node's latch, so
                 // readers of this node are blocked for the whole transition.
-                split_child_in_place(keys, children, idx, tree, epoch);
-                idx = lower_bound(keys, key);
+                split_child_in_place(keys, heads, children, idx, tree, epoch);
+                idx = lower_bound(keys, heads, key);
             }
             let child = children[idx].clone();
             // NOTE: no assert that the child is non-full here — key_count()
@@ -1014,6 +1092,7 @@ fn insert_rec(
 /// the parent.
 fn split_child_in_place(
     p_keys: &mut Vec<Vec<u8>>,
+    p_heads: &mut Vec<u32>,
     p_children: &mut Vec<Arc<Node>>,
     idx: usize,
     tree: &BTree,
@@ -1023,27 +1102,33 @@ fn split_child_in_place(
     let (sep, right) = {
         let mut cg = child.lock(epoch);
         match &mut *cg {
-            NodeBody::Leaf { keys, vals, next } => {
+            NodeBody::Leaf { keys, heads, vals, next } => {
                 let mid = keys.len() / 2;
                 let right_keys = keys.split_off(mid);
+                // The right sibling's cache is rebuilt by its constructor;
+                // only the retained half needs mirroring here.
+                let _ = heads.split_off(mid);
                 let right_vals = vals.split_off(mid);
                 let right = Node::new_leaf_with(right_keys, right_vals, next.take());
                 *next = Some(right.clone());
                 let sep = keys.last().cloned().unwrap_or_default();
                 (sep, right)
             }
-            NodeBody::Internal { keys, children } => {
+            NodeBody::Internal { keys, heads, children } => {
                 let mid = keys.len() / 2;
                 let sep = keys[mid].clone();
                 let right_keys = keys.split_off(mid + 1);
+                let _ = heads.split_off(mid + 1);
                 let right_children = children.split_off(mid + 1);
                 keys.pop(); // separator moves up
+                heads.pop();
                 (sep, Node::new_internal(right_keys, right_children))
             }
         }
     }; // child latch released here
-    let at = lower_bound(p_keys, &sep);
-    p_keys.insert(at, sep);
+    let at = lower_bound(p_keys, p_heads, &sep);
+    p_keys.insert(at, sep.clone());
+    p_heads.insert(at, key_head(&sep));
     p_children.insert(at + 1, right);
     tree.bump_splits();
 }
@@ -1055,18 +1140,19 @@ fn delete_rec(
 ) -> Option<Vec<u8>> {
     let mut g = node.lock(epoch);
     match &mut *g {
-        NodeBody::Leaf { keys, vals, .. } => {
-            let idx = lower_bound(keys, key);
+        NodeBody::Leaf { keys, heads, vals, .. } => {
+            let idx = lower_bound(keys, heads, key);
             if idx < keys.len() && keys[idx] == key {
                 let v = vals.remove(idx);
                 keys.remove(idx);
+                heads.remove(idx);
                 Some(v)
             } else {
                 None
             }
         }
-        NodeBody::Internal { keys, children } => {
-            let idx = lower_bound(keys, key);
+        NodeBody::Internal { keys, heads, children } => {
+            let idx = lower_bound(keys, heads, key);
             let child = children[idx].clone();
             drop(g); // release parent latch before descending (lock coupling)
             delete_rec(&child, key, epoch)
@@ -1074,13 +1160,21 @@ fn delete_rec(
     }
 }
 
-/// First index whose key is >= `key`.
-fn lower_bound(keys: &[Vec<u8>], key: &[u8]) -> usize {
-    let mut lo = 0usize;
-    let mut hi = keys.len();
+/// First index whose key is >= `key`: binary search with a prefix
+/// prefilter. Each step compares the contiguous `heads` entry first and only
+/// dereferences the heap-allocated key buffer on a head collision, so
+/// distinct prefixes resolve without pointer indirection or memcmp while
+/// colliding prefixes cost exactly the old binary search plus one
+/// L1-resident `u32` compare per step (never asymptotically worse).
+fn lower_bound(keys: &[Vec<u8>], heads: &[u32], key: &[u8]) -> usize {
+    // Defensive clamp: every published body keeps the vectors parallel, so
+    // this equals `keys.len()` on all observable snapshots.
+    let n = keys.len().min(heads.len());
+    let h = key_head(key);
+    let (mut lo, mut hi) = (0, n);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if keys[mid].as_slice() < key {
+        if heads[mid] < h || (heads[mid] == h && keys[mid].as_slice() < key) {
             lo = mid + 1;
         } else {
             hi = mid;

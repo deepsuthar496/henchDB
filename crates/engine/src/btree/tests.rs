@@ -405,3 +405,182 @@
             assert_eq!(t.get(&k), Some(v.to_vec()), "at {i}");
         }
     }
+
+#[test]
+fn key_head_edge_lengths_and_order() {
+    // Empty / short keys zero-pad; 4-byte keys are exact; longer keys
+    // truncate to the prefix.
+    assert_eq!(key_head(b""), 0);
+    assert_eq!(key_head(b"a"), u32::from_be_bytes([b'a', 0, 0, 0]));
+    assert_eq!(key_head(b"abc"), u32::from_be_bytes([b'a', b'b', b'c', 0]));
+    assert_eq!(
+        key_head(b"abcd"),
+        u32::from_be_bytes([b'a', b'b', b'c', b'd'])
+    );
+    assert_eq!(key_head(b"abcde"), key_head(b"abcd"));
+    assert_eq!(key_head(b"ab"), key_head(b"ab\x00\x00"));
+    // Order consistency: differing heads decide exactly like memcmp.
+    let mut keys: Vec<Vec<u8>> = vec![
+        b"".to_vec(),
+        b"a".to_vec(),
+        b"ab".to_vec(),
+        b"ab\x00".to_vec(),
+        b"abc".to_vec(),
+        b"abcd".to_vec(),
+        b"b".to_vec(),
+        vec![0u8, 0, 0, 1],
+        vec![0u8, 0, 1],
+        vec![255u8],
+    ];
+    keys.sort();
+    let heads = heads_for(&keys);
+    for w in heads.windows(2) {
+        assert!(w[0] <= w[1], "heads must be non-decreasing for sorted keys");
+    }
+    for i in 0..keys.len() {
+        for j in 0..keys.len() {
+            let (a, b) = (&keys[i], &keys[j]);
+            if heads[i] < heads[j] {
+                assert!(a.as_slice() < b.as_slice(), "head order must imply key order");
+            }
+            if a.as_slice() < b.as_slice() {
+                assert!(heads[i] <= heads[j], "key order must imply head order");
+            }
+        }
+    }
+}
+
+#[test]
+fn lower_bound_matches_naive_reference() {
+    // Differential test: two-phase search equals naive linear scan on
+    // randomized keys with heavy 4-byte-prefix sharing.
+    let mut state = 0x1234_5678_9abcu64;
+    let mut next = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..300 {
+        let prefix = next() % 8; // force collisions on the head
+        let mut k = format!("p{prefix:04}").into_bytes();
+        k.extend_from_slice(&next().to_be_bytes());
+        k.extend_from_slice(&[next() as u8]);
+        keys.push(k);
+    }
+    keys.sort();
+    keys.dedup();
+    let heads = heads_for(&keys);
+    let naive = |q: &[u8]| keys.iter().position(|k| k.as_slice() >= q).unwrap_or(keys.len());
+    for _ in 0..2000 {
+        let mut q = format!("p{:04}", next() % 10).into_bytes();
+        q.extend_from_slice(&next().to_be_bytes());
+        assert_eq!(lower_bound(&keys, &heads, &q), naive(&q), "query {q:?}");
+    }
+    // Exact-hit and empty-tree edges.
+    assert_eq!(lower_bound(&[], &[], b"x"), 0);
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(lower_bound(&keys, &heads, k), i);
+    }
+}
+
+#[test]
+fn heads_stay_synced_through_splits_and_merges() {
+    let t = BTree::new();
+    for i in 0..10_000u64 {
+        let k = i.to_be_bytes();
+        assert!(t.insert(&k, &k));
+    }
+    assert!(t.split_count() > 0);
+    t.assert_heads_synced();
+    // Point + range results exact after splits.
+    for i in (0..10_000u64).step_by(333) {
+        let k = i.to_be_bytes();
+        assert_eq!(t.get(&k), Some(k.to_vec()));
+    }
+    // Updates (same and different value lengths) never touch heads.
+    for i in (0..1_000u64).step_by(7) {
+        let k = i.to_be_bytes();
+        assert!(t.update_in_place(&k, &k).is_some());
+        assert_eq!(t.upsert(&k, &[i as u8; 3]), Some(k.to_vec()));
+    }
+    t.assert_heads_synced();
+    // Mass delete drives borrow/merge paths; sync + content stay exact.
+    for i in (0..10_000u64).filter(|i| i % 3 != 0) {
+        let k = i.to_be_bytes();
+        assert!(t.remove(&k).is_some(), "missing {i}");
+    }
+    t.assert_heads_synced();
+    for i in 0..10_000u64 {
+        let k = i.to_be_bytes();
+        assert_eq!(t.get(&k).is_some(), i % 3 == 0, "at {i}");
+    }
+    let r = t.range(Some(&3_000u64.to_be_bytes()), true, Some(&6_000u64.to_be_bytes()), true);
+    assert_eq!(r.len(), 1_001);
+}
+
+#[test]
+fn heads_prefix_collisions_stay_exact() {
+    // 2,000 keys sharing one 4-byte prefix: phase 2 does all the work.
+    let t = BTree::new();
+    for i in 0..2_000u64 {
+        let mut k = b"same".to_vec();
+        k.extend_from_slice(&i.to_be_bytes());
+        assert!(t.insert(&k, &vec![i as u8; 8]));
+    }
+    t.assert_heads_synced();
+    for i in (0..2_000u64).step_by(101) {
+        let mut k = b"same".to_vec();
+        k.extend_from_slice(&i.to_be_bytes());
+        assert_eq!(t.get(&k), Some(vec![i as u8; 8]), "at {i}");
+    }
+    let mut lo = b"same".to_vec();
+    lo.extend_from_slice(&500u64.to_be_bytes());
+    let mut hi = b"same".to_vec();
+    hi.extend_from_slice(&1_500u64.to_be_bytes());
+    assert_eq!(t.range(Some(&lo), true, Some(&hi), true).len(), 1_001);
+}
+
+#[test]
+fn heads_concurrent_churn_validates() {
+    use std::sync::Arc;
+    let t = Arc::new(BTree::new());
+    // Seed 4 disjoint ranges (splits before the hammer starts).
+    for w in 0..4u64 {
+        for i in 0..1_000u64 {
+            let k = (w * 100_000 + i).to_be_bytes();
+            t.insert(&k, &k);
+        }
+    }
+    t.assert_heads_synced();
+    let mut handles = Vec::new();
+    for w in 0..4u64 {
+        let t = t.clone();
+        handles.push(thread::spawn(move || {
+            // Churn one range: delete evens, re-insert odds with new
+            // values, point-read everything in between.
+            for i in 0..1_000u64 {
+                let k = (w * 100_000 + i).to_be_bytes();
+                if i % 2 == 0 {
+                    t.remove(&k);
+                } else {
+                    t.upsert(&k, &[w as u8; 5]);
+                }
+                let _ = t.get(&k);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    t.assert_heads_synced();
+    for w in 0..4u64 {
+        for i in 0..1_000u64 {
+            let k = (w * 100_000 + i).to_be_bytes();
+            if i % 2 == 0 {
+                assert_eq!(t.get(&k), None, "stale w={w} i={i}");
+            } else {
+                assert_eq!(t.get(&k), Some(vec![w as u8; 5]), "wrong w={w} i={i}");
+            }
+        }
+    }
+}

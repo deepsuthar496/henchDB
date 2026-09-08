@@ -107,7 +107,7 @@ you upgrade a component, update the row and the module doc comment.
 
 | Area | v0.1 implementation | Roadmap (research.md) |
 |---|---|---|
-| Index | Typed OLC B+ tree, `MAX_KEYS=128`, borrow/merge on delete (`MIN_KEYS=64`) + root collapse + EBR retire | Prefix + 4-byte-head SIMD search, swizzled tree nodes (`research.md` §Storage); value overflow paging is done (see Storage row) |
+| Index | Typed OLC B+ tree, `MAX_KEYS=128`, borrow/merge on delete (`MIN_KEYS=64`) + root collapse + EBR retire + 4-byte key-head prefix cache with prefiltered binary search (Priority 14) | Prefix compression, swizzled tree nodes (`research.md` §Storage); value overflow paging is done (see Storage row) |
 | Storage | 256 KiB slotted pages + 64-bit swips + write-through cooling pool (`page.rs`); rows >1 KiB spill off-page with epoch-quarantined reuse; snapshot v2 carries key/value pairs, WAL carries full rows | Swizzled tree nodes, page GC / free-space persistence across restart, write-back batching, io_uring `IOPOLL` (Linux-only, `cfg`-gate it) |
 | Reads | Optimistic version snapshot + validate, restart on mismatch | Same, over immutable epoch-quarantined COW snapshots (formally data-race-free; EBR retires superseded bodies + merged-away nodes) |
 | Writes | Session-staged write set; commit takes one commit lock, validates, WAL-batches, installs (allocating an MVCC commit epoch); installs record superseded rows while snapshot readers are active | Per-core WAL shards, Early Lock Release, column-granular versioning (RCC) |
