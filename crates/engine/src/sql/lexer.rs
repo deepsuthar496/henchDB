@@ -37,7 +37,7 @@ impl Lexer {
                     out.push(Token::Ident(self.read_ident()));
                 }
                 '-' if self.peek_digit() => out.push(self.read_number()),
-                ',' | '(' | ')' | '*' | ';' | '=' | '.' => {
+                ',' | '(' | ')' | '*' | ';' | '=' | '.' | ':' => {
                     out.push(Token::Sym(c));
                     self.pos += 1;
                 }

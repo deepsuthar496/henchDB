@@ -125,6 +125,8 @@ impl Parser {
             Some("DELETE") => self.parse_delete(),
             Some("BEGIN") => {
                 self.pos += 1;
+                // ORMs open transactions as `BEGIN TRANSACTION`.
+                self.eat_kw("TRANSACTION");
                 Ok(Statement::Begin)
             }
             Some("START") => {
@@ -486,7 +488,21 @@ impl Parser {
         if self.peek() == &Token::Sym('(') {
             self.parse_derived()
         } else {
-            Ok(TableRef::Table(self.expect_ident()?))
+            // One optional `.` qualifier: `db.table` (cross-database) and
+            // `pg_catalog.pg_class` (system views) route by their dotted
+            // name; three-part names are rejected.
+            let first = self.expect_ident()?;
+            if self.eat_sym('.') {
+                let second = self.expect_ident()?;
+                if self.eat_sym('.') {
+                    return Err(Error::ParseError(
+                        "three-part table names are not supported".into(),
+                    ));
+                }
+                Ok(TableRef::Table(format!("{first}.{second}")))
+            } else {
+                Ok(TableRef::Table(first))
+            }
         }
     }
 
@@ -519,6 +535,34 @@ impl Parser {
                 let column = self.parse_col_ref()?;
                 self.expect_sym(')')?;
                 items.push(SelectItem::Aggregate { func, column });
+            } else if matches!(self.peek(), Token::Ident(_))
+                && self.tokens.get(self.pos + 1) == Some(&Token::Sym('('))
+            {
+                // Zero-argument system function in the projection list
+                // (`version()`, `current_schema()`, ...): the executor
+                // validates the name and evaluates it from the session.
+                let Token::Ident(name) = self.next() else {
+                    unreachable!()
+                };
+                self.expect_sym('(')?;
+                self.expect_sym(')')?;
+                let alias = if self.eat_kw("AS") {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                // Trailing `::type` casts on system functions are accepted
+                // and ignored (all four return text already).
+                while self.eat_sym(':') {
+                    self.expect_sym(':')?;
+                    let target = self.expect_ident()?;
+                    if !is_known_cast(&target) {
+                        return Err(Error::ParseError(format!(
+                            "unknown cast '::{target}'"
+                        )));
+                    }
+                }
+                items.push(SelectItem::SysFunc { name, alias });
             } else if matches!(self.peek(), Token::Number(_) | Token::Str(_))
                 || (self.peek() == &Token::Sym('-')
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))))
@@ -539,8 +583,14 @@ impl Parser {
             }
             break;
         }
-        self.expect_kw("FROM")?;
-        let from = self.parse_table_ref()?;
+        // FROM is optional: a FROM-less SELECT (`SELECT 1`,
+        // `SELECT version()`) yields exactly one row; only
+        // row-independent items are valid (checked at execution).
+        let from = if self.eat_kw("FROM") {
+            self.parse_table_ref()?
+        } else {
+            TableRef::Empty
+        };
         let mut joins = Vec::new();
         loop {
             let kind = if self.eat_kw("INNER") {
@@ -978,7 +1028,7 @@ impl Parser {
             self.expect_sym(')')?;
             return Ok(Expr::ScalarSubquery(Box::new(stmt)));
         }
-        match self.next() {
+        let base = match self.next() {
             Token::Str(s) => Ok(Expr::Literal(Datum::Text(s))),
             Token::Number(n) => {
                 if n.contains('.') {
@@ -1026,6 +1076,99 @@ impl Parser {
                 })
             }
             t => Err(Error::ParseError(format!("expected operand, got {t:?}"))),
+        }?;
+        // PostgreSQL `::type` casts (ORM introspection staples like
+        // `'x'::regclass`, `col::text`): desugared at parse time — casts on
+        // columns are comparison-identities, casts on literals fold to the
+        // coerced literal. Anything else is a clean parse error.
+        let mut e = base;
+        while self.eat_sym(':') {
+            self.expect_sym(':')?;
+            let target = self.expect_ident()?;
+            e = apply_cast(e, &target)?;
         }
+        Ok(e)
     }
+}
+
+/// Cast target names accepted by `::` (and by system-function projection
+/// suffixes): the text/identifier family, the integer family, bool, and
+/// floats. Anything else fails closed at parse time.
+fn is_known_cast(target: &str) -> bool {
+    matches!(
+        target.to_ascii_uppercase().as_str(),
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "REGCLASS" | "OID" | "INT2"
+            | "INT4" | "INT8" | "BOOL" | "BOOLEAN" | "FLOAT4" | "FLOAT8"
+    )
+}
+
+fn apply_cast(base: Expr, target: &str) -> Result<Expr> {
+    let t = target.to_ascii_uppercase();
+    if !is_known_cast(&t) {
+        return Err(Error::ParseError(format!("unknown cast '::{target}'")));
+    }
+    match base {
+        Expr::Column(_) => Ok(base),
+        Expr::Literal(d) => Ok(Expr::Literal(coerce_literal(&d, &t, target)?)),
+        other => Err(Error::ParseError(format!(
+            "cannot cast {other:?} with '::{target}'"
+        ))),
+    }
+}
+
+fn coerce_literal(d: &Datum, t: &str, target: &str) -> Result<Datum> {
+    if matches!(d, Datum::Null) {
+        return Ok(Datum::Null);
+    }
+    Ok(match t {
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "REGCLASS" => {
+            Datum::Text(d.to_string())
+        }
+        "OID" | "INT2" | "INT4" | "INT8" => match d {
+            Datum::Int(i) => Datum::Int(*i),
+            Datum::Float(f) => Datum::Int(*f as i64),
+            Datum::Bool(b) => Datum::Int(i64::from(*b)),
+            Datum::Text(s) => s.trim().parse::<i64>().map(Datum::Int).map_err(|_| {
+                Error::ParseError(format!("cannot cast '{s}' to '::{target}'"))
+            })?,
+            Datum::Null => Datum::Null,
+            Datum::DateTime(_) => {
+                return Err(Error::ParseError(format!(
+                    "cannot cast {d:?} to '::{target}'"
+                )))
+            }
+        },
+        "BOOL" | "BOOLEAN" => match d {
+            Datum::Bool(b) => Datum::Bool(*b),
+            Datum::Int(i) => Datum::Bool(*i != 0),
+            Datum::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => Datum::Bool(true),
+                "false" | "f" | "0" => Datum::Bool(false),
+                _ => {
+                    return Err(Error::ParseError(format!(
+                        "cannot cast '{s}' to '::{target}'"
+                    )))
+                }
+            },
+            Datum::Null => Datum::Null,
+            Datum::Float(_) | Datum::DateTime(_) => {
+                return Err(Error::ParseError(format!(
+                    "cannot cast {d:?} to '::{target}'"
+                )))
+            }
+        },
+        _ => match d {
+            Datum::Float(f) => Datum::Float(*f),
+            Datum::Int(i) => Datum::Float(*i as f64),
+            Datum::Text(s) => s.trim().parse::<f64>().map(Datum::Float).map_err(|_| {
+                Error::ParseError(format!("cannot cast '{s}' to '::{target}'"))
+            })?,
+            Datum::Null => Datum::Null,
+            Datum::Bool(_) | Datum::DateTime(_) => {
+                return Err(Error::ParseError(format!(
+                    "cannot cast {d:?} to '::{target}'"
+                )))
+            }
+        },
+    })
 }

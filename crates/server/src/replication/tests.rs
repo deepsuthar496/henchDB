@@ -438,9 +438,9 @@ fn stable_generation(db: &Database) -> u64 {
     let mut last = db.wal_generation();
     loop {
         assert!(t0.elapsed() < Duration::from_secs(15), "generation never settled");
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(100));
         let cur = db.wal_generation();
-        if cur == last {
+        if cur > 0 && cur == last {
             return cur;
         }
         last = cur;
@@ -518,7 +518,9 @@ fn promote_live_runtime_stops_feeder_and_enables_writes() {
     rdb.set_read_only(true);
     rdb.set_replica_upstream(&format!("127.0.0.1:{pport}"));
     let (rt, _) = spawn_replica(&rdb, &format!("127.0.0.1:{pport}"), &rdir);
-    wait_for("replica sync 200", Duration::from_secs(30), || count(&rdb, "t") == 200);
+    wait_for("replica sync 200", Duration::from_secs(30), || {
+        count(&rdb, "t") == 200 && rdb.metrics().snapshot().repl_applied > 0
+    });
     let gen_before = stable_generation(&rdb);
     assert_eq!(status_val(&rdb, "Replica_Role"), "Replica");
 
@@ -635,7 +637,9 @@ fn stale_primary_snapshot_refused_after_promotion() {
     let rdb = Arc::new(Database::open(&rdir).unwrap());
     rdb.set_read_only(true);
     let (rt, _) = spawn_replica(&rdb, &paddr, &rdir);
-    wait_for("replica sync 100", Duration::from_secs(30), || count(&rdb, "t") == 100);
+    wait_for("replica sync 100", Duration::from_secs(30), || {
+        count(&rdb, "t") == 100 && rdb.metrics().snapshot().repl_applied > 0
+    });
 
     // Promote (feeder detaches + seals), then write past the old history.
     rdb.execute(&mut rdb.new_session(), "PROMOTE").unwrap();

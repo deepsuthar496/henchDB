@@ -272,29 +272,6 @@ pub(crate) fn mysql_establish(
     }
     let authed_user = match hs {
         Some(hs) if !hs.username.is_empty() => {
-            // The client may answer with a different plugin than offered
-            // (--default-auth). When it names a plugin we support, run the
-            // AuthSwitch exchange (0xFE + plugin + scramble, raw reply);
-            // unknown plugins fail closed.
-            let plugin = if hs.plugin.is_empty() { AUTH_PLUGIN.to_string() } else { hs.plugin.clone() };
-            let mut proof = hs.auth.clone();
-            if plugin != AUTH_PLUGIN
-                && (plugin == auth::PLUGIN_NATIVE || plugin == auth::PLUGIN_CACHING_SHA2)
-            {
-                let mut sw = vec![0xFE];
-                sw.extend_from_slice(plugin.as_bytes());
-                sw.push(0);
-                sw.extend_from_slice(&scramble);
-                sw.push(0);
-                write_packet(reader.get_mut(), &sw, &mut sseq)?;
-                reader.get_mut().flush()?;
-                let (cseq2, sw_resp) = match read_packet(&mut reader, 16 * 1024 * 1024) {
-                    Ok(v) => v,
-                    Err(_) => return Ok(None),
-                };
-                sseq = cseq2.wrapping_add(1);
-                proof = sw_resp;
-            }
             // Fail closed when the auth store is unreadable.
             let store = match UserStore::load(&ctx.auth_path) {
                 Ok(s) => s,
@@ -306,19 +283,59 @@ pub(crate) fn mysql_establish(
                     return Ok(None);
                 }
             };
-            // Unknown users fail exactly like wrong passwords.
-            let using_password = !proof.is_empty() && proof != [0];
-            let ok = store
-                .users
-                .get(&hs.username)
-                .map(|v| auth::verify(v, &plugin, &scramble, &proof))
-                .unwrap_or(false);
+            // Unknown users fail exactly like wrong passwords (no user enumeration).
+            let Some(user_def) = store.users.get(&hs.username) else {
+                eprintln!("access denied for '{}' from {peer}", hs.username);
+                let p = access_denied(&hs.username, &peer_host, !hs.auth.is_empty() && hs.auth != [0]);
+                write_packet(reader.get_mut(), &p, &mut sseq)?;
+                reader.get_mut().flush()?;
+                return Ok(None);
+            };
+
+            let client_plugin = if hs.plugin.is_empty() { AUTH_PLUGIN } else { hs.plugin.as_str() };
+            let target_plugin = &user_def.plugin;
+            let mut proof = hs.auth.clone();
+            let mut did_auth_switch = false;
+
+            // When the client offered credentials under a different plugin than
+            // the account requires, or the client sent empty proof anticipating a
+            // switch (and the account has a password), prompt the client
+            // via AuthSwitchRequest (0xFE + plugin + scramble) to submit proof
+            // for the account's required plugin.
+            if !user_def.hash.is_empty()
+                && (client_plugin != target_plugin || proof.is_empty())
+                && (target_plugin == auth::PLUGIN_NATIVE || target_plugin == auth::PLUGIN_CACHING_SHA2)
+            {
+                let mut sw = vec![0xFE];
+                sw.extend_from_slice(target_plugin.as_bytes());
+                sw.push(0);
+                sw.extend_from_slice(&scramble);
+                sw.push(0);
+                write_packet(reader.get_mut(), &sw, &mut sseq)?;
+                reader.get_mut().flush()?;
+                let (cseq2, sw_resp) = match read_packet(&mut reader, 16 * 1024 * 1024) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                sseq = cseq2.wrapping_add(1);
+                proof = sw_resp;
+                did_auth_switch = true;
+            }
+
+            let using_password = (!hs.auth.is_empty() && hs.auth != [0]) || (!proof.is_empty() && proof != [0]);
+            let ok = auth::verify(user_def, target_plugin, &scramble, &proof);
             if !ok {
                 eprintln!("access denied for '{}' from {peer}", hs.username);
                 let p = access_denied(&hs.username, &peer_host, using_password);
                 write_packet(reader.get_mut(), &p, &mut sseq)?;
                 reader.get_mut().flush()?;
                 return Ok(None);
+            }
+            // For caching_sha2_password negotiated via AuthSwitch, the client expects
+            // a fast_auth_success indicator (0x03) before the OK packet.
+            if did_auth_switch && target_plugin == auth::PLUGIN_CACHING_SHA2 {
+                write_packet(reader.get_mut(), &[0x03], &mut sseq)?;
+                reader.get_mut().flush()?;
             }
             if let Some(db_name) = &hs.db {
                 if !db_name.is_empty() {
@@ -337,6 +354,7 @@ pub(crate) fn mysql_establish(
     write_packet(reader.get_mut(), &ok_payload(0, ""), &mut sseq)?;
     reader.get_mut().flush()?;
     println!("mysql connected: {peer} as '{authed_user}'");
+    session.user = authed_user.clone();
     // Processlist entry for SHOW PROCESSLIST / Threads_connected.
     let proc = ProcGuard::register(&db, &authed_user, &peer_host);
     // Idle timeout from here on (handshake already completed); a quiet

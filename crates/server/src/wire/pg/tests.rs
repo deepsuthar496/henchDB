@@ -388,6 +388,30 @@ fn extended_binary_params_and_results() {
 }
 
 #[test]
+fn extended_unknown_oid_keeps_short_text_as_text() {
+    // Regression (Priority 13): OID-0 inference must not read `t`/`f` as
+    // bool — introspection filters (`WHERE relname = 't'`) compare text.
+    // `true`/`false` still infer bool.
+    let dir = std::env::temp_dir().join(format!("hdbpgxt_{}", std::process::id()));
+    let db = pg_test_db(&dir);
+    let mut s = db.new_session();
+    let mut conn = PgConn::default();
+    let _ = conn
+        .on_parse(&parse_parse_msg(&parse_payload("qt", "SELECT id FROM t WHERE v = $1", &[])).unwrap())
+        .unwrap();
+    // 'b' is text here (matches row 2); under the old inference 't'/'f'
+    // became bool and matched nothing.
+    let _ = conn
+        .on_bind(&parse_bind_msg(&bind_payload("pt", "qt", &[0], &[Some(b"b")], &[])).unwrap())
+        .unwrap();
+    let r = conn
+        .on_execute(&db, &mut s, &parse_execute_msg(&b"pt\0\x00\x00\x00\x00".to_vec()).unwrap())
+        .unwrap();
+    assert!(r.windows(8).any(|w| w == b"SELECT 1"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn extended_partial_execute_suspends() {
     let dir = std::env::temp_dir().join(format!("hdbpgxs_{}", std::process::id()));
     let db = pg_test_db(&dir);

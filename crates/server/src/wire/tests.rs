@@ -506,3 +506,145 @@ fn tls_loopback_roundtrip() {
     server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mysql_establish_auth_switch_roundtrip() {
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use crate::auth::{self, UserStore, PLUGIN_CACHING_SHA2, PLUGIN_NATIVE};
+    use crate::wire::mysql_establish;
+    use crate::wire::packet::{read_packet, write_packet};
+
+    let dir = std::env::temp_dir().join(format!("hdbauth_sw_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let auth_path = dir.join("auth.bin");
+    let (mut store, _) = UserStore::load_or_bootstrap(&auth_path).unwrap();
+    store.set_password("nativeuser", b"nativepw", PLUGIN_NATIVE).unwrap();
+    store.set_password("sha2user", b"sha2pw", PLUGIN_CACHING_SHA2).unwrap();
+
+    let db = Arc::new(engine::Database::open(&dir.join("db")).unwrap());
+
+    // Case 1: Client connects as nativeuser (server offers caching_sha2_password)
+    // Server must send AuthSwitch to mysql_native_password, client sends native token.
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ctx_clone = crate::wire::ConnCtx {
+            auth_path: auth_path.clone(),
+            idle_timeout: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tls: None,
+        };
+        let db_clone = db.clone();
+        let srv = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let session = mysql_establish(db_clone, sock, &ctx_clone, true).unwrap();
+            assert!(session.is_some());
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut reader = std::io::BufReader::new(client.try_clone().unwrap());
+        // 1. Read HandshakeV10
+        let (seq1, hs_pkt) = read_packet(&mut reader, 65536).unwrap();
+        assert_eq!(seq1, 0);
+        let mut pos = 1;
+        while hs_pkt[pos] != 0 { pos += 1; }
+        pos += 1 + 4;
+        let mut scramble = [0u8; 20];
+        scramble[..8].copy_from_slice(&hs_pkt[pos..pos + 8]);
+        pos += 8 + 1 + 2 + 1 + 2 + 1 + 10;
+        scramble[8..].copy_from_slice(&hs_pkt[pos..pos + 12]);
+
+        // 2. Client sends HandshakeResponse41 with caching_sha2_password and dummy proof
+        let caps = 0x00088207u32 | 0x00008000 | 0x00080000;
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&caps.to_le_bytes());
+        resp.extend_from_slice(&[0u8; 4]);
+        resp.push(255);
+        resp.extend_from_slice(&[0u8; 23]);
+        resp.extend_from_slice(b"nativeuser\0");
+        resp.push(32); // auth len
+        resp.extend_from_slice(&[0u8; 32]); // dummy sha2 token
+        resp.extend_from_slice(PLUGIN_CACHING_SHA2.as_bytes());
+        resp.push(0);
+        let mut cseq = 1u8;
+        write_packet(&mut client, &resp, &mut cseq).unwrap();
+        client.flush().unwrap();
+
+        // 3. Server must send AuthSwitchRequest with 0xFE and PLUGIN_NATIVE
+        let (seq2, sw_req) = read_packet(&mut reader, 65536).unwrap();
+        assert_eq!(seq2, 2);
+        assert_eq!(sw_req[0], 0xFE);
+        let sw_plugin = std::str::from_utf8(&sw_req[1..1 + PLUGIN_NATIVE.len()]).unwrap();
+        assert_eq!(sw_plugin, PLUGIN_NATIVE);
+        let sw_scramble = &sw_req[1 + PLUGIN_NATIVE.len() + 1..1 + PLUGIN_NATIVE.len() + 1 + 20];
+
+        // 4. Client computes native token and replies (sequence must follow seq2)
+        let stage1 = auth::sha1(b"nativepw");
+        let stage2 = auth::sha1(&stage1);
+        let mut pre = Vec::new();
+        pre.extend_from_slice(sw_scramble);
+        pre.extend_from_slice(&stage2);
+        let mask = auth::sha1(&pre);
+        let token: Vec<u8> = stage1.iter().zip(mask.iter()).map(|(a, b)| a ^ b).collect();
+
+        cseq = seq2.wrapping_add(1);
+        write_packet(&mut client, &token, &mut cseq).unwrap();
+        client.flush().unwrap();
+
+        // 5. Server sends OK payload
+        let (seq3, ok_pkt) = read_packet(&mut reader, 65536).unwrap();
+        assert_eq!(seq3, 4);
+        assert_eq!(ok_pkt[0], 0x00);
+
+        srv.join().unwrap();
+    }
+
+    // Case 2: Client connects as sha2user with wrong password -> Access Denied 1045
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ctx_clone = crate::wire::ConnCtx {
+            auth_path: auth_path.clone(),
+            idle_timeout: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tls: None,
+        };
+        let db_clone = db.clone();
+        let srv = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let session = mysql_establish(db_clone, sock, &ctx_clone, true).unwrap();
+            assert!(session.is_none());
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut reader = std::io::BufReader::new(client.try_clone().unwrap());
+        let _ = read_packet(&mut reader, 65536).unwrap();
+
+        let caps = 0x00088207u32 | 0x00008000 | 0x00080000;
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&caps.to_le_bytes());
+        resp.extend_from_slice(&[0u8; 4]);
+        resp.push(255);
+        resp.extend_from_slice(&[0u8; 23]);
+        resp.extend_from_slice(b"sha2user\0");
+        resp.push(32);
+        resp.extend_from_slice(&[0xFF; 32]); // wrong token
+        resp.extend_from_slice(PLUGIN_CACHING_SHA2.as_bytes());
+        resp.push(0);
+        let mut cseq = 1u8;
+        write_packet(&mut client, &resp, &mut cseq).unwrap();
+        client.flush().unwrap();
+
+        let (_, err_pkt) = read_packet(&mut reader, 65536).unwrap();
+        assert_eq!(err_pkt[0], 0xFF);
+        let code = u16::from_le_bytes([err_pkt[1], err_pkt[2]]);
+        assert_eq!(code, 1045);
+
+        srv.join().unwrap();
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

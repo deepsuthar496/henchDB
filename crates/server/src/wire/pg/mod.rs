@@ -308,6 +308,7 @@ fn pg_session(
     w.write_all(&init)?;
     w.flush()?;
     println!("pg connected: {peer} as '{authed_user}'");
+    session.user = authed_user.clone();
     // Processlist entry for SHOW PROCESSLIST / Threads_connected.
     let peer_host = peer.ip().to_string();
     let proc = ProcGuard::register(&db, &authed_user, &peer_host);

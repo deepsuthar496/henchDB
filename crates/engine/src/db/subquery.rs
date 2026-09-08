@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::plan::{join_key, JoinKey};
+use super::sysviews;
 use super::{Database, Output, Session};
 use crate::error::{Error, Result};
 use crate::sql::{Expr, JoinClause, SelectItem, SelectStmt, TableRef};
@@ -71,7 +72,8 @@ pub(crate) enum Folded {
 
 /// Resolve one FROM/JOIN source: base tables via the catalog, derived
 /// aliases via the session materialization map (populated by
-/// `setup_derived` before scope building).
+/// `setup_derived` before scope building), system views (`pg_catalog.*`,
+/// `information_schema.*`) synthesized on the fly (see `sysviews.rs`).
 pub(crate) fn resolve_table_ref(
     db: &Database,
     session: &Session,
@@ -82,11 +84,19 @@ pub(crate) fn resolve_table_ref(
             if let Some(t) = session.subq.eph.get(name) {
                 return Ok(t.clone());
             }
+            if let Some(t) = sysviews::sysview_source(db, session, name)? {
+                return Ok(t);
+            }
             db.table(session, name)
         }
         TableRef::Derived { alias, .. } => session.subq.eph.get(alias).cloned().ok_or_else(|| {
             Error::TableNotFound(format!("{alias} (derived table was not materialized)"))
         }),
+        // FROM-less selects never reach resolution (the executor serves
+        // them as a single row); reaching here is a bug, not bad input.
+        TableRef::Empty => Err(Error::InvalidQuery(
+            "FROM-less SELECT cannot be resolved to a table".into(),
+        )),
     }
 }
 
@@ -291,13 +301,21 @@ fn inner_scope(
     let mut aliases = Vec::new();
     for r in std::iter::once(&query.from).chain(query.joins.iter().map(|j| &j.table)) {
         match r {
-            TableRef::Table(name) => tables.push(db.table(session, name)?),
+            TableRef::Table(name) => {
+                if let Some(t) = sysviews::sysview_source(db, session, name)? {
+                    tables.push(t);
+                } else {
+                    tables.push(db.table(session, name)?);
+                }
+            }
             TableRef::Derived { alias, .. } => {
                 if let Some(t) = session.subq.eph.get(alias) {
                     tables.push(t.clone());
                 }
                 aliases.push(alias.clone());
             }
+            // FROM-less subqueries contribute no tables; their refs escape.
+            TableRef::Empty => {}
         }
     }
     Ok(InnerScope { tables, aliases })

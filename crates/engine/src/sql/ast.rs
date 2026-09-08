@@ -44,6 +44,13 @@ pub enum SelectItem {
     /// Bare literal in the projection list (`SELECT 1`, the canonical
     /// `EXISTS (SELECT 1 ...)` body).
     Literal(Datum),
+    /// Zero-argument system function (`version()`, `current_schema()`,
+    /// `current_database()`, `user()`): evaluated per statement from the
+    /// session context, constant across all output rows.
+    SysFunc {
+        name: String,
+        alias: Option<String>,
+    },
 }
 
 /// A standalone SELECT: the reusable unit for top-level statements,
@@ -64,14 +71,18 @@ pub struct SelectStmt {
 pub enum TableRef {
     Table(String),
     Derived { query: Box<SelectStmt>, alias: String },
+    /// FROM-less SELECT (`SELECT version()`): exactly one row, no columns.
+    Empty,
 }
 
 impl TableRef {
-    /// Display name: the table name, or the derived alias.
+    /// Display name: the table name, the derived alias, or `DUAL` for the
+    /// FROM-less single row (MySQL-compatible naming).
     pub fn name(&self) -> &str {
         match self {
             TableRef::Table(n) => n,
             TableRef::Derived { alias, .. } => alias,
+            TableRef::Empty => "DUAL",
         }
     }
 }

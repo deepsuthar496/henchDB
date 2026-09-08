@@ -39,12 +39,13 @@ pub(crate) mod ddl;
 pub(crate) mod diag;
 pub(crate) mod explain;
 pub(crate) mod fk;
+pub(crate) mod join;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub(crate) mod query;
 pub(crate) mod replica;
 pub(crate) mod subquery;
-
+pub(crate) mod sysviews;
 #[cfg(test)]
 mod tests;
 
@@ -71,6 +72,9 @@ use std::time::Duration;
 pub struct Session {
     pub(crate) txn: Option<ActiveTxn>,
     pub current_db: String,
+    /// Authenticated username (empty before login; defaults to `root` for
+    /// local sessions). Backs the `user()` system function.
+    pub user: String,
     pub max_execution_time: Option<Duration>,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
@@ -92,6 +96,7 @@ impl Default for Session {
         Session {
             txn: None,
             current_db: "default".to_string(),
+            user: "root".to_string(),
             max_execution_time: None,
             snapshot: None,
             subq: subquery::SubqueryState::default(),

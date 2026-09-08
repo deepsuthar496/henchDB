@@ -11,6 +11,7 @@ mod fk;
 mod joins;
 mod opt;
 mod subquery;
+mod sysviews;
 mod txn;
 
 fn setup(dir: &Path) -> Database {

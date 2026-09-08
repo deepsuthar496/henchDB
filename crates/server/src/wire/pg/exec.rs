@@ -144,9 +144,15 @@ fn decode_text(oid: u32, text: &str) -> Result<Datum, (String, String)> {
             if let Ok(f) = text.parse::<f64>() {
                 return Ok(Datum::Float(f));
             }
+            // Bool inference is deliberately narrow (`true`/`false` only):
+            // PostgreSQL abbreviations like `t`, `f`, `yes`, `no`, `on`,
+            // `off` are legitimate text values (table `t`, `relkind 'r'`
+            // filters), and an unknown-type parameter compared against a
+            // text column must stay text. (`WHERE boolcol = 'true'` keeps
+            // working; explicit OID 16 params still accept the full set.)
             match text.to_ascii_lowercase().as_str() {
-                "true" | "t" | "yes" | "on" => return Ok(Datum::Bool(true)),
-                "false" | "f" | "no" | "off" => return Ok(Datum::Bool(false)),
+                "true" => return Ok(Datum::Bool(true)),
+                "false" => return Ok(Datum::Bool(false)),
                 _ => {}
             }
             Ok(Datum::Text(text.to_string()))

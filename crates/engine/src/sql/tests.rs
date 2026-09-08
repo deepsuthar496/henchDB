@@ -512,3 +512,98 @@ fn parse_subqueries() {
     assert!(parse_sql("SELECT * FROM (SELECT id FROM t);").is_err());
     assert!(parse_sql("SELECT * FROM (t);").is_err());
 }
+
+#[test]
+fn parse_sysfunc_fromless_and_casts() {
+    // FROM-less system function: one row, no source.
+    let s = parse_sql("SELECT version();").unwrap();
+    match s {
+        Statement::Select { items, from, .. } => {
+            assert_eq!(
+                items,
+                vec![SelectItem::SysFunc { name: "version".into(), alias: None }]
+            );
+            assert!(matches!(from, TableRef::Empty));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // FROM-less literal keeps working (`EXISTS (SELECT 1 ...)` body).
+    let s = parse_sql("SELECT 1;").unwrap();
+    match s {
+        Statement::Select { items, from, .. } => {
+            assert_eq!(items, vec![SelectItem::Literal(Datum::Int(1))]);
+            assert!(matches!(from, TableRef::Empty));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Alias + trailing `::type` suffixes on system functions.
+    let s = parse_sql("SELECT current_schema() AS s FROM t;").unwrap();
+    match s {
+        Statement::Select { items, from, .. } => {
+            assert_eq!(
+                items,
+                vec![SelectItem::SysFunc {
+                    name: "current_schema".into(),
+                    alias: Some("s".into())
+                }]
+            );
+            assert_eq!(from, TableRef::Table("t".into()));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql("SELECT version()::text;").unwrap();
+    match s {
+        Statement::Select { items, .. } => {
+            assert_eq!(
+                items,
+                vec![SelectItem::SysFunc { name: "version".into(), alias: None }]
+            );
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Dotted FROM names (system views, cross-database tables).
+    let s = parse_sql("SELECT * FROM pg_catalog.pg_class;").unwrap();
+    match s {
+        Statement::Select { from, .. } => {
+            assert_eq!(from, TableRef::Table("pg_catalog.pg_class".into()));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    assert!(parse_sql("SELECT * FROM a.b.c;").is_err());
+    // `::` casts desugar at parse time.
+    let s = parse_sql("SELECT * FROM t WHERE relname = 'x'::regclass;").unwrap();
+    match s {
+        Statement::Select { selection, .. } => match selection.unwrap() {
+            Expr::Cmp { left, right, .. } => {
+                assert!(matches!(*left, Expr::Column(_)));
+                assert_eq!(*right, Expr::Literal(Datum::Text("x".into())));
+            }
+            other => panic!("wrong expr {other:?}"),
+        },
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql("SELECT * FROM t WHERE n = '5'::int4;").unwrap();
+    match s {
+        Statement::Select { selection, .. } => match selection.unwrap() {
+            Expr::Cmp { right, .. } => {
+                assert_eq!(*right, Expr::Literal(Datum::Int(5)));
+            }
+            other => panic!("wrong expr {other:?}"),
+        },
+        other => panic!("wrong stmt {other:?}"),
+    }
+    let s = parse_sql("SELECT * FROM t WHERE c::text = 'v';").unwrap();
+    match s {
+        Statement::Select { selection, .. } => match selection.unwrap() {
+            Expr::Cmp { left, .. } => {
+                assert_eq!(*left, Expr::Column("c".into()));
+            }
+            other => panic!("wrong expr {other:?}"),
+        },
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Unknown cast targets and unparsable literals fail closed.
+    assert!(parse_sql("SELECT * FROM t WHERE c = 'v'::money;").is_err());
+    assert!(parse_sql("SELECT * FROM t WHERE n = 'abc'::int4;").is_err());
+    assert!(parse_sql("SELECT * FROM t WHERE n = 1::text::int4;").is_ok());
+}
