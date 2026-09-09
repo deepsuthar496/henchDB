@@ -384,6 +384,14 @@ fn parse_analyze_and_explain() {
         other => panic!("wrong stmt {other:?}"),
     }
 
+    let s = parse_sql("EXPLAIN MEMO SELECT * FROM t WHERE id = 1;").unwrap();
+    match s {
+        Statement::ExplainMemo { statement } => {
+            assert!(matches!(*statement, Statement::Select { .. }));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
     let s = parse_sql("EXPLAIN ANALYZE SELECT a FROM t JOIN u ON t.id = u.id;").unwrap();
     match s {
         Statement::Explain { analyze, statement } => {

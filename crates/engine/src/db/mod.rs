@@ -43,6 +43,7 @@ pub(crate) mod dml;
 pub(crate) mod explain;
 pub(crate) mod fk;
 pub(crate) mod join;
+pub(crate) mod memo;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub mod privilege;
@@ -591,6 +592,9 @@ impl Database {
             Statement::AnalyzeTable { table } => self.exec_analyze(session, &table),
             Statement::Explain { analyze, statement } => {
                 self.exec_explain(session, analyze, &statement)
+            }
+            Statement::ExplainMemo { statement } => {
+                self.exec_explain_memo(session, &statement)
             }
             Statement::CreateTable { name, columns, foreign_keys } => {
                 self.exec_create_table(session, name, columns, foreign_keys)

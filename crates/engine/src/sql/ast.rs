@@ -100,7 +100,7 @@ pub struct JoinClause {
     pub on: Expr,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -352,6 +352,9 @@ pub enum Statement {
     },
     Explain {
         analyze: bool,
+        statement: Box<Statement>,
+    },
+    ExplainMemo {
         statement: Box<Statement>,
     },
     CreateUser {

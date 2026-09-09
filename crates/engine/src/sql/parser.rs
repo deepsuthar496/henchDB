@@ -227,16 +227,23 @@ impl Parser {
             Some("EXPLAIN") => {
                 self.pos += 1;
                 let analyze = self.eat_kw("ANALYZE");
+                let memo = if !analyze { self.eat_kw("MEMO") } else { false };
                 if kw(self.peek()).as_deref() != Some("SELECT") {
                     return Err(Error::ParseError(format!(
                         "EXPLAIN supports SELECT only, got {:?}",
                         self.peek()
                     )));
                 }
-                Ok(Statement::Explain {
-                    analyze,
-                    statement: Box::new(self.parse_select()?),
-                })
+                if memo {
+                    Ok(Statement::ExplainMemo {
+                        statement: Box::new(self.parse_select()?),
+                    })
+                } else {
+                    Ok(Statement::Explain {
+                        analyze,
+                        statement: Box::new(self.parse_select()?),
+                    })
+                }
             }
             Some("DESCRIBE") => {
                 // MySQL synonym for EXPLAIN over a SELECT (table describe

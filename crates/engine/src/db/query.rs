@@ -88,6 +88,13 @@ impl Database {
                 ("cost".into(), ColumnType::Text),
                 ("time_ms".into(), ColumnType::Text),
             ]),
+            Statement::ExplainMemo { .. } => Ok(vec![
+                ("group".into(), ColumnType::BigInt),
+                ("operator".into(), ColumnType::Text),
+                ("cost".into(), ColumnType::Text),
+                ("est_rows".into(), ColumnType::Text),
+                ("detail".into(), ColumnType::Text),
+            ]),
             _ => Ok(vec![]),
         }
     }

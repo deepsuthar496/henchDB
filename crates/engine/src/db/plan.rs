@@ -10,8 +10,8 @@ use crate::types::{ColumnType, Datum};
 // Access-path selection (index-aware WHERE analysis)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub(crate) enum AccessPath {
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessPath {
     Point(Datum),
     /// Multi-point seek for `pk IN (...)` (list order preserved).
     PkIn(Vec<Datum>),

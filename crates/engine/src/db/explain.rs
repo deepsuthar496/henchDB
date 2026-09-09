@@ -221,4 +221,62 @@ impl Database {
         };
         Ok(Output { columns, rows, message: "OK".into() })
     }
+
+    pub(super) fn exec_explain_memo(
+        &self,
+        session: &mut Session,
+        inner: &Statement,
+    ) -> Result<Output> {
+        let Statement::Select {
+            items,
+            from,
+            joins,
+            selection,
+            order_by,
+            limit,
+            group_by,
+        } = inner.clone()
+        else {
+            return Err(Error::NotSupported("EXPLAIN MEMO supports SELECT only".into()));
+        };
+        let select_stmt = crate::sql::SelectStmt {
+            items,
+            from: from.clone(),
+            joins: joins.clone(),
+            selection,
+            order_by,
+            limit,
+            group_by,
+        };
+        let saved = subquery::setup_derived(self, session, &from, &joins)?;
+        let res = self.optimize_select_memo(session, &select_stmt);
+        subquery::teardown_derived(session, saved);
+        let (memo, root_group, best) = res?;
+
+        let mut rows = Vec::new();
+        if let Some(plan) = best {
+            plan.collect_explain_rows(root_group, &mut rows);
+        } else {
+            rows.push(vec![
+                Datum::Int(root_group as i64),
+                Datum::Text("No feasible physical plan found".into()),
+                Datum::Text("0.00".into()),
+                Datum::Text("0.0".into()),
+                Datum::Null,
+            ]);
+        }
+
+        let columns = vec![
+            "group".into(),
+            "operator".into(),
+            "cost".into(),
+            "est_rows".into(),
+            "detail".into(),
+        ];
+        Ok(Output {
+            columns,
+            rows,
+            message: format!("OK (memo explored {} groups)", memo.num_groups()),
+        })
+    }
 }

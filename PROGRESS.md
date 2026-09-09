@@ -29,7 +29,7 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **269/269 tests passing** (185 engine + 84 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, `wire/`, `net/`, and `replication/` cleanly modularized).
+- **Quality & Size Ceiling**: **275/275 tests passing** (191 engine + 84 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, `wire/`, `net/`, and `replication/` cleanly modularized).
 ---
 
 ## 2. What was done, in order (with the "how")
@@ -156,7 +156,7 @@ comment in git history and in README.
 | Early Lock Release, column-granular versioning (RCC-C) | ❌ | backlog F3 |
 | Per-core distributed WAL | ❌ single shared WAL | backlog F6 |
 | io_uring polled I/O (`IOPOLL`, `O_DIRECT`) | ❌ Linux-only; needs `cfg` gating + portable fallback | backlog F6 |
-| Cascades memo optimizer | ❌ (heuristic access-path selection only) | backlog F5 |
+| Cascades memo optimizer | ✅ done (Priority 19 Equivalence Classes, Commutativity/Associativity, Predicate Pushdown, Hash/NL Join & Batch/Index lowerings, branch-and-bound pruning, EXPLAIN MEMO) | `db/memo.rs` |
 | Hash joins (equi-key build/probe, INNER + LEFT) | ✅ done (smaller-side build, residual ON filter, NULL/NaN-safe keys) | `db/plan.rs`, `db/query.rs` |
 | Morsel-driven parallelism, ColumnBatch vectorized execution & direct raw-to-columnar storage sourcing | ✅ done (Priority 15 ColumnBatch + Priority 18 direct raw-to-columnar leaf scans & zero-alloc batching) | `db/batch.rs`, `btree.rs` |
 | Wire Encryption (TLS / SSL - SEC2) | ❌ plaintext with SHA-256 challenge auth | backlog SEC2 |
@@ -523,8 +523,23 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 
 ---
 
+### 19. 🌲 Priority 19: Cascades Memo Query Optimizer & Equivalence Classes
+* **Status**: ✅ **COMPLETED**
+* **Why it mattered**: Complex multi-table joins, subqueries, and mixed index/batch access paths relied on greedy heuristics. A Cascades Memo query optimizer provides systematic exploration of logically equivalent plans via Equivalence Classes (`Group`s), transformation rules (join commutativity, associativity, predicate pushdown), implementation rules (TableScan, IndexScan, BatchScan, HashJoin L/R, NestedLoopJoin, BatchAggregate, ScalarAggregate), cost-based branch-and-bound pruning, and bounded search depth to guarantee low microsecond OLTP planning overhead.
+* **Delivered**:
+  - `db/memo.rs` (1,428 lines, `std`-only): Memo container with Equivalence Classes (`Group`), deduplicating logical operators (`LogicalOp`) via hash-consing; logical property derivation (`LogicalProperties`: cardinality, schemas, output columns);
+  - Transformation Rules: Join Commutativity ($A \bowtie B \equiv B \bowtie A$), Join Associativity ($(A \bowtie B) \bowtie C \equiv A \bowtie (B \bowtie C)$), and Predicate Pushdown through Inner Joins (decomposing WHERE conjunctions and routing single-table filters to respective child groups while retaining multi-table residual join predicates);
+  - Implementation Rules: TableScan, IndexScan (PK point/range/IN, secondary seek/IN), Vectorized BatchScan (`ColumnBatch`), HashJoin (costing Left-build vs Right-build based on cardinality), NestedLoopJoin, BatchAggregate, ScalarAggregate;
+  - Cost-Based Search Engine: Branch-and-bound cost limits pruning suboptimal subtrees early, with bounded recursion depth protecting OLTP latency; best physical plan extraction (`extract_best_plan`) and formatted plan tree display (`format_tree`, `collect_explain_rows`);
+  - SQL Integration: `EXPLAIN MEMO SELECT ...` statement parsed and executed, rendering the optimal physical plan tree and memo exploration metrics;
+  - Strict 1,500-line file ceiling compliance across all repository files (`check_lines.py` verified).
+* **Evidence**: 275/275 green (incl. 6 new unit and integration tests: group deduplication, commutativity, associativity, predicate pushdown, hash join build-side selection, and SQL explain memo integration); `cargo check --release` with zero warnings.
+* **Effort**: High.
+
+---
+
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**269 tests: 185 engine + 84 server** as of this writing).
+1. `cargo test` — all green (**275 tests: 191 engine + 84 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.
