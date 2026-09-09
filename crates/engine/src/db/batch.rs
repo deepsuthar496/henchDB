@@ -126,73 +126,219 @@ impl Column {
 }
 
 impl ColumnBatch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         ColumnBatch { cols: Vec::new(), sel: Vec::new() }
     }
 
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         for c in self.cols.iter_mut() {
             c.clear();
         }
         self.sel.clear();
     }
-}
 
-/// Decode up to `MORSEL` rows into columnar form, decoding only `need`
-/// columns (projection pushdown: filters, aggregates, and group keys name
-/// exactly what they touch — wide-table COUNT(*) queries never pay for
-/// text memcpy). Column allocations persist across chunks (cleared, never
-/// reallocated after warmup); unneeded positions stay empty and are never
-/// touched downstream. `None` means the data does not match the schema
-/// kinds (mixed-type ephemeral columns) — the caller falls back to the
-/// scalar executor, which handles them.
-pub(super) fn decode_morsel(
-    batch: &mut ColumnBatch,
-    schema: &Schema,
-    rows: &[Vec<Datum>],
-    need: &[bool],
-) -> Option<()> {
-    let n = rows.len().min(MORSEL);
-    // (Re)shape on layout change only (first chunk); otherwise reuse.
-    let mut shaped = batch.cols.len() == schema.columns.len();
-    if shaped {
-        for (col, c) in batch.cols.iter().zip(schema.columns.iter()) {
-            let kind = match col {
-                Column::I64 { .. } => 0,
-                Column::F64 { .. } => 1,
-                Column::Bool { .. } => 2,
-                Column::Str { .. } => 3,
-                Column::DateTime { .. } => 4,
-            };
-            if kind != col_kind(c.ctype) {
-                shaped = false;
-                break;
+    #[allow(dead_code)]
+    pub(super) fn selection(&self) -> &[u16] {
+        &self.sel
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn len(&self) -> usize {
+        self.sel.len()
+    }
+
+    /// (Re)shape the batch columns on schema change, clearing old contents
+    /// and pre-reserving capacity for active columns.
+    pub(super) fn prepare_morsel(&mut self, schema: &Schema, need: &[bool], cap: usize) {
+        let mut shaped = self.cols.len() == schema.columns.len();
+        if shaped {
+            for (col, c) in self.cols.iter().zip(schema.columns.iter()) {
+                let kind = match col {
+                    Column::I64 { .. } => 0,
+                    Column::F64 { .. } => 1,
+                    Column::Bool { .. } => 2,
+                    Column::Str { .. } => 3,
+                    Column::DateTime { .. } => 4,
+                };
+                if kind != col_kind(c.ctype) {
+                    shaped = false;
+                    break;
+                }
+            }
+        }
+        if !shaped {
+            self.cols.clear();
+            for c in &schema.columns {
+                match col_kind(c.ctype) {
+                    0 => self.cols.push(Column::I64 { vals: Vec::new(), null: Vec::new() }),
+                    1 => self.cols.push(Column::F64 { vals: Vec::new(), null: Vec::new() }),
+                    2 => self.cols.push(Column::Bool { vals: Vec::new(), null: Vec::new() }),
+                    3 => self.cols.push(Column::Str { data: Vec::new(), off: Vec::new(), null: Vec::new() }),
+                    _ => self.cols.push(Column::DateTime { vals: Vec::new(), null: Vec::new() }),
+                }
+            }
+        }
+        self.clear();
+        for (ci, col) in self.cols.iter_mut().enumerate() {
+            if need.get(ci).copied().unwrap_or(false) {
+                col.reserve(cap);
             }
         }
     }
-    if !shaped {
-        batch.cols.clear();
-        for c in &schema.columns {
-            match col_kind(c.ctype) {
-                0 => batch.cols.push(Column::I64 { vals: Vec::new(), null: Vec::new() }),
-                1 => batch.cols.push(Column::F64 { vals: Vec::new(), null: Vec::new() }),
-                2 => batch.cols.push(Column::Bool { vals: Vec::new(), null: Vec::new() }),
-                3 => batch.cols.push(Column::Str { data: Vec::new(), off: Vec::new(), null: Vec::new() }),
-                _ => batch.cols.push(Column::DateTime { vals: Vec::new(), null: Vec::new() }),
+
+    /// Decode one raw encoded row directly into active column buffers without
+    /// allocating intermediate Datum values. Unprojected columns (`need[ci] == false`)
+    /// are skipped by offset with zero copies or string allocations.
+    pub(super) fn push_raw_row(
+        &mut self,
+        _schema: &Schema,
+        buf: &[u8],
+        need: &[bool],
+    ) -> Option<()> {
+        let mut off = 0usize;
+        for (ci, col) in self.cols.iter_mut().enumerate() {
+            let needed = need.get(ci).copied().unwrap_or(false);
+            let tag = *buf.get(off)?;
+            off += 1;
+            match tag {
+                0 => {
+                    if needed {
+                        match col {
+                            Column::I64 { vals, null } => {
+                                vals.push(0);
+                                null.push(1);
+                            }
+                            Column::F64 { vals, null } => {
+                                vals.push(0.0);
+                                null.push(1);
+                            }
+                            Column::Bool { vals, null } => {
+                                vals.push(false);
+                                null.push(1);
+                            }
+                            Column::Str { data, off: str_off, null } => {
+                                if str_off.is_empty() {
+                                    str_off.push(0);
+                                }
+                                str_off.push(data.len());
+                                null.push(1);
+                            }
+                            Column::DateTime { vals, null } => {
+                                vals.push(0);
+                                null.push(1);
+                            }
+                        }
+                    }
+                }
+                1 => {
+                    if off + 8 > buf.len() {
+                        return None;
+                    }
+                    if needed {
+                        let v = i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                        match col {
+                            Column::I64 { vals, null } => {
+                                vals.push(v);
+                                null.push(0);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    off += 8;
+                }
+                2 => {
+                    if off + 8 > buf.len() {
+                        return None;
+                    }
+                    if needed {
+                        let v = f64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                        match col {
+                            Column::F64 { vals, null } => {
+                                vals.push(v);
+                                null.push(0);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    off += 8;
+                }
+                3 => {
+                    if off + 4 > buf.len() {
+                        return None;
+                    }
+                    let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                    off += 4;
+                    if off + len > buf.len() {
+                        return None;
+                    }
+                    if needed {
+                        match col {
+                            Column::Str { data, off: str_off, null } => {
+                                if str_off.is_empty() {
+                                    str_off.push(0);
+                                }
+                                data.extend_from_slice(&buf[off..off + len]);
+                                str_off.push(data.len());
+                                null.push(0);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    off += len;
+                }
+                4 => {
+                    if off + 1 > buf.len() {
+                        return None;
+                    }
+                    if needed {
+                        let v = buf[off] != 0;
+                        match col {
+                            Column::Bool { vals, null } => {
+                                vals.push(v);
+                                null.push(0);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    off += 1;
+                }
+                5 => {
+                    if off + 8 > buf.len() {
+                        return None;
+                    }
+                    if needed {
+                        let v = i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                        match col {
+                            Column::DateTime { vals, null } => {
+                                vals.push(v);
+                                null.push(0);
+                            }
+                            _ => return None,
+                        }
+                    }
+                    off += 8;
+                }
+                _ => return None,
             }
         }
+        if off != buf.len() {
+            return None;
+        }
+        Some(())
     }
-    batch.clear();
-    for col in batch.cols.iter_mut() {
-        col.reserve(n);
-    }
-    batch.sel.extend(0..n as u16);
-    for r in rows.iter().take(n) {
-        for (ci, col) in batch.cols.iter_mut().enumerate() {
+
+    /// Decode one Datum-slice row (used by staged overlays and snapshot history).
+    pub(super) fn push_datum_row(
+        &mut self,
+        _schema: &Schema,
+        row: &[Datum],
+        need: &[bool],
+    ) -> Option<()> {
+        for (ci, col) in self.cols.iter_mut().enumerate() {
             if !need.get(ci).copied().unwrap_or(false) {
                 continue;
             }
-            let d = r.get(ci)?;
+            let d = row.get(ci)?;
             match (col, d) {
                 (Column::I64 { vals, null }, Datum::Int(v)) => {
                     vals.push(*v);
@@ -246,19 +392,42 @@ pub(super) fn decode_morsel(
                 _ => return None,
             }
         }
+        Some(())
     }
-    // Every decoded Str column must expose `n + 1` offsets even when the
-    // chunk holds no values for it (uniform indexing downstream).
-    for (ci, col) in batch.cols.iter_mut().enumerate() {
-        if !need.get(ci).copied().unwrap_or(false) {
-            continue;
-        }
-        if let Column::Str { off, .. } = col {
-            if off.is_empty() {
-                off.push(0);
+
+    /// Seal the current morsel: populate selection vector and initialize text offsets.
+    pub(super) fn finish_morsel(&mut self, need: &[bool], count: usize) {
+        self.sel.clear();
+        self.sel.extend(0..count as u16);
+        for (ci, col) in self.cols.iter_mut().enumerate() {
+            if !need.get(ci).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Column::Str { off, .. } = col {
+                if off.is_empty() {
+                    off.push(0);
+                }
             }
         }
     }
+}
+
+/// Decode up to `MORSEL` rows into columnar form, decoding only `need`
+/// columns (projection pushdown). Reuses `prepare_morsel`, `push_datum_row`,
+/// and `finish_morsel`.
+#[allow(dead_code)]
+pub(super) fn decode_morsel(
+    batch: &mut ColumnBatch,
+    schema: &Schema,
+    rows: &[Vec<Datum>],
+    need: &[bool],
+) -> Option<()> {
+    let n = rows.len().min(MORSEL);
+    batch.prepare_morsel(schema, need, n);
+    for r in rows.iter().take(n) {
+        batch.push_datum_row(schema, r, need)?;
+    }
+    batch.finish_morsel(need, n);
     Some(())
 }
 
@@ -960,6 +1129,132 @@ pub(super) fn applicable(
     ))
 }
 
+/// Stream morsels through the batch pipeline: direct raw leaf scan on the
+/// fast path (no intermediate Vec<Datum>), falling back to visible_rows
+/// when staged writes or consistent snapshots require overlay/history resolution.
+fn scan_batch_morsels<F>(
+    db: &Database,
+    session: &Session,
+    table: &Arc<Table>,
+    schema: &Schema,
+    selection: Option<&Expr>,
+    need: &[bool],
+    deadline: Option<std::time::Instant>,
+    mut on_morsel: F,
+) -> Result<Option<()>>
+where
+    F: FnMut(&mut ColumnBatch) -> Result<()>,
+{
+    let has_overlay = session.txn.as_ref().map_or(false, |t| {
+        t.staged.iter().any(|((tbl, _), _)| tbl == &table.def.name)
+    });
+    let has_snapshot = session.snapshot.is_some();
+
+    if has_overlay || has_snapshot {
+        // Staged writes or consistent snapshot: route through visible_rows for
+        // exact time-travel / overlay ordering, then morsel-decode.
+        let rows = db.visible_rows(session, table, None)?;
+        let mut batch = ColumnBatch::new();
+        let mut off = 0usize;
+        while off < rows.len() {
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() > dl {
+                    return Err(Error::QueryTimeout);
+                }
+            }
+            let end = (off + MORSEL).min(rows.len());
+            let n = end - off;
+            batch.prepare_morsel(schema, need, n);
+            for r in &rows[off..end] {
+                if batch.push_datum_row(schema, r, need).is_none() {
+                    return Ok(None);
+                }
+            }
+            batch.finish_morsel(need, n);
+            if let Some(sel) = selection {
+                if filter_batch(&mut batch, schema, sel).is_none() {
+                    return Ok(None);
+                }
+            }
+            on_morsel(&mut batch)?;
+            off = end;
+        }
+        return Ok(Some(()));
+    }
+
+    // Fast path: direct raw leaf scan from B+ tree without intermediate Vec<Datum>.
+    let mut batch = ColumnBatch::new();
+    batch.prepare_morsel(schema, need, MORSEL);
+    let mut row_count = 0usize;
+    let mut check_counter = 0usize;
+    let mut decode_error = false;
+    let mut timeout_error = false;
+    let mut morsel_err: Option<Error> = None;
+
+    table.tree().scan_leaves(|_keys, vals| {
+        for raw in vals {
+            check_counter += 1;
+            if check_counter % 256 == 0 {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        timeout_error = true;
+                        return false;
+                    }
+                }
+            }
+            let resolved = match table.resolve_value(raw) {
+                Ok(r) => r,
+                Err(_) => {
+                    decode_error = true;
+                    return false;
+                }
+            };
+            if batch.push_raw_row(schema, &resolved, need).is_none() {
+                decode_error = true;
+                return false;
+            }
+            row_count += 1;
+            if row_count == MORSEL {
+                batch.finish_morsel(need, row_count);
+                if let Some(sel) = selection {
+                    if filter_batch(&mut batch, schema, sel).is_none() {
+                        decode_error = true;
+                        return false;
+                    }
+                }
+                if let Err(e) = on_morsel(&mut batch) {
+                    morsel_err = Some(e);
+                    return false;
+                }
+                batch.prepare_morsel(schema, need, MORSEL);
+                row_count = 0;
+            }
+        }
+        true
+    });
+
+    if timeout_error {
+        return Err(Error::QueryTimeout);
+    }
+    if let Some(err) = morsel_err {
+        return Err(err);
+    }
+    if decode_error {
+        return Ok(None);
+    }
+    if row_count > 0 {
+        batch.finish_morsel(need, row_count);
+        if let Some(sel) = selection {
+            if filter_batch(&mut batch, schema, sel).is_none() {
+                return Ok(None);
+            }
+        }
+        on_morsel(&mut batch)?;
+    }
+
+    Ok(Some(()))
+}
+
 /// Global aggregation over a single table through the batch path.
 /// `Ok(None)` = not eligible or undecodable — the caller runs the scalar
 /// executor. Otherwise returns the finished single-row output.
@@ -1001,36 +1296,31 @@ pub(super) fn try_global_agg(
         })
         .collect();
     let need = need_mask(schema, selection, &extra);
-    // Source rows exactly like the scalar path (same access plan, snapshot,
-    // overlay, and ORDER — float sums follow suit bit for bit).
-    let rows = db.visible_rows(session, table, None)?;
     let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
-    let mut batch = ColumnBatch::new();
-    let mut off = 0usize;
-    while off < rows.len() {
-        if let Some(dl) = deadline {
-            if std::time::Instant::now() > dl {
-                return Err(Error::QueryTimeout);
+
+    let res = scan_batch_morsels(
+        db,
+        session,
+        table,
+        schema,
+        selection,
+        &need,
+        deadline,
+        |batch| {
+            for item in items.iter_mut() {
+                match item {
+                    Item::Count(n) => *n += batch.sel.len() as u64,
+                    Item::Fold { col, fold, .. } => fold_column(batch, *col, fold)?,
+                    Item::Const => {}
+                }
             }
-        }
-        let end = (off + MORSEL).min(rows.len());
-        if decode_morsel(&mut batch, schema, &rows[off..end], &need).is_none() {
-            return Ok(None);
-        }
-        if let Some(sel) = selection {
-            if filter_batch(&mut batch, schema, sel).is_none() {
-                return Ok(None);
-            }
-        }
-        for item in items.iter_mut() {
-            match item {
-                Item::Count(n) => *n += batch.sel.len() as u64,
-                Item::Fold { col, fold, .. } => fold_column(&batch, *col, fold)?,
-                Item::Const => {}
-            }
-        }
-        off = end;
+            Ok(())
+        },
+    )?;
+    if res.is_none() {
+        return Ok(None);
     }
+
     let mut out_row = Vec::with_capacity(aggs.len());
     let mut out_columns = Vec::with_capacity(aggs.len());
     for ((spec, name), item) in aggs.iter().zip(items.into_iter()) {
@@ -1101,42 +1391,38 @@ pub(super) fn try_grouped_agg(
         extra.push(*c);
     }
     let need = need_mask(schema, selection, &extra);
-    let rows = db.visible_rows(session, table, None)?;
     let deadline = session.max_execution_time.map(|t| std::time::Instant::now() + t);
     let mut groups: std::collections::BTreeMap<Vec<Datum>, GroupAcc> = Default::default();
-    let mut batch = ColumnBatch::new();
-    let mut off = 0usize;
-    while off < rows.len() {
-        if let Some(dl) = deadline {
-            if std::time::Instant::now() > dl {
-                return Err(Error::QueryTimeout);
-            }
-        }
-        let end = (off + MORSEL).min(rows.len());
-        if decode_morsel(&mut batch, schema, &rows[off..end], &need).is_none() {
-            return Ok(None);
-        }
-        if let Some(sel) = selection {
-            if filter_batch(&mut batch, schema, sel).is_none() {
-                return Ok(None);
-            }
-        }
-        for &i in &batch.sel {
-            let r = i as usize;
-            let key: Vec<Datum> =
-                key_idx.iter().map(|&k| cell_datum(&batch, k, r)).collect();
-            let g = groups.entry(key).or_insert_with(|| GroupAcc {
-                count: 0,
-                folds: template.iter().map(|f| f.map(fold_for)).collect(),
-            });
-            g.count += 1;
-            for (pi, f) in g.folds.iter_mut().enumerate() {
-                if let Some(fold) = f {
-                    fold_cell(&batch, agg_col[pi].expect("fold column"), r, fold)?;
+
+    let res = scan_batch_morsels(
+        db,
+        session,
+        table,
+        schema,
+        selection,
+        &need,
+        deadline,
+        |batch| {
+            for &i in &batch.sel {
+                let r = i as usize;
+                let key: Vec<Datum> =
+                    key_idx.iter().map(|&k| cell_datum(batch, k, r)).collect();
+                let g = groups.entry(key).or_insert_with(|| GroupAcc {
+                    count: 0,
+                    folds: template.iter().map(|f| f.map(fold_for)).collect(),
+                });
+                g.count += 1;
+                for (pi, f) in g.folds.iter_mut().enumerate() {
+                    if let Some(fold) = f {
+                        fold_cell(batch, agg_col[pi].expect("fold column"), r, fold)?;
+                    }
                 }
             }
-        }
-        off = end;
+            Ok(())
+        },
+    )?;
+    if res.is_none() {
+        return Ok(None);
     }
     // Abort before emitting anything when a fold failed: errors surface
     // identically to the scalar path (whole query fails).

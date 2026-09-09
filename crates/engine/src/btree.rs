@@ -474,6 +474,54 @@ impl BTree {
         self.range(None, true, None, true)
     }
 
+    /// Full scan in leaf chunks (used by the raw batch executor to stream
+    /// leaf values without materializing the full tree in memory).
+    pub fn scan_leaves<F>(&self, mut callback: F)
+    where
+        F: FnMut(&[Vec<u8>], &[Vec<u8>]) -> bool,
+    {
+        let _pin = self.pin_op();
+        let mut node = self.current_root();
+        loop {
+            let version = node.latch.wait_and_version();
+            match node.body() {
+                NodeBody::Leaf { .. } => {
+                    if !node.latch.validate(version) {
+                        node = self.current_root();
+                        continue;
+                    }
+                    break;
+                }
+                NodeBody::Internal { children, .. } => {
+                    let child = children[0].clone();
+                    if !node.latch.validate(version) {
+                        node = self.current_root();
+                        continue;
+                    }
+                    node = child;
+                }
+            }
+        }
+        loop {
+            let version = node.latch.wait_and_version();
+            let (keys, vals, next) = match node.body() {
+                NodeBody::Leaf { keys, vals, next, .. } => (keys.clone(), vals.clone(), next.clone()),
+                NodeBody::Internal { .. } => break,
+            };
+            if !node.latch.validate(version) {
+                continue;
+            }
+            if !callback(&keys, &vals) {
+                break;
+            }
+            if let Some(n) = next {
+                node = n;
+            } else {
+                break;
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.scan_all().len()
     }

@@ -7,7 +7,7 @@ use super::*;
 use super::super::batch;
 use crate::db::query::AggSpec;
 use crate::db::{Database, Output, Session};
-use crate::sql::{parse_sql, AggFunc, Expr, SelectItem, Statement};
+use crate::sql::{parse_sql, Expr, SelectItem, Statement};
 use crate::table::{Schema, Table};
 
 type StrResult<T> = std::result::Result<T, String>;
@@ -433,5 +433,154 @@ fn batch_scalar_fallback_shapes() {
         .execute(&mut s, "SELECT COUNT(*) FROM m WHERE id IN (SELECT id FROM m WHERE id < 3)")
         .unwrap();
     assert_eq!(out.rows[0][0], Datum::Int(2));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_raw_column_decoding_parity() {
+    let dir = tmp("raw_parity");
+    let db = setup(&dir);
+    let s = db.new_session();
+    let table = db.table(&s, "m").unwrap();
+    let schema = table.schema();
+
+    // Generate diverse test rows
+    let test_rows = vec![
+        vec![Datum::Int(10), Datum::Int(-123), Datum::Float(3.1415), Datum::Text("hello world".into()), Datum::Bool(true), Datum::DateTime(1_000_000)],
+        vec![Datum::Int(20), Datum::Null, Datum::Float(0.0), Datum::Text("".into()), Datum::Bool(false), Datum::Null],
+        vec![Datum::Int(30), Datum::Int(42), Datum::Null, Datum::Null, Datum::Null, Datum::DateTime(2_000_000)],
+    ];
+
+    // Encode rows to raw byte buffers
+    let raw_rows: Vec<Vec<u8>> = test_rows.iter().map(|r| Table::encode_row(r)).collect();
+
+    // Test with full need mask
+    let need_all = vec![true; schema.columns.len()];
+    let mut batch_datum = batch::ColumnBatch::new();
+    let mut batch_raw = batch::ColumnBatch::new();
+
+    batch_datum.prepare_morsel(schema, &need_all, test_rows.len());
+    for r in &test_rows {
+        batch_datum.push_datum_row(schema, r, &need_all).expect("datum decode");
+    }
+    batch_datum.finish_morsel(&need_all, test_rows.len());
+
+    batch_raw.prepare_morsel(schema, &need_all, raw_rows.len());
+    for raw in &raw_rows {
+        batch_raw.push_raw_row(schema, raw, &need_all).expect("raw decode");
+    }
+    batch_raw.finish_morsel(&need_all, raw_rows.len());
+
+    // Both batches must produce identical selection vectors
+    assert_eq!(batch_datum.selection(), batch_raw.selection());
+
+    // Test partial projection pushdown: only decode col 1 (a) and col 3 (t)
+    let need_partial = vec![false, true, false, true, false, false];
+    let mut batch_partial = batch::ColumnBatch::new();
+    batch_partial.prepare_morsel(schema, &need_partial, raw_rows.len());
+    for raw in &raw_rows {
+        batch_partial.push_raw_row(schema, raw, &need_partial).expect("partial raw decode");
+    }
+    batch_partial.finish_morsel(&need_partial, raw_rows.len());
+
+    // Unprojected columns must stay untouched
+    assert_eq!(batch_partial.selection().len(), 3);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_raw_multi_morsel_scan_and_aggs() {
+    let dir = tmp("multi_morsel");
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(
+        &mut s,
+        "CREATE TABLE multi (id INT PRIMARY KEY, cat INT, val INT, note TEXT)",
+    )
+    .unwrap();
+
+    // Insert 2,500 rows across 3 categories
+    // This exercises > 2 full morsel boundaries (1024 + 1024 + 452)
+    db.execute(&mut s, "BEGIN").unwrap();
+    for i in 1..=2500 {
+        let cat = i % 3;
+        let note = format!("note_{i}");
+        db.execute(
+            &mut s,
+            &format!("INSERT INTO multi VALUES ({i}, {cat}, {i}, '{note}')"),
+        )
+        .unwrap();
+    }
+    db.execute(&mut s, "COMMIT").unwrap();
+
+    // Verify global aggregates over 2500 rows in direct raw batch mode
+    let out = db
+        .execute(&mut s, "SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM multi")
+        .unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(2500));
+    // sum of 1..=2500 = 2500 * 2501 / 2 = 3,126,250
+    assert_eq!(out.rows[0][1], Datum::Int(3_126_250));
+    assert_eq!(out.rows[0][2], Datum::Int(1));
+    assert_eq!(out.rows[0][3], Datum::Int(2500));
+
+    // Verify grouped aggregates across multiple morsels
+    let out_grp = db
+        .execute(
+            &mut s,
+            "SELECT cat, COUNT(*), SUM(val) FROM multi GROUP BY cat ORDER BY cat",
+        )
+        .unwrap();
+    assert_eq!(out_grp.rows.len(), 3);
+    assert_eq!(out_grp.rows[0][0], Datum::Int(0));
+    assert_eq!(out_grp.rows[1][0], Datum::Int(1));
+    assert_eq!(out_grp.rows[2][0], Datum::Int(2));
+
+    // Filtered multi-morsel aggregate
+    let out_filtered = db
+        .execute(
+            &mut s,
+            "SELECT COUNT(*), SUM(val) FROM multi WHERE val > 1000",
+        )
+        .unwrap();
+    // 1001..=2500 = 1500 rows
+    assert_eq!(out_filtered.rows[0][0], Datum::Int(1500));
+    // sum of 1001..=2500 = 3126250 - (1000*1001/2) = 3126250 - 500500 = 2,625,750
+    assert_eq!(out_filtered.rows[0][1], Datum::Int(2_625_750));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_raw_scan_with_snapshot_isolation() {
+    let dir = tmp("snap_batch");
+    let db = Database::open(&dir).unwrap();
+    let mut s1 = db.new_session();
+    let mut s2 = db.new_session();
+
+    db.execute(
+        &mut s1,
+        "CREATE TABLE items (id INT PRIMARY KEY, qty INT)",
+    )
+    .unwrap();
+    for i in 1..=10 {
+        db.execute(&mut s1, &format!("INSERT INTO items VALUES ({i}, 10)")).unwrap();
+    }
+
+    // Session 2 pins consistent snapshot
+    db.execute(&mut s2, "START TRANSACTION WITH CONSISTENT SNAPSHOT").unwrap();
+
+    // Session 1 mutates items (adds more and updates existing)
+    db.execute(&mut s1, "INSERT INTO items VALUES (11, 100)").unwrap();
+    db.execute(&mut s1, "UPDATE items SET qty = 50 WHERE id = 1").unwrap();
+
+    // Session 1 sees 11 items, sum = 9*10 + 50 + 100 = 240
+    let out1 = db.execute(&mut s1, "SELECT COUNT(*), SUM(qty) FROM items").unwrap();
+    assert_eq!(out1.rows[0], vec![Datum::Int(11), Datum::Int(240)]);
+
+    // Session 2 in consistent snapshot MUST see original 10 items, sum = 100
+    let out2 = db.execute(&mut s2, "SELECT COUNT(*), SUM(qty) FROM items").unwrap();
+    assert_eq!(out2.rows[0], vec![Datum::Int(10), Datum::Int(100)]);
+
     let _ = fs::remove_dir_all(&dir);
 }

@@ -79,6 +79,7 @@ impl Shard {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
@@ -139,6 +140,7 @@ impl ShardPool {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn queued_segments(&self) -> usize {
         self.shards.iter().map(|s| s.len()).sum()
     }
