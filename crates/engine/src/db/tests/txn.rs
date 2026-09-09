@@ -301,3 +301,77 @@ fn snapshot_concurrent_writer_stress() {
     assert_eq!(mvcc_val(&db, &mut f, 1).as_deref(), Some("w199"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Priority 17: checkpoint/reset waves between concurrent commit bursts,
+/// with WAL archiving on — every burst must survive exactly once, and the
+/// archived segments must partition the full history (no lost bytes between
+/// the live log and the archive). Checkpoints run between waves (never
+/// racing installs) for deterministic counts.
+#[test]
+fn checkpoint_waves_and_archive_chain_under_load() {
+    use crate::archive::{list_segments, read_segment_payload};
+    use crate::wal::Wal;
+    let dir = std::env::temp_dir().join(format!("hdbwaves_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = std::sync::Arc::new(setup(&dir));
+    let adir = dir.join("archive");
+    db.set_archive_dir(&adir).unwrap();
+    const WAVES: u64 = 3;
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 150;
+    for wave in 0..WAVES {
+        let mut handles = Vec::new();
+        for w in 0..THREADS {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut s = db.new_session();
+                for i in 0..PER_THREAD {
+                    let id = (wave * THREADS * PER_THREAD + w * PER_THREAD + i) as i64;
+                    db.execute(&mut s, &format!("INSERT INTO t VALUES ({id}, 'w{id}', 1.0)"))
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut s = db.new_session();
+        db.execute(&mut s, "CHECKPOINT").unwrap();
+    }
+    let total = (WAVES * THREADS * PER_THREAD) as i64;
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(total));
+    drop(db);
+    // Reopen from snapshot + truncated WAL: same exact count.
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(total));
+    // Archive completeness: segment payloads across all generations hold
+    // exactly the wave history (puts + commits, disjoint partition).
+    let segs = list_segments(&adir).unwrap();
+    assert_eq!(segs.len(), WAVES as usize);
+    let mut puts = 0u64;
+    let mut commits = 0u64;
+    for seg in &segs {
+        assert_eq!(seg.meta.start_offset, 8, "each generation restarts at 8");
+        assert!(seg.meta.end_offset > seg.meta.start_offset);
+        let payload = read_segment_payload(&seg.path, &seg.meta).unwrap();
+        let (recs, consumed) = Wal::decode_wal_range(&payload, false).unwrap();
+        assert_eq!(consumed, payload.len(), "segment fully decodable");
+        for r in recs {
+            match r {
+                crate::wal::Record::Put { .. } => puts += 1,
+                crate::wal::Record::Commit { .. } => commits += 1,
+                // Setup DDL rides along in the first segment; only the
+                // per-row Put+Commit pairs must partition exactly.
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(puts, total as u64);
+    // +1: the setup CREATE TABLE carries its own Commit marker.
+    assert_eq!(commits, total as u64 + 1);
+    let _ = fs::remove_dir_all(&dir);
+}

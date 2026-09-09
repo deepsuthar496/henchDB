@@ -9,10 +9,13 @@
 //! record; recovery ignores trailing records without a matching Commit, which
 //! makes crash recovery an idempotent redo of committed transactions.
 //!
-//! v0.1 uses a single serialized log file with `sync_data` per commit batch
-//! (correct, portable). The research doc's per-core distributed WAL with
-//! io_uring group commit is the roadmap item; the `append_batch` seam below
-//! is where it plugs in.
+//! v0.1 uses a single log file with per-core staging shards (Priority 17):
+//! commits reserve offsets atomically, stage bytes into shard FIFOs without
+//! touching the file lock, and one background syncer drains all shards in
+//! offset order into one write + `sync_data` per round (correct, portable).
+//! The research doc's lock-free commit pipeline and io_uring group commit
+//! stay roadmap items; the syncer's single ordered write is their seam
+//! (see `wal/shard.rs`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -23,6 +26,8 @@ use crate::error::{Error, Result};
 use crate::table::TableDef;
 use crate::types::{ColumnType, Datum};
 use std::io::Seek;
+
+mod shard;
 
 pub const WAL_MAGIC: &[u8; 4] = b"HDBW";
 /// v2 adds the per-column AUTO_INCREMENT byte to table defs (F7). v3 adds
@@ -92,19 +97,27 @@ pub enum Record {
     },
 }
 
-/// Shared between `Wal` and the background syncer thread.
+/// Shared between `Wal`, the per-shard staging appends, and the background
+/// syncer thread.
 ///
-/// Group commit: `append_records` only writes bytes into the OS page cache
-/// (fast, short file-mutex critical section) and advances `written`. A single
-/// dedicated syncer thread batches all concurrently pending commits into one
-/// `sync_data` call and advances `durable`; committing threads wait for
-/// `durable >= my_end`. This is what makes N concurrent durable commits cost
-/// roughly one fsync instead of N.
+/// Group commit with sharded staging (Priority 17): `append_records`
+/// encodes outside any lock, reserves global offsets with one atomic
+/// `fetch_add` on `written`, and stages bytes into a core-local shard FIFO
+/// (short shard-mutex critical section — no file lock, no syscall). The
+/// single syncer drains all shards in monotone offset order into one
+/// contiguous file write per round and advances `durable` with one
+/// `sync_data`; committing threads wait for `durable >= my_end`. File
+/// bytes, framing, and offset order are identical to the unsharded log.
 struct WalShared {
     file: Mutex<File>,
     sync_file: Mutex<File>,
-    /// End offset of all bytes handed to the OS (monotone under file mutex).
+    /// Reservation frontier: one-past the last RESERVED offset (monotone
+    /// via atomic fetch_add). Reservation order == file order.
     written: std::sync::atomic::AtomicU64,
+    /// End offset physically present in the file (page cache). The syncer
+    /// advances it after each flush batch, before syncing; readers clamp
+    /// to it so staged-but-unflushed bytes are never read.
+    file_written: std::sync::atomic::AtomicU64,
     /// End offset known to be durably on disk (monotone; see syncer).
     durable: std::sync::atomic::AtomicU64,
     /// Number of concurrent threads currently waiting on durability.
@@ -126,6 +139,18 @@ struct WalShared {
     /// (generation, offset)). Persisted in a `wal.gen` sidecar next to the
     /// log so primary restarts don't alias a new history onto old offsets.
     generation: std::sync::atomic::AtomicU64,
+    /// Per-core staging shards (see `shard.rs`).
+    shards: shard::ShardPool,
+    /// Sequencer lock: held across offset reservation + staged push so push
+    /// order always equals reservation order (per-shard FIFOs stay sorted
+    /// even for lock-free `append_batch` callers). Tiny critical section —
+    /// fetch_add plus one queue push, no syscalls, no encoding — so it
+    /// never approaches the old file-mutex contention.
+    stage_lock: Mutex<()>,
+    /// Serializes the syncer's drain+write+sync rounds against `reset()`'s
+    /// drain+truncate+swap. Appends never take it (shard locks only).
+    /// Lock order everywhere: flush -> shard.
+    flush_lock: Mutex<()>,
 }
 
 pub struct CommitterGuard<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -208,6 +233,7 @@ impl Wal {
             file: Mutex::new(file),
             sync_file: Mutex::new(sync_file),
             written: std::sync::atomic::AtomicU64::new(len),
+            file_written: std::sync::atomic::AtomicU64::new(len),
             durable: std::sync::atomic::AtomicU64::new(len),
             waiters: std::sync::atomic::AtomicUsize::new(0),
             committing: std::sync::atomic::AtomicUsize::new(0),
@@ -217,6 +243,9 @@ impl Wal {
             synced_bytes: std::sync::atomic::AtomicU64::new(0),
             sync_us: std::sync::atomic::AtomicU64::new(0),
             generation: std::sync::atomic::AtomicU64::new(generation),
+            shards: shard::ShardPool::new(),
+            stage_lock: Mutex::new(()),
+            flush_lock: Mutex::new(()),
         });
         let worker_shared = shared.clone();
         let syncer = std::thread::Builder::new()
@@ -239,8 +268,9 @@ impl Wal {
         &self.path
     }
 
-    /// Next absolute byte offset a new record batch will start at. Used by
-    /// the commit sequencer as the initial install frontier.
+    /// Next absolute byte offset a new record batch will start at
+    /// (reservation frontier). Used by the commit sequencer as the install
+    /// frontier and by checkpoint to re-base after truncation.
     /// (sync_data calls, total bytes synced) — average bytes per sync is the
     /// observed group-commit batch size.
     pub fn sync_stats(&self) -> (u64, u64) {
@@ -283,7 +313,6 @@ impl Wal {
             .written
             .load(std::sync::atomic::Ordering::Acquire)
     }
-
     /// End offset known durably on disk. Replication streams only the
     /// durable prefix, so every streamed byte is a complete framed record.
     pub fn durable_offset(&self) -> u64 {
@@ -305,13 +334,18 @@ impl Wal {
         let mut clone = file.try_clone()?;
         drop(file);
         clone.seek(std::io::SeekFrom::Start(from))?;
-        // Clamp to what has actually been written (never read past EOF
-        // into a short buffer that decode would misread as torn).
+        // Clamp to bytes physically in the file (never read staged-but-
+        // unflushed reservations or past EOF into a short buffer that
+        // decode would misread as torn).
         let written = self.next_offset();
         if from > written {
             return Err(Error::Corrupted("wal range beyond written".into()));
         }
-        let avail = (written - from).min(max_len as u64) as usize;
+        let filed = self
+            .shared
+            .file_written
+            .load(std::sync::atomic::Ordering::Acquire);
+        let avail = filed.saturating_sub(from).min(max_len as u64) as usize;
         let mut buf = vec![0u8; avail];
         let mut filled = 0usize;
         while filled < avail {
@@ -358,20 +392,38 @@ impl Wal {
 
     /// Append records without waiting for durability; returns (start, end)
     /// file offsets. The commit sequencer orders installs by these offsets.
+    /// Encoding happens outside any lock; offsets are reserved atomically
+    /// (reservation order == file order) and bytes stage into the calling
+    /// thread's shard FIFO for the syncer to drain in order — no file
+    /// lock and no syscall inside the caller's critical section.
     pub fn append_records(&self, records: &[Record]) -> Result<(u64, u64)> {
         let mut buf = Vec::with_capacity(128);
         for rec in records {
             encode_record(rec, &mut buf);
         }
         let len = buf.len() as u64;
-        let mut file = self.shared.file.lock().unwrap();
-        file.write_all(&buf)?;
-        // Atomic bump inside the file lock keeps `written` order == byte order.
-        let start = self
-            .shared
-            .written
-            .fetch_add(len, std::sync::atomic::Ordering::AcqRel);
-        drop(file);
+        if len == 0 {
+            let w = self
+                .shared
+                .written
+                .load(std::sync::atomic::Ordering::Acquire);
+            return Ok((w, w));
+        }
+        // Reserve + stage atomically w.r.t. other appenders (sequencer
+        // lock): global reservation order == push order, so every shard
+        // FIFO stays sorted and the syncer always fronts the frontier.
+        // Encode already happened outside; this section is fetch_add plus
+        // one queue push — no syscalls, no file lock.
+        let start = {
+            let _seq = self.shared.stage_lock.lock().unwrap();
+            let start = self
+                .shared
+                .written
+                .fetch_add(len, std::sync::atomic::Ordering::AcqRel);
+            let idx = self.shared.shards.pick();
+            self.shared.shards.shard(idx).push(start, buf);
+            start
+        };
         self.shared.work.notify_all();
         Ok((start, start + len))
     }
@@ -421,9 +473,109 @@ impl Wal {
 /// fsync.
 const GROUP_COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_micros(100);
 
+/// Max bytes coalesced into one file write per syncer round (bounds a
+/// single round's latency while keeping big batches to one write+fsync).
+const DRAIN_BATCH_CAP: u64 = 4 << 20;
+
+/// Pop staged segments in global offset order starting at `frontier`,
+/// up to `cap` bytes. Returns the segments (shard index + start + bytes)
+/// and the new frontier. Stops at the first gap: under commit-lock
+/// serialization every reservation is staged immediately, so a gap only
+/// means a transient lock-free interleave (wait for the next append
+/// notification) — never skip ahead, never write out of order.
+/// Caller must hold `flush_lock`.
+fn drain_available(
+    shared: &WalShared,
+    cap: u64,
+    batch: &mut Vec<(usize, u64, Vec<u8>)>,
+) -> u64 {
+    use std::sync::atomic::Ordering;
+    batch.clear();
+    let mut frontier = shared.durable.load(Ordering::Acquire);
+    let reserved = shared.written.load(Ordering::Acquire);
+    let mut bytes = 0u64;
+    while frontier < reserved && bytes < cap {
+        let mut found: Option<(usize, Vec<u8>)> = None;
+        for i in 0..shared.shards.len() {
+            if let Some(data) = shared.shards.shard(i).pop_at(frontier) {
+                found = Some((i, data));
+                break;
+            }
+        }
+        let Some((idx, data)) = found else {
+            debug_assert!(
+                false,
+                "wal drain gap at offset {frontier} (reserved {reserved})"
+            );
+            break;
+        };
+        frontier += data.len() as u64;
+        bytes += data.len() as u64;
+        batch.push((idx, frontier - data.len() as u64, data));
+    }
+    frontier
+}
+
+/// Write one coalesced batch to the file (the syncer is the sole writer;
+/// reset() is excluded by `flush_lock`), advance `file_written`, sync, and
+/// publish `durable`. On write error the popped segments are re-queued in
+/// order for a later round; on sync error the bytes stay filed but
+/// undurable — both mirror the legacy failure contract. Caller holds
+/// `flush_lock`.
+fn write_and_sync(
+    shared: &WalShared,
+    batch: &mut Vec<(usize, u64, Vec<u8>)>,
+    frontier: u64,
+    coalesce: &mut Vec<u8>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    coalesce.clear();
+    for (_, _, data) in batch.iter() {
+        coalesce.extend_from_slice(data);
+    }
+    // Portable flush backend: one ordered page-cache write. This exact
+    // call is the seam where a Linux io_uring (IOPOLL) submit-and-wait
+    // backend plugs in behind #[cfg(target_os = "linux")] (see
+    // `wal/shard.rs` for why it ships as a seam, not an implementation).
+    let write_ok = {
+        use std::io::Write;
+        let mut file = shared.file.lock().unwrap();
+        file.write_all(coalesce).is_ok()
+    };
+    if !write_ok {
+        // Return bytes to their shard fronts (reverse pop order per shard
+        // preserves each FIFO exactly) and leave `durable` behind.
+        let mut back: Vec<(usize, u64, Vec<u8>)> = std::mem::take(batch);
+        while let Some((idx, start, data)) = back.pop() {
+            shared.shards.shard(idx).push_front(start, data);
+        }
+        return Err(Error::Io("wal file write failed".into()));
+    }
+    shared.file_written.store(frontier, Ordering::Release);
+    {
+        let sync_file = shared.sync_file.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        if sync_file.sync_data().is_err() {
+            return Err(Error::Io("wal sync failed".into()));
+        }
+        shared
+            .sync_us
+            .fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    shared.durable.fetch_max(frontier, Ordering::AcqRel);
+    shared.syncs.fetch_add(1, Ordering::Relaxed);
+    shared.synced_bytes.fetch_add(frontier, Ordering::Relaxed);
+    shared.work.notify_all();
+    Ok(())
+}
+
 /// One fsync covers every commit appended since the previous iteration.
 fn syncer_loop(shared: Arc<WalShared>) {
     use std::sync::atomic::Ordering;
+    // Segments popped this round + their coalesced file bytes (both reused
+    // across rounds to stay off the allocator in the hot loop).
+    let mut batch: Vec<(usize, u64, Vec<u8>)> = Vec::new();
+    let mut coalesce: Vec<u8> = Vec::new();
     loop {
         let mut stop = shared.state.lock().unwrap();
         while shared.written.load(Ordering::Acquire) == shared.durable.load(Ordering::Acquire) {
@@ -446,26 +598,17 @@ fn syncer_loop(shared: Arc<WalShared>) {
             }
         }
 
-        let target = shared.written.load(Ordering::Acquire);
-        {
-            let sync_file = shared.sync_file.lock().unwrap();
-            let t0 = std::time::Instant::now();
-            if sync_file.sync_data().is_err() {
-                return; // disk gone: leave `durable` behind so waiters error out
+        let round: Result<()> = (|| {
+            let _flush = shared.flush_lock.lock().unwrap();
+            let frontier = drain_available(&shared, DRAIN_BATCH_CAP, &mut batch);
+            if batch.is_empty() {
+                return Ok(());
             }
-            shared
-                .sync_us
-                .fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            write_and_sync(&shared, &mut batch, frontier, &mut coalesce)
+        })();
+        if round.is_err() {
+            return; // disk gone: leave `durable` behind so waiters error out
         }
-        // Clamp to `written`: a checkpoint reset may have truncated the log
-        // while this iteration was in flight.
-        let cap = shared.written.load(Ordering::Acquire);
-        shared
-            .durable
-            .fetch_max(target.min(cap), Ordering::AcqRel);
-        shared.syncs.fetch_add(1, Ordering::Relaxed);
-        shared.synced_bytes.fetch_add(cap, Ordering::Relaxed);
-        shared.work.notify_all();
     }
 }
 
@@ -484,7 +627,10 @@ impl Drop for Wal {
 
 impl Wal {
     /// Truncate the log after a successful checkpoint (snapshot) and rewrite
-    /// the header.
+    /// the header. Staged-but-unflushed bytes are flushed and synced first
+    /// (under the same exclusion as the syncer), so the pre-truncate fsync
+    /// covers every reserved byte; then the file, handles, and all three
+    /// frontiers restart at the header, exactly like the legacy path.
     pub fn reset(&self) -> Result<()> {
         // Windows quirk: set_len is not permitted through an append-mode
         // handle, so truncate via a fresh write handle instead. Serialized
@@ -501,6 +647,19 @@ impl Wal {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1;
         write_generation(&self.path, generation)?;
+
+        // Drain + sync everything staged (excludes the syncer via
+        // flush_lock), so no reserved byte is lost to the truncate below.
+        let mut batch: Vec<(usize, u64, Vec<u8>)> = Vec::new();
+        let mut coalesce: Vec<u8> = Vec::new();
+        {
+            let _flush = self.shared.flush_lock.lock().unwrap();
+            let frontier = drain_available(&self.shared, u64::MAX, &mut batch);
+            if !batch.is_empty() {
+                write_and_sync(&self.shared, &mut batch, frontier, &mut coalesce)?;
+            }
+        }
+
         let mut file = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -525,8 +684,14 @@ impl Wal {
                 .written
                 .store(HEADER_LEN, std::sync::atomic::Ordering::Release);
             self.shared
+                .file_written
+                .store(HEADER_LEN, std::sync::atomic::Ordering::Release);
+            self.shared
                 .durable
                 .store(HEADER_LEN, std::sync::atomic::Ordering::Release);
+            // The drain above emptied every queue; clear defensively so a
+            // gap can never survive the generation boundary.
+            self.shared.shards.clear_all();
         }
         // Wake replication feeders: their offsets just went stale (they
         // detect generation/offset mismatch and re-bootstrap).
@@ -1097,8 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_codec_corruption_fuzz_and_robustness() {
-        let dir = std::env::temp_dir().join(format!("hdbwal_fuzz_{}", std::process::id()));
+    fn wal_codec_corruption_fuzz_and_robustness() {        let dir = std::env::temp_dir().join(format!("hdbwal_fuzz_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wal.log");
         let _ = std::fs::remove_file(&path);
@@ -1157,6 +1321,126 @@ mod tests {
             assert!(res.is_err(), "huge record must be rejected with Corrupted");
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Priority 17: 24 threads hammer durable multi-record transactions
+    /// through sharded staging concurrently. Every commit must land exactly
+    /// once, in global offset order, with no torn records and no deadlock.
+    #[test]
+    fn sharded_concurrent_appends_stay_ordered() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("hdbwal_shard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal.log");
+        let _ = std::fs::remove_file(&path);
+        let wal = Arc::new(Wal::open(&path).unwrap());
+        const THREADS: u64 = 24;
+        const PER_THREAD: u64 = 50;
+        let mut handles = Vec::new();
+        for w in 0..THREADS {
+            let wal = wal.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let txn = w * 1_000_000 + i + 1;
+                    wal.append_batch(&[
+                        Record::Put {
+                            txn,
+                            table: "t".into(),
+                            key: txn.to_le_bytes().to_vec(),
+                            row: vec![w as u8; 64],
+                        },
+                        Record::Commit { txn, ts: Some(1_700_000_000) },
+                    ])
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All staged bytes must drain (nothing stranded in shards): wait
+        // for the syncer to catch the reservation frontier.
+        let t0 = std::time::Instant::now();
+        while wal.next_offset() != wal.durable_offset() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "drain stall");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(wal);
+        // Reopen: every commit present exactly once, framing intact.
+        let wal2 = Wal::open(&path).unwrap();
+        let recs = wal2.read_all().unwrap();
+        let mut commits: Vec<u64> = Vec::new();
+        let mut puts = 0u64;
+        for r in &recs {
+            match r {
+                Record::Put { .. } => puts += 1,
+                Record::Commit { txn, .. } => commits.push(*txn),
+                _ => panic!("unexpected record {r:?}"),
+            }
+        }
+        assert_eq!(puts, THREADS * PER_THREAD);
+        commits.sort_unstable();
+        assert_eq!(commits.len() as u64, THREADS * PER_THREAD);
+        for w in 0..THREADS {
+            for i in 0..PER_THREAD {
+                assert!(commits.contains(&(w * 1_000_000 + i + 1)));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Priority 17: hammered durable commits plus a dangling staged tail —
+    /// reopening recovers every commit and drops the tail, torn or not.
+    #[test]
+    fn sharded_recovery_drops_interleaved_tails() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("hdbwal_tail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal.log");
+        let _ = std::fs::remove_file(&path);
+        let wal = Arc::new(Wal::open(&path).unwrap());
+        let mut handles = Vec::new();
+        for w in 0..8u64 {
+            let wal = wal.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..100u64 {
+                    let txn = w * 100_000 + i + 1;
+                    wal.append_batch(&[Record::Put {
+                        txn,
+                        table: "t".into(),
+                        key: vec![i as u8],
+                        row: vec![w as u8],
+                    }, Record::Commit { txn, ts: None }])
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Dangling staged Put with no Commit (crash between records).
+        wal.append_unsynced(&[Record::Put {
+            txn: 999_999,
+            table: "t".into(),
+            key: vec![9],
+            row: vec![9],
+        }])
+        .unwrap();
+        drop(wal);
+        let wal2 = Wal::open(&path).unwrap();
+        let recs = wal2.read_all().unwrap();
+        let commits = recs
+            .iter()
+            .filter(|r| matches!(r, Record::Commit { .. }))
+            .count();
+        assert_eq!(commits, 800);
+        assert!(!recs.iter().any(|r| matches!(
+            r,
+            Record::Put { txn: 999_999, .. }
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
