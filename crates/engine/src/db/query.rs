@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::subquery;
 use super::sysviews;
+use super::batch;
 
 /// Per-table input actuals (execution order) for `EXPLAIN ANALYZE`.
 pub(super) use super::join::JoinCapture;
@@ -455,7 +456,29 @@ impl Database {
             }
             _ => (selection.clone(), None),
         };
-        let mut rows = self.visible_rows(session, &table_arc, plain_sel.as_ref())?;
+        // Sole-COUNT(*) fast path through the batch executor (falls back
+        // below on Ok(None)); scalar-filtered rows are only sourced when
+        // the batch path declines, so success never pays for both.
+        if count_only && sub_sel.is_none() {
+            let aggs = vec![(AggSpec::Count, "COUNT(*)".into())];
+            if batch::applicable(session, &table_arc, plain_sel.as_ref())? {
+                if let Some(out) =
+                    batch::try_global_agg(self, session, &table_arc, plain_sel.as_ref(), &aggs)?
+                {
+                    return Ok(out);
+                }
+            }
+        }
+        // Global-aggregate candidates defer scalar sourcing the same way:
+        // the batch runner sources its own rows on success.
+        let batch_candidate = agg_only
+            && sub_sel.is_none()
+            && batch::applicable(session, &table_arc, plain_sel.as_ref())?;
+        let mut rows = if batch_candidate {
+            Vec::new()
+        } else {
+            self.visible_rows(session, &table_arc, plain_sel.as_ref())?
+        };
         if let Some(q) = sub_sel.as_ref() {
             let scope = std::slice::from_ref(&table_arc);
             rows = subquery::filter_with_subqueries(self, session, scope, rows, q)?;
@@ -488,6 +511,16 @@ impl Database {
                     }
                     _ => unreachable!(),
                 }
+            }
+            // Morsel-driven fast path (re-sources inside); on decline the
+            // scalar-filtered rows are sourced here for the legacy path.
+            if batch_candidate {
+                if let Some(out) =
+                    batch::try_global_agg(self, session, &table_arc, plain_sel.as_ref(), &aggs)?
+                {
+                    return Ok(out);
+                }
+                rows = self.visible_rows(session, &table_arc, plain_sel.as_ref())?;
             }
             return Self::exec_aggregate_rows(&aggs, rows);
         }

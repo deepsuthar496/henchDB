@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use super::cost::{estimate_count, local_predicate, selectivity};
-use super::plan::{equi_join, join_key, order_joins, JoinKey};
+use super::batch;
+use super::cost::{estimate_count, local_predicate, selectivity};use super::plan::{equi_join, join_key, order_joins, JoinKey};
 use super::query::AggSpec;
 use super::subquery;
 use super::{Database, Output, Session};
@@ -16,6 +16,15 @@ use crate::types::Datum;
 
 pub(super) struct JoinCapture {
     pub input_rows: Vec<usize>,
+}
+
+/// Grouped projection slot: a group-key position, an aggregate (None =
+/// `COUNT(*)`), or a row-independent constant. Shared by the scalar
+/// executor and the batch pushdown.
+pub(super) enum GProj {
+    Key(usize),
+    Agg(Option<(AggFunc, usize)>),
+    Const(Datum),
 }
 
 /// One global-aggregation output column: a row count, a column aggregate,
@@ -392,6 +401,23 @@ impl Database {
                 )
             });
         if !group_by.is_empty() {
+            // Single-source GROUP BY through the batch pushdown (captured
+            // EXPLAIN ANALYZE plans and multi-table scopes stay scalar);
+            // decline falls through to the legacy path below.
+            if joins.is_empty() && exec_tables.len() == 1 && capture.is_none() {
+                if let Some(out) = batch::try_grouped_agg(
+                    self,
+                    session,
+                    &exec_tables[0],
+                    selection.as_ref(),
+                    &items,
+                    &group_by,
+                    order_by.clone(),
+                    limit,
+                )? {
+                    return Ok(out);
+                }
+            }
             return self.exec_grouped(&items, &exec_tables, rows, &group_by, order_by, limit);
         }
         if has_agg && !all_agg {
@@ -686,16 +712,46 @@ impl Database {
         order_by: Vec<(String, bool)>,
         limit: Option<usize>,
     ) -> Result<Output> {
+        let (out_columns, projs, key_idx) = Self::resolve_grouped_projs(items, tables, group_by)?;
+        let mut groups: BTreeMap<Vec<Datum>, Vec<usize>> = BTreeMap::new();
+        for (ri, r) in rows.iter().enumerate() {
+            let key: Vec<Datum> = key_idx.iter().map(|&i| r[i].clone()).collect();
+            groups.entry(key).or_default().push(ri);
+        }
+        // Build (output row, group key) pairs so ORDER BY can address output
+        // columns and unprojected group keys alike.
+        let mut paired: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(groups.len());
+        for (key, members) in &groups {
+            let member_rows: Vec<Vec<Datum>> =
+                members.iter().map(|&i| rows[i].clone()).collect();
+            let mut out_row = Vec::with_capacity(projs.len());
+            for p in &projs {
+                match p {
+                    GProj::Key(pos) => out_row.push(key[*pos].clone()),
+                    GProj::Agg(None) => out_row.push(Datum::Int(member_rows.len() as i64)),
+                    GProj::Agg(Some((func, idx))) => {
+                        out_row.push(Self::compute_aggregate(*func, *idx, &member_rows)?)
+                    }
+                    GProj::Const(d) => out_row.push(d.clone()),
+                }
+            }
+            paired.push((out_row, key.clone()));
+        }
+        Self::assemble_grouped_output(out_columns, paired, group_by, order_by, limit)
+    }
+
+    /// Validate + resolve grouped projection items (shared by the scalar
+    /// executor and the batch pushdown so both reject the same shapes).
+    pub(super) fn resolve_grouped_projs(
+        items: &[SelectItem],
+        tables: &[Arc<Table>],
+        group_by: &[String],
+    ) -> Result<(Vec<String>, Vec<GProj>, Vec<usize>)> {
         let mut key_idx = Vec::with_capacity(group_by.len());
         for g in group_by {
             key_idx.push(Self::resolve_scope(tables, g)?);
         }
         // Validate + resolve projection items.
-        enum GProj {
-            Key(usize), // position in group_by
-            Agg(Option<(AggFunc, usize)>),
-            Const(Datum),
-        }
         let mut out_columns = Vec::with_capacity(items.len());
         let mut projs = Vec::with_capacity(items.len());
         for item in items {
@@ -745,30 +801,19 @@ impl Database {
                 }
             }
         }
-        let mut groups: BTreeMap<Vec<Datum>, Vec<usize>> = BTreeMap::new();
-        for (ri, r) in rows.iter().enumerate() {
-            let key: Vec<Datum> = key_idx.iter().map(|&i| r[i].clone()).collect();
-            groups.entry(key).or_default().push(ri);
-        }
-        // Build (output row, group key) pairs so ORDER BY can address output
-        // columns and unprojected group keys alike.
-        let mut paired: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::with_capacity(groups.len());
-        for (key, members) in &groups {
-            let member_rows: Vec<Vec<Datum>> =
-                members.iter().map(|&i| rows[i].clone()).collect();
-            let mut out_row = Vec::with_capacity(projs.len());
-            for p in &projs {
-                match p {
-                    GProj::Key(pos) => out_row.push(key[*pos].clone()),
-                    GProj::Agg(None) => out_row.push(Datum::Int(member_rows.len() as i64)),
-                    GProj::Agg(Some((func, idx))) => {
-                        out_row.push(Self::compute_aggregate(*func, *idx, &member_rows)?)
-                    }
-                    GProj::Const(d) => out_row.push(d.clone()),
-                }
-            }
-            paired.push((out_row, key.clone()));
-        }
+        Ok((out_columns, projs, key_idx))
+    }
+
+    /// ORDER BY (over output columns and unprojected group keys alike) +
+    /// LIMIT for grouped outputs (shared by scalar and batch paths).
+    pub(super) fn assemble_grouped_output(
+        out_columns: Vec<String>,
+        paired: Vec<(Vec<Datum>, Vec<Datum>)>,
+        group_by: &[String],
+        order_by: Vec<(String, bool)>,
+        limit: Option<usize>,
+    ) -> Result<Output> {
+        let mut paired = paired;
         if !order_by.is_empty() {
             enum OKey {
                 Out(usize),

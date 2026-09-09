@@ -7,9 +7,9 @@ use super::*;
 use crate::table::{Schema, TableDef};
 use crate::types::ColumnType;
 
+mod batch;
 mod fk;
-mod joins;
-mod opt;
+mod joins;mod opt;
 mod subquery;
 mod sysviews;
 mod txn;

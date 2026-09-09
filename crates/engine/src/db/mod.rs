@@ -34,8 +34,8 @@ use mvcc::SnapshotPin;
 
 use plan::{access_path, AccessPath};
 
-pub(crate) mod cost;
-pub(crate) mod ddl;
+pub(crate) mod batch;
+pub(crate) mod cost;pub(crate) mod ddl;
 pub(crate) mod diag;
 pub(crate) mod explain;
 pub(crate) mod fk;
@@ -1194,7 +1194,11 @@ impl Database {
 
     /// All rows of a table visible to the session: committed tree state,
     /// filtered, with the transaction's staged writes overlaid.
-    fn visible_rows(
+    /// `pub(super)` so the batch executor (`db/batch.rs`) can source
+    /// unfiltered rows (passing `None`) and apply its own vectorized
+    /// filter + pushdown while sharing access paths, snapshots, overlays,
+    /// and row order exactly.
+    pub(super) fn visible_rows(
         &self,
         session: &Session,
         table: &Arc<Table>,
