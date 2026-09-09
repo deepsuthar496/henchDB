@@ -479,7 +479,7 @@ impl PgConn {
             };
             let final_sql =
                 substitute(&stmt.sql, &stmt.offsets, &lits).map_err(|m| (String::from("08P01"), m))?;
-            let result = db.execute(session, &final_sql).map_err(|e| (sqlstate(&e).to_string(), e.to_string()))?;
+            let result = db.execute(session, &final_sql).map_err(|e| pg_error(&e))?;
             if result.columns.is_empty() {
                 return Ok(command_complete(&command_tag(&result.message, result.rows.len(), false)));
             }

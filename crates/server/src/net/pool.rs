@@ -219,7 +219,12 @@ fn run_steps(
         let step = match &mut conn.state {
             ConnState::Mysql(m) => wire::mysql_step(&db, m, ctx),
             ConnState::Pg(p) => wire::pg::pg_step(&db, p, ctx),
-            ConnState::Legacy(l) => crate::legacy_step(&db, l),
+            ConnState::Legacy(l) => {
+                let v0 = db.privilege_version();
+                let r = crate::legacy_step(&db, l);
+                crate::auth::persist_if_changed(&db, &shared.auth_path, v0);
+                r
+            }
             ConnState::NewMain(_) | ConnState::NewPg(_) => {
                 return (Some(conn), Disposition::Closed);
             }

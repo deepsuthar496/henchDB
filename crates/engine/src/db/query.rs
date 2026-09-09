@@ -68,6 +68,7 @@ impl Database {
                 ("Msg_type".into(), ColumnType::Text),
                 ("Msg_text".into(), ColumnType::Text),
             ]),
+            Statement::ShowGrants { .. } => Ok(vec![("Grants".into(), ColumnType::Text)]),
             Statement::Explain { analyze: false, .. } => Ok(vec![
                 ("table".into(), ColumnType::Text),
                 ("access_path".into(), ColumnType::Text),

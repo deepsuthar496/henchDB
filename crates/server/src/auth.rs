@@ -29,6 +29,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use engine::db::privilege::GrantRule;
+use engine::sql::Privilege;
+
 // ---------------------------------------------------------------------------
 // SHA-256 (FIPS 180-4, portable, no deps)
 // ---------------------------------------------------------------------------
@@ -163,11 +166,14 @@ pub const PLUGIN_CACHING_SHA2: &str = "caching_sha2_password";
 pub const PLUGIN_NATIVE: &str = "mysql_native_password";
 
 /// Stored verifier for one account. `verifier` is empty for empty-password
-/// accounts (only an empty proof is accepted then).
+/// accounts (only an empty proof is accepted then). `grants` carries the
+/// RBAC rules (v2 file section; empty for v1-decoded accounts except the
+/// migration rule below).
 #[derive(Debug, Clone)]
 pub struct Verifier {
     pub plugin: String,
     pub hash: Vec<u8>, // 32 bytes (SHA-256) or 20 bytes (double SHA-1)
+    pub grants: Vec<GrantRule>,
 }
 
 impl Verifier {
@@ -175,6 +181,7 @@ impl Verifier {
         Verifier {
             plugin: PLUGIN_CACHING_SHA2.into(),
             hash: sha256(password).to_vec(),
+            grants: Vec::new(),
         }
     }
     pub fn new_native(password: &[u8]) -> Self {
@@ -182,12 +189,14 @@ impl Verifier {
         Verifier {
             plugin: PLUGIN_NATIVE.into(),
             hash: sha1(&stage1).to_vec(),
+            grants: Vec::new(),
         }
     }
     pub fn empty() -> Self {
         Verifier {
             plugin: PLUGIN_CACHING_SHA2.into(),
             hash: Vec::new(),
+            grants: Vec::new(),
         }
     }
     /// Empty-password accounts (dev bootstrap). Kept as API for callers;
@@ -279,7 +288,12 @@ fn verify_sha2_native_fallback(v: &Verifier, scramble: &[u8], token: &[u8]) -> b
 // ---------------------------------------------------------------------------
 
 pub const AUTH_MAGIC: &[u8; 4] = b"HDBA";
-pub const AUTH_FORMAT_VERSION: u32 = 1;
+/// v1 = verifiers only; v2 appends a per-user grants section (RBAC). v1
+/// files decode cleanly: every pre-existing non-root account migrates with
+/// `ALL PRIVILEGES ON *.*` (behavior-preserving upgrade — tighten with
+/// REVOKE afterwards); root needs no stored grant (code bypass).
+pub const AUTH_FORMAT_VERSION: u32 = 2;
+const AUTH_FORMAT_V1: u32 = 1;
 
 pub struct UserStore {
     path: PathBuf,
@@ -314,7 +328,8 @@ impl UserStore {
         }
         let mut b4 = [0u8; 4];
         f.read_exact(&mut b4).map_err(|_| "auth file: truncated".to_string())?;
-        if u32::from_le_bytes(b4) != AUTH_FORMAT_VERSION {
+        let version = u32::from_le_bytes(b4);
+        if version != AUTH_FORMAT_VERSION && version != AUTH_FORMAT_V1 {
             return Err("auth file: version".to_string());
         }
         f.read_exact(&mut b4).map_err(|_| "auth file: truncated".to_string())?;
@@ -355,7 +370,25 @@ impl UserStore {
             if !hash.is_empty() && hash.len() != 32 && hash.len() != 20 {
                 return Err("auth file: bad verifier".to_string());
             }
-            users.insert(name, Verifier { plugin, hash });
+            let grants = if version == AUTH_FORMAT_V1 {
+                Vec::new()
+            } else {
+                decode_grants(&mut f)?
+            };
+            users.insert(name, Verifier { plugin, hash, grants });
+        }
+        if version == AUTH_FORMAT_V1 {
+            // Behavior-preserving upgrade: pre-RBAC accounts keep full
+            // access (root bypasses in code and needs nothing stored).
+            for (name, v) in users.iter_mut() {
+                if name != "root" {
+                    v.grants.push(GrantRule {
+                        priv_: Privilege::All,
+                        db: "*".into(),
+                        tbl: "*".into(),
+                    });
+                }
+            }
         }
         Ok(UserStore {
             path: path.to_path_buf(),
@@ -404,12 +437,148 @@ impl UserStore {
             }
             f.write_all(&[v.hash.len() as u8]).map_err(|e| format!("auth file: {e}"))?;
             f.write_all(&v.hash).map_err(|e| format!("auth file: {e}"))?;
+            encode_grants(&mut f, &v.grants)?;
         }
         f.sync_data().map_err(|e| format!("auth file: {e}"))?;
         drop(f);
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("auth file: {e}"))?;
         Ok(())
     }
+}
+
+/// Version-guarded persist: snapshot `db.privilege_version()` before client
+/// SQL, call this after — persists only when a privilege mutation happened
+/// (GRANT/REVOKE/CREATE/DROP/ALTER USER). Save failures are logged loudly
+/// but never fail the (already executed) statement; the next mutation
+/// retries.
+pub fn persist_if_changed(db: &engine::Database, auth_path: &Path, before: u64) {
+    if db.privilege_version() != before {
+        if let Err(e) = persist_privileges(db, auth_path) {
+            eprintln!("auth persist failed (grants held in memory, retried on next change): {e}");
+        }
+    }
+}
+
+/// Serializes concurrent privilege persists (two interleaved
+/// read-modify-write cycles would otherwise drop grants).
+static AUTH_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Post-execute persist hook: call after client SQL when
+/// `db.privilege_version()` moved since before the statement. Exports the
+/// engine principals + grants, hashes staged CREATE/ALTER passwords into
+/// verifiers, prunes tombstoned (dropped) accounts, imports file-only
+/// accounts (`passwd`-created) as grantless principals, and saves
+/// atomically. A save failure is reported but never fails the (already
+/// executed) statement; the next mutation retries.
+pub fn persist_privileges(db: &engine::Database, auth_path: &Path) -> Result<(), String> {
+    let _guard = AUTH_SAVE_LOCK
+        .lock()
+        .map_err(|e| format!("auth save lock: {e}"))?;
+    let (users, tombstones, pending) = db.export_privileges();
+    let mut store = match UserStore::load(auth_path) {
+        Ok(s) => s,
+        Err(_) => UserStore { path: auth_path.to_path_buf(), users: HashMap::new() },
+    };
+    // Staged passwords first: hash into verifiers, preserving any grants
+    // already on the account.
+    for (user, pw) in &pending {
+        let v = Verifier::new_sha2(pw.as_bytes());
+        match store.users.get_mut(user) {
+            Some(e) => {
+                e.hash = v.hash;
+                e.plugin = v.plugin;
+            }
+            None => {
+                store.users.insert(user.clone(), v);
+            }
+        }
+    }
+    // Grants sync for engine principals.
+    for (user, rules) in &users {
+        match store.users.get_mut(user) {
+            Some(e) => e.grants = rules.clone(),
+            None => eprintln!(
+                "auth: principal '{user}' has no account; grants held in memory only"
+            ),
+        }
+    }
+    // Prune dropped accounts.
+    for t in &tombstones {
+        store.users.remove(t);
+    }
+    // Import file-only accounts as grantless principals (root needs none:
+    // the code bypass covers it, and it must never gain stored rules).
+    let fresh: Vec<String> = store
+        .users
+        .keys()
+        .filter(|n| *n != "root" && !users.iter().any(|(u, _)| u == *n))
+        .cloned()
+        .collect();
+    if !fresh.is_empty() {
+        db.import_missing_users(&fresh);
+    }
+    store.save()
+}
+
+/// Encode one user's grant list: u32 count + per rule (u8 priv, u32 db +
+/// bytes, u32 tbl + bytes). Lengths capped like the rest of the codec.
+fn encode_grants(f: &mut File, grants: &[GrantRule]) -> Result<(), String> {
+    if grants.len() > 65_536 {
+        return Err("auth file: too many grants".to_string());
+    }
+    f.write_all(&(grants.len() as u32).to_le_bytes())
+        .map_err(|e| format!("auth file: {e}"))?;
+    for g in grants {
+        f.write_all(&[g.priv_.codec_byte()]).map_err(|e| format!("auth file: {e}"))?;
+        for part in [&g.db, &g.tbl] {
+            if part.len() > 1024 {
+                return Err("auth file: bad grant scope".to_string());
+            }
+            f.write_all(&(part.len() as u32).to_le_bytes())
+                .map_err(|e| format!("auth file: {e}"))?;
+            f.write_all(part.as_bytes()).map_err(|e| format!("auth file: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_u32_capped(f: &mut File, cap: usize, what: &str) -> Result<Vec<u8>, String> {
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4).map_err(|_| "auth file: truncated".to_string())?;
+    let n = u32::from_le_bytes(b4) as usize;
+    if n > cap {
+        return Err(format!("auth file: {what} too large"));
+    }
+    let mut buf = vec![0u8; n];
+    if n > 0 {
+        f.read_exact(&mut buf).map_err(|_| "auth file: truncated".to_string())?;
+    }
+    Ok(buf)
+}
+
+fn decode_grants(f: &mut File) -> Result<Vec<GrantRule>, String> {
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4).map_err(|_| "auth file: truncated".to_string())?;
+    let n = u32::from_le_bytes(b4) as usize;
+    if n > 65_536 {
+        return Err("auth file: too many grants".to_string());
+    }
+    let mut out = Vec::with_capacity(n.min(16));
+    for _ in 0..n {
+        let mut pb = [0u8; 1];
+        f.read_exact(&mut pb).map_err(|_| "auth file: truncated".to_string())?;
+        let priv_ = Privilege::from_codec_byte(pb[0])
+            .ok_or_else(|| "auth file: bad privilege".to_string())?;
+        let db = String::from_utf8(read_u32_capped(f, 1024, "grant scope")?)
+            .map_err(|_| "auth file: bad grant scope".to_string())?;
+        let tbl = String::from_utf8(read_u32_capped(f, 1024, "grant scope")?)
+            .map_err(|_| "auth file: bad grant scope".to_string())?;
+        if db.is_empty() || tbl.is_empty() {
+            return Err("auth file: bad grant scope".to_string());
+        }
+        out.push(GrantRule { priv_, db, tbl });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -494,8 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn user_file_roundtrip_and_corruption() {
-        let path = std::env::temp_dir().join(format!("hdbauth_{}.bin", std::process::id()));
+    fn user_file_roundtrip_and_corruption() {        let path = std::env::temp_dir().join(format!("hdbauth_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let (mut store, fresh) = UserStore::load_or_bootstrap(&path).unwrap();
         assert!(fresh);
@@ -520,5 +688,100 @@ mod tests {
             let _ = UserStore::load(&path);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn grant(priv_: Privilege, db: &str, tbl: &str) -> GrantRule {
+        GrantRule { priv_, db: db.into(), tbl: tbl.into() }
+    }
+
+    #[test]
+    fn v2_grants_roundtrip() {
+        let path = std::env::temp_dir().join(format!("hdbauthv2_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (mut store, _) = UserStore::load_or_bootstrap(&path).unwrap();
+        store.set_password("root", b"pw", PLUGIN_CACHING_SHA2).unwrap();
+        store.set_password("app", b"pw", PLUGIN_NATIVE).unwrap();
+        store.users.get_mut("app").unwrap().grants = vec![
+            grant(Privilege::Select, "shop", "*"),
+            grant(Privilege::Insert, "shop", "orders"),
+            grant(Privilege::All, "*", "*"),
+        ];
+        store.save().unwrap();
+        let re = UserStore::load(&path).unwrap();
+        assert_eq!(re.users["app"].grants.len(), 3);
+        assert_eq!(re.users["app"].grants[0].priv_, Privilege::Select);
+        assert_eq!(re.users["root"].grants.len(), 0);
+        // Unknown privilege bytes and truncated grants sections fail clean.
+        let bytes = std::fs::read(&path).unwrap();
+        for len in 0..bytes.len() {
+            std::fs::write(&path, &bytes[..len]).unwrap();
+            let _ = UserStore::load(&path);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hand-encoded v1 file (no grants section): legacy accounts decode,
+    /// non-root keeps ALL (behavior-preserving upgrade), root stays bare.
+    #[test]
+    fn v1_legacy_decodes_with_migrated_grants() {
+        let path = std::env::temp_dir().join(format!("hdbauthv1_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut f = Vec::new();
+        f.extend_from_slice(b"HDBA");
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f.extend_from_slice(&2u32.to_le_bytes());
+        for (name, plugin, hash) in [
+            ("root", 1u8, vec![]),
+            ("app", 2u8, vec![4u8; 20]),
+        ] {
+            f.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            f.extend_from_slice(name.as_bytes());
+            f.push(plugin);
+            f.push(hash.len() as u8);
+            f.extend_from_slice(&hash);
+        }
+        std::fs::write(&path, &f).unwrap();
+        let store = UserStore::load(&path).unwrap();
+        assert!(store.users["root"].grants.is_empty());
+        assert_eq!(
+            store.users["app"].grants,
+            vec![grant(Privilege::All, "*", "*")]
+        );
+        // Saving upgrades the file to v2 (grants section appears).
+        store.save().unwrap();
+        let re = UserStore::load(&path).unwrap();
+        assert_eq!(re.users["app"].grants.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_hook_end_to_end() {
+        // Full SQL flow: CREATE USER + GRANT through the engine, persist,
+        // reload — account, verifier, and grants all survive.
+        let dir = std::env::temp_dir().join(format!("hdbpersist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = engine::Database::open(&dir).unwrap();
+        let mut s = db.new_session();
+        db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        let v0 = db.privilege_version();
+        db.execute(&mut s, "CREATE USER app IDENTIFIED BY 's3cret!'").unwrap();
+        db.execute(&mut s, "GRANT SELECT, INSERT ON t TO app").unwrap();
+        assert!(db.privilege_version() != v0);
+        let auth_path = dir.join("auth.bin");
+        persist_if_changed(&db, &auth_path, v0);
+        let store = UserStore::load(&auth_path).unwrap();
+        assert_eq!(store.users["app"].hash, sha256(b"s3cret!").to_vec());
+        assert_eq!(store.users["app"].grants.len(), 2);
+        // Pending passwords drained (memory-only, never on disk plaintext).
+        let (_, _, pending) = db.export_privileges();
+        assert!(pending.is_empty());
+        // DROP USER prunes the account on the next persist.
+        let v1 = db.privilege_version();
+        db.execute(&mut s, "DROP USER app").unwrap();
+        persist_if_changed(&db, &auth_path, v1);
+        let store = UserStore::load(&auth_path).unwrap();
+        assert!(!store.users.contains_key("app"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

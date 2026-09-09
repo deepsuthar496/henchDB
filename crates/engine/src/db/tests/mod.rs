@@ -10,6 +10,7 @@ use crate::types::ColumnType;
 mod batch;
 mod fk;
 mod joins;mod opt;
+mod privilege;
 mod subquery;
 mod sysviews;
 mod txn;

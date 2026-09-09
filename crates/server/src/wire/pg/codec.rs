@@ -174,10 +174,22 @@ pub fn sqlstate(e: &engine::Error) -> &'static str {
         engine::Error::DatabaseNotFound(_) => "3D000",
         engine::Error::DatabaseExists(_) => "42P04",
         engine::Error::ReadOnlyReplica => "25006",
-        engine::Error::InvalidQuery(_) => "21000",
+        engine::Error::AccessDenied { .. } => "42501",        engine::Error::InvalidQuery(_) => "21000",
         engine::Error::ExecutionError(_) => "21000",
         engine::Error::InvalidOperation(_) => "55000",
         _ => "XX000",
+    }
+}
+
+/// Engine error rendered for the PG wire: `(sqlstate, message)`. Access
+/// denials speak PostgreSQL (`permission denied for table ...`) instead of
+/// the engine's MySQL-1142 Display text.
+pub fn pg_error(e: &engine::Error) -> (String, String) {
+    match e {
+        engine::Error::AccessDenied { object, .. } => {
+            ("42501".to_string(), format!("permission denied for table {object}"))
+        }
+        _ => (sqlstate(e).to_string(), e.to_string()),
     }
 }
 

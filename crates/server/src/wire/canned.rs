@@ -351,15 +351,6 @@ pub fn canned_output(sql: &str) -> Option<Output> {
             message: "OK".into(),
         });
     }
-    if low_trim.starts_with("show grants") {
-        return Some(Output {
-            columns: vec!["Grants".into()],
-            rows: vec![vec![Datum::Text(
-                "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'".into(),
-            )]],
-            message: "OK".into(),
-        });
-    }
     if low_trim.starts_with("show columns")
         || low_trim.starts_with("show fields")
         || low_trim.starts_with("describe")

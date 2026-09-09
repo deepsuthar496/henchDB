@@ -89,6 +89,16 @@ fn sqlstate_mapping() {
     assert_eq!(sqlstate(&Error::TxnConflict("x".into())), "40001");
     assert_eq!(sqlstate(&Error::QueryTimeout), "57014");
     assert_eq!(sqlstate(&Error::TxnNotActive), "25000");
+    // RBAC denials speak PostgreSQL: 42501 + permission-denied text.
+    let denied = Error::AccessDenied {
+        user: "alice".into(),
+        command: "SELECT".into(),
+        object: "shop.orders".into(),
+    };
+    assert_eq!(sqlstate(&denied), "42501");
+    let (code, msg) = pg_error(&denied);
+    assert_eq!(code, "42501");
+    assert_eq!(msg, "permission denied for table shop.orders");
 }
 
 #[test]

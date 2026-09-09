@@ -364,7 +364,9 @@ pub(crate) fn pg_step(
                 if copy::is_copy_from_stdin(&sql) {
                     run_copy_in(&db, session, &sql, reader, ctx)?;
                 } else {
+                    let v0 = db.privilege_version();
                     run_simple(&db, session, &sql, reader)?;
+                    auth::persist_if_changed(&db, &ctx.auth_path, v0);
                 }
                 db.note_idle(proc.id());
             }
@@ -441,7 +443,9 @@ pub(crate) fn pg_step(
                             format!("portal {}", m.portal)
                         };
                         db.note_command(proc.id(), &session.current_db, "Execute", &info);
+                        let v0 = db.privilege_version();
                         let res = pg.on_execute(&db, session, &m);
+                        auth::persist_if_changed(&db, &ctx.auth_path, v0);
                         db.note_idle(proc.id());
                         match res {
                             Ok(resp) => {
@@ -576,7 +580,8 @@ fn run_simple(
                 }
             }
             Err(e) => {
-                out.extend_from_slice(&error_response(sqlstate(&e), &e.to_string()));
+                let (code, msg) = pg_error(&e);
+                out.extend_from_slice(&error_response(&code, &msg));
                 break; // subsequent statements of this Q are skipped
             }
         }

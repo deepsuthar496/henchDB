@@ -29,6 +29,14 @@ pub enum Error {
     ExecutionError(String),
     /// Valid statement, wrong node role (e.g. PROMOTE on a primary).
     InvalidOperation(String),
+    /// RBAC denial: user lacks the privilege on the object. The Display
+    /// text is the MySQL 1142 message; the PG frontend reformats the
+    /// fields into its 42501 text (see `wire/pg/codec.rs`).
+    AccessDenied {
+        user: String,
+        command: String,
+        object: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -67,6 +75,9 @@ impl fmt::Display for Error {
             Error::InvalidQuery(m) => write!(f, "invalid query: {m}"),
             Error::ExecutionError(m) => write!(f, "execution error: {m}"),
             Error::InvalidOperation(m) => write!(f, "invalid operation: {m}"),
+            Error::AccessDenied { user, command, object } => {
+                write!(f, "{command} command denied to user '{user}'@'localhost' for table '{object}'")
+            }
         }
     }
 }

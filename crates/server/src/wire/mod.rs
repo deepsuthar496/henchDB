@@ -409,8 +409,20 @@ pub(crate) fn mysql_step(
         match payload[0] {
             COM_QUIT => return Ok(Closed),
             COM_SHUTDOWN => {
-                // Any authenticated user may request shutdown in v1
-                // (per-user privileges are the SEC8 follow-up).
+                // Shutdown needs admin rights (root or global ALL); the
+                // engine session carries the authenticated username.
+                if !db.is_admin(&session.user) {
+                    write_err(
+                        reader.get_mut(),
+                        &mut out_seq,
+                        &engine::Error::AccessDenied {
+                            user: session.user.clone(),
+                            command: "SHUTDOWN".into(),
+                            object: "*.*".into(),
+                        },
+                    )?;
+                    return Ok(Idle);
+                }
                 println!("shutdown requested by '{}' from {}", m.authed_user, m.peer);
                 match db.checkpoint() {
                     Ok(()) => {
@@ -444,7 +456,12 @@ pub(crate) fn mysql_step(
                 reader.get_mut().flush()?;
             }
             COM_RESET_CONNECTION => {
+                // Session state resets, but the connection stays
+                // authenticated as the login user (resetting to root would
+                // silently escalate privileges).
+                let user = std::mem::take(&mut session.user);
                 *session = db.new_session();
+                session.user = user;
                 write_packet(reader.get_mut(), &ok_payload(0, ""), &mut out_seq)?;
                 reader.get_mut().flush()?;
             }
@@ -456,9 +473,20 @@ pub(crate) fn mysql_step(
                     return Ok(Idle);
                 }
                 // `mysqladmin shutdown` issues SHUTDOWN as text (COM_QUERY),
-                // not COM_SHUTDOWN: same graceful path, authenticated only
-                // (per-user privileges are the SEC8 follow-up).
+                // not COM_SHUTDOWN: same graceful path, admin rights required.
                 if sql.eq_ignore_ascii_case("shutdown") {
+                    if !db.is_admin(&session.user) {
+                        write_err(
+                            reader.get_mut(),
+                            &mut out_seq,
+                            &engine::Error::AccessDenied {
+                                user: session.user.clone(),
+                                command: "SHUTDOWN".into(),
+                                object: "*.*".into(),
+                            },
+                        )?;
+                        return Ok(Idle);
+                    }
                     println!("shutdown requested by '{}' from {}", m.authed_user, m.peer);
                     match db.checkpoint() {
                         Ok(()) => {
@@ -476,7 +504,9 @@ pub(crate) fn mysql_step(
                 let batch = split_statements(sql);
                 let batch = if batch.is_empty() { vec![sql.to_string()] } else { batch };
                 db.note_command(proc.id(), &session.current_db, "Query", batch.first().map(String::as_str).unwrap_or(sql));
+                let v0 = db.privilege_version();
                 execute_statements(&db, session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, false)?;
+                auth::persist_if_changed(&db, &ctx.auth_path, v0);
                 db.note_idle(proc.id());
             }
             COM_STMT_PREPARE => {
@@ -551,7 +581,9 @@ pub(crate) fn mysql_step(
                                 let batch = split_statements(&final_sql);
                                 let batch = if batch.is_empty() { vec![final_sql] } else { batch };
                                 db.note_command(proc.id(), &session.current_db, "Execute", batch.first().map(String::as_str).unwrap_or(""));
+                                let v0 = db.privilege_version();
                                 execute_statements(&db, session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, true)?;
+                                auth::persist_if_changed(&db, &ctx.auth_path, v0);
                                 db.note_idle(proc.id());
                             }
                             Err(msg) => write_err_msg(reader.get_mut(), &mut out_seq, 1064, &msg)?,

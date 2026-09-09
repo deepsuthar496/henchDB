@@ -693,6 +693,14 @@ fn banner() {
 fn shell(dir: &Path) -> engine::Result<()> {
     banner();
     let db = Database::open(dir)?;
+    // Shell sessions run as root, but SQL user management still works
+    // in-memory here; persist it so a later `serve` on this dir keeps it.
+    let auth_path = dir.join("auth.bin");
+    if let Ok(store) = auth::UserStore::load(&auth_path) {
+        db.import_privileges(
+            &store.users.iter().map(|(n, v)| (n.clone(), v.grants.clone())).collect::<Vec<_>>(),
+        );
+    }
     let mut session = db.new_session();
     println!("embedded mode. type SQL, or .help / .quit");
     let stdin = std::io::stdin();
@@ -716,10 +724,12 @@ fn shell(dir: &Path) -> engine::Result<()> {
             }
             _ => {}
         }
+        let v0 = db.privilege_version();
         match db.execute(&mut session, trimmed) {
             Ok(out) => print_output(&out),
             Err(e) => println!("error: {e}"),
         }
+        auth::persist_if_changed(&db, &auth_path, v0);
     }
     println!("checkpointing...");
     db.checkpoint()?;
@@ -787,8 +797,18 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     std::fs::create_dir_all(dir)?;
     // Fail closed when the auth store cannot bootstrap.
     let auth_path = dir.join("auth.bin");
-    auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;
+    let (auth_store, _) =
+        auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;
     let db = Arc::new(Database::open(dir)?);
+    // RBAC boot import: engine enforcement mirrors the file's principals +
+    // grants (root needs nothing stored: the code bypass covers it).
+    db.import_privileges(
+        &auth_store
+            .users
+            .iter()
+            .map(|(n, v)| (n.clone(), v.grants.clone()))
+            .collect::<Vec<_>>(),
+    );
     install_signal_handlers();
     // Continuous WAL archiving (PITR): checkpoints persist the truncated
     // durable prefix into HDBA segments under this directory.

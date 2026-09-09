@@ -106,6 +106,8 @@ pub(crate) fn is_write_statement(sql: &str) -> bool {
             | "CREATE"
             | "DROP"
             | "ALTER"
+            | "GRANT"
+            | "REVOKE"
             | "TRUNCATE"
             | "BACKUP"
             | "CHECKPOINT"

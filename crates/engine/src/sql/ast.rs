@@ -186,6 +186,92 @@ pub struct ForeignKeySpec {
     pub on_delete: FkAction,
 }
 
+/// Grantable privilege kinds (wire-visible names match MySQL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Create,
+    Drop,
+    All,
+}
+
+impl Privilege {
+    pub fn parse(s: &str) -> Option<Privilege> {
+        Some(match s.to_ascii_uppercase().as_str() {
+            "SELECT" => Privilege::Select,
+            "INSERT" => Privilege::Insert,
+            "UPDATE" => Privilege::Update,
+            "DELETE" => Privilege::Delete,
+            "CREATE" => Privilege::Create,
+            "DROP" => Privilege::Drop,
+            "ALL" | "ALL PRIVILEGES" => Privilege::All,
+            _ => return None,
+        })
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Privilege::Select => "SELECT",
+            Privilege::Insert => "INSERT",
+            Privilege::Update => "UPDATE",
+            Privilege::Delete => "DELETE",
+            Privilege::Create => "CREATE",
+            Privilege::Drop => "DROP",
+            Privilege::All => "ALL PRIVILEGES",
+        }
+    }
+
+    /// Stable codec byte for `auth.bin` (never reorder).
+    pub fn codec_byte(&self) -> u8 {
+        match self {
+            Privilege::Select => 1,
+            Privilege::Insert => 2,
+            Privilege::Update => 3,
+            Privilege::Delete => 4,
+            Privilege::Create => 5,
+            Privilege::Drop => 6,
+            Privilege::All => 7,
+        }
+    }
+
+    pub fn from_codec_byte(b: u8) -> Option<Privilege> {
+        Some(match b {
+            1 => Privilege::Select,
+            2 => Privilege::Insert,
+            3 => Privilege::Update,
+            4 => Privilege::Delete,
+            5 => Privilege::Create,
+            6 => Privilege::Drop,
+            7 => Privilege::All,
+            _ => return None,
+        })
+    }
+}
+
+/// Privilege scope: global (`*.*`), database (`db.*`), or table
+/// (`db.tbl`, bare `tbl` resolving to the session database at check time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantScope {
+    Global,
+    Database { db: String },
+    Table { db: Option<String>, tbl: String },
+}
+
+impl GrantScope {
+    /// Canonical display (`*.*`, `db.*`, `db.tbl` / `tbl`).
+    pub fn display(&self) -> String {
+        match self {
+            GrantScope::Global => "*.*".into(),
+            GrantScope::Database { db } => format!("{db}.*"),
+            GrantScope::Table { db: Some(db), tbl } => format!("{db}.{tbl}"),
+            GrantScope::Table { db: None, tbl } => tbl.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateDatabase {
@@ -267,5 +353,31 @@ pub enum Statement {
     Explain {
         analyze: bool,
         statement: Box<Statement>,
+    },
+    CreateUser {
+        name: String,
+        if_not_exists: bool,
+        password: String,
+    },
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    AlterUser {
+        name: String,
+        password: String,
+    },
+    Grant {
+        privs: Vec<Privilege>,
+        scope: GrantScope,
+        user: String,
+    },
+    Revoke {
+        privs: Vec<Privilege>,
+        scope: GrantScope,
+        user: String,
+    },
+    ShowGrants {
+        for_user: Option<String>,
     },
 }

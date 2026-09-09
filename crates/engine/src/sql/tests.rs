@@ -607,3 +607,93 @@ fn parse_sysfunc_fromless_and_casts() {
     assert!(parse_sql("SELECT * FROM t WHERE n = 'abc'::int4;").is_err());
     assert!(parse_sql("SELECT * FROM t WHERE n = 1::text::int4;").is_ok());
 }
+
+#[test]
+fn parse_user_management_and_grants() {
+    use super::ast::{GrantScope, Privilege};
+    // CREATE USER with IF NOT EXISTS + host specifier.
+    match parse_sql("CREATE USER IF NOT EXISTS 'alice'@'localhost' IDENTIFIED BY 's3cret';").unwrap() {
+        Statement::CreateUser { name, if_not_exists, password } => {
+            assert_eq!(name, "alice");
+            assert!(if_not_exists);
+            assert_eq!(password, "s3cret");
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Bare identifiers work too; non-string passwords fail.
+    match parse_sql("CREATE USER bob IDENTIFIED BY 'pw';").unwrap() {
+        Statement::CreateUser { name, .. } => assert_eq!(name, "bob"),
+        other => panic!("wrong stmt {other:?}"),
+    }
+    assert!(parse_sql("CREATE USER bob IDENTIFIED BY 42;").is_err());
+    // DROP / ALTER.
+    match parse_sql("DROP USER IF EXISTS 'alice';").unwrap() {
+        Statement::DropUser { name, if_exists } => {
+            assert_eq!(name, "alice");
+            assert!(if_exists);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("ALTER USER 'alice' IDENTIFIED BY 'new';").unwrap() {
+        Statement::AlterUser { name, password } => {
+            assert_eq!(name, "alice");
+            assert_eq!(password, "new");
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // GRANT with priv list, scopes, and host specifiers.
+    match parse_sql("GRANT SELECT, INSERT ON shop.* TO 'alice'@'%';").unwrap() {
+        Statement::Grant { privs, scope, user } => {
+            assert_eq!(privs, vec![Privilege::Select, Privilege::Insert]);
+            assert_eq!(scope, GrantScope::Database { db: "shop".into() });
+            assert_eq!(user, "alice");
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("GRANT ALL PRIVILEGES ON *.* TO root;").unwrap() {
+        Statement::Grant { privs, scope, user } => {
+            assert_eq!(privs, vec![Privilege::All]);
+            assert_eq!(scope, GrantScope::Global);
+            assert_eq!(user, "root");
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("GRANT UPDATE ON shop.orders TO bob;").unwrap() {
+        Statement::Grant { scope, .. } => {
+            assert_eq!(
+                scope,
+                GrantScope::Table { db: Some("shop".into()), tbl: "orders".into() }
+            );
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("GRANT DELETE ON orders TO bob;").unwrap() {
+        Statement::Grant { scope, .. } => {
+            assert_eq!(scope, GrantScope::Table { db: None, tbl: "orders".into() });
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // REVOKE mirrors GRANT with FROM.
+    match parse_sql("REVOKE SELECT ON *.* FROM 'alice';").unwrap() {
+        Statement::Revoke { privs, scope, user } => {
+            assert_eq!(privs, vec![Privilege::Select]);
+            assert_eq!(scope, GrantScope::Global);
+            assert_eq!(user, "alice");
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // SHOW GRANTS with and without FOR.
+    match parse_sql("SHOW GRANTS;").unwrap() {
+        Statement::ShowGrants { for_user } => assert_eq!(for_user, None),
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("SHOW GRANTS FOR 'alice'@localhost;").unwrap() {
+        Statement::ShowGrants { for_user } => assert_eq!(for_user.as_deref(), Some("alice")),
+        other => panic!("wrong stmt {other:?}"),
+    }
+    // Rejections: unknown privileges, missing ON/TO, ALTER non-USER.
+    assert!(parse_sql("GRANT FROBNICATE ON *.* TO bob;").is_err());
+    assert!(parse_sql("GRANT SELECT *.* TO bob;").is_err());
+    assert!(parse_sql("GRANT SELECT ON *.* bob;").is_err());
+    assert!(parse_sql("ALTER TABLE t ADD COLUMN c INT;").is_err());
+}

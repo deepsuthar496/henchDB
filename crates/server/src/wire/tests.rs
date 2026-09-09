@@ -86,8 +86,7 @@ fn response_parse_auth_and_plugin() {
 }
 
 #[test]
-fn ok_err_eof_shapes() {
-    let ok = ok_payload(3, "3 row(s) inserted");
+fn ok_err_eof_shapes() {    let ok = ok_payload(3, "3 row(s) inserted");
     assert_eq!(ok[0], 0x00);
     let err = err_payload(1064, "42000", "parse error: x");
     assert_eq!(err[0], 0xFF);
@@ -95,6 +94,26 @@ fn ok_err_eof_shapes() {
     assert_eq!(err[3], b'#');
     assert_eq!(&err[4..9], b"42000");
     assert_eq!(eof_payload()[0], 0xFE);
+}
+
+#[test]
+fn access_denied_maps_to_mysql_1142() {
+    // Exact MySQL 1142/42000 code + message shape for RBAC denials.
+    let e = engine::Error::AccessDenied {
+        user: "alice".into(),
+        command: "SELECT".into(),
+        object: "shop.orders".into(),
+    };
+    assert_eq!(
+        e.to_string(),
+        "SELECT command denied to user 'alice'@'localhost' for table 'shop.orders'"
+    );
+    let (code, state) = mysql_error_for(&e);
+    assert_eq!((code, state), (1142, "42000"));
+    let err = err_payload(code, state, &e.to_string());
+    assert_eq!(err[0], 0xFF);
+    assert_eq!(u16::from_le_bytes([err[1], err[2]]), 1142);
+    assert_eq!(&err[4..9], b"42000");
 }
 
 #[test]

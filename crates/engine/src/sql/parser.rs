@@ -177,9 +177,17 @@ impl Parser {
                     Ok(Statement::ShowEngineStatus)
                 } else if self.eat_kw("PROCESSLIST") {
                     Ok(Statement::ShowProcesslist)
+                } else if self.eat_kw("GRANTS") {
+                    // SHOW GRANTS [FOR user]
+                    let for_user = if self.eat_kw("FOR") {
+                        Some(self.parse_user_name()?)
+                    } else {
+                        None
+                    };
+                    Ok(Statement::ShowGrants { for_user })
                 } else {
                     Err(Error::ParseError(format!(
-                        "expected TABLES, DATABASES, STATUS, ENGINE STATUS or PROCESSLIST after SHOW, got {:?}",
+                        "expected TABLES, DATABASES, STATUS, ENGINE STATUS, PROCESSLIST or GRANTS after SHOW, got {:?}",
                         self.peek()
                     )))
                 }
@@ -245,10 +253,126 @@ impl Parser {
                     statement: Box::new(self.parse_select()?),
                 })
             }
+            Some("GRANT") => self.parse_grant(false),
+            Some("REVOKE") => self.parse_grant(true),
+            Some("ALTER") => {
+                self.pos += 1;
+                self.expect_kw("USER")?;
+                let name = self.parse_user_name()?;
+                self.expect_kw("IDENTIFIED")?;
+                self.expect_kw("BY")?;
+                let password = self.parse_password()?;
+                Ok(Statement::AlterUser { name, password })
+            }
             _ => Err(Error::ParseError(format!(
                 "expected statement, got {:?}",
                 self.peek()
             ))),
+        }
+    }
+
+    /// Parse a `user` / `'user'` / `"user"` account name with an optional
+    /// `@host` specifier (host validated, normalized away: permissions are
+    /// per username).
+    fn parse_user_name(&mut self) -> Result<String> {
+        let name = match self.next() {
+            Token::Str(s) => s,
+            Token::Ident(s) => s,
+            t => {
+                return Err(Error::ParseError(format!(
+                    "expected user name, got {t:?}"
+                )))
+            }
+        };
+        if self.eat_sym('@') {
+            match self.next() {
+                Token::Str(_) | Token::Ident(_) => {}
+                t => {
+                    return Err(Error::ParseError(format!(
+                        "expected host after '@', got {t:?}"
+                    )))
+                }
+            }
+        }
+        if name.is_empty() || name.len() > 256 {
+            return Err(Error::ParseError("bad user name".into()));
+        }
+        Ok(name)
+    }
+
+    /// Parse `'password'` (string literal only — never an identifier).
+    fn parse_password(&mut self) -> Result<String> {
+        match self.parse_literal_operand()? {
+            Datum::Text(p) => Ok(p),
+            other => Err(Error::ParseError(format!(
+                "password must be a string literal, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Parse `priv1 [, priv2 ...]` (`ALL [PRIVILEGES]` allowed).
+    fn parse_priv_list(&mut self) -> Result<Vec<Privilege>> {
+        let mut privs = Vec::new();
+        loop {
+            let word = self.expect_ident()?;
+            let mut p = Privilege::parse(&word).ok_or_else(|| {
+                Error::ParseError(format!("unknown privilege '{word}'"))
+            })?;
+            if p == Privilege::All {
+                self.eat_kw("PRIVILEGES");
+                p = Privilege::All;
+            }
+            privs.push(p);
+            if !self.eat_sym(',') {
+                break;
+            }
+        }
+        Ok(privs)
+    }
+
+    /// Parse a grant scope: `*.*` (or bare `*`), `db.*`, `db.tbl`, `tbl`.
+    fn parse_grant_scope(&mut self) -> Result<GrantScope> {
+        if self.peek() == &Token::Sym('*') {
+            self.pos += 1;
+            if self.eat_sym('.') {
+                self.expect_sym('*')?;
+            }
+            return Ok(GrantScope::Global);
+        }
+        let first = match self.next() {
+            Token::Str(s) => s,
+            Token::Ident(s) => s,
+            t => {
+                return Err(Error::ParseError(format!(
+                    "expected grant scope, got {t:?}"
+                )))
+            }
+        };
+        if self.eat_sym('.') {
+            if self.peek() == &Token::Sym('*') {
+                self.pos += 1;
+                Ok(GrantScope::Database { db: first })
+            } else {
+                let tbl = self.expect_ident()?;
+                Ok(GrantScope::Table { db: Some(first), tbl })
+            }
+        } else {
+            Ok(GrantScope::Table { db: None, tbl: first })
+        }
+    }
+
+    /// Parse `GRANT privs ON scope TO user` / `REVOKE privs ON scope FROM`.
+    fn parse_grant(&mut self, revoke: bool) -> Result<Statement> {
+        self.pos += 1;
+        let privs = self.parse_priv_list()?;
+        self.expect_kw("ON")?;
+        let scope = self.parse_grant_scope()?;
+        self.expect_kw(if revoke { "FROM" } else { "TO" })?;
+        let user = self.parse_user_name()?;
+        if revoke {
+            Ok(Statement::Revoke { privs, scope, user })
+        } else {
+            Ok(Statement::Grant { privs, scope, user })
         }
     }
 
@@ -264,6 +388,19 @@ impl Parser {
             };
             let name = self.expect_ident()?;
             Ok(Statement::CreateDatabase { name, if_not_exists })
+        } else if self.eat_kw("USER") {
+            let if_not_exists = if self.eat_kw("IF") {
+                self.expect_kw("NOT")?;
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
+            let name = self.parse_user_name()?;
+            self.expect_kw("IDENTIFIED")?;
+            self.expect_kw("BY")?;
+            let password = self.parse_password()?;
+            Ok(Statement::CreateUser { name, if_not_exists, password })
         } else if self.eat_kw("TABLE") {
             let name = self.expect_ident()?;
             self.expect_sym('(')?;
@@ -404,6 +541,15 @@ impl Parser {
         } else if self.eat_kw("TABLE") {
             let name = self.expect_ident()?;
             Ok(Statement::DropTable { name })
+        } else if self.eat_kw("USER") {
+            let if_exists = if self.eat_kw("IF") {
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
+            let name = self.parse_user_name()?;
+            Ok(Statement::DropUser { name, if_exists })
         } else if self.eat_kw("INDEX") {
             let name = self.expect_ident()?;
             self.expect_kw("ON")?;
@@ -411,7 +557,7 @@ impl Parser {
             Ok(Statement::DropIndex { name, table })
         } else {
             Err(Error::ParseError(format!(
-                "expected DATABASE, TABLE, or INDEX after DROP, got {:?}",
+                "expected DATABASE, TABLE, USER, or INDEX after DROP, got {:?}",
                 self.peek()
             )))
         }
