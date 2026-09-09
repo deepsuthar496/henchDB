@@ -272,6 +272,13 @@ impl GrantScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateDatabase {
@@ -316,11 +323,20 @@ pub enum Statement {
         table: String,
         selection: Option<Expr>,
     },
-    Begin,
+    Begin {
+        isolation: Option<IsolationLevel>,
+        read_only: bool,
+    },
     Commit,
     Rollback,
     StartTransaction {
         snapshot: bool,
+        isolation: Option<IsolationLevel>,
+        read_only: bool,
+    },
+    SetTransaction {
+        isolation: IsolationLevel,
+        global: bool,
     },
     ShowTables,
     ShowStatus {

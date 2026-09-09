@@ -1,4 +1,4 @@
-//! MVCC version buffer & snapshot isolation (F3, `research.md` §MVCC).
+//! MVCC version buffer & snapshot isolation (Priority 20, `research.md` §MVCC).
 //!
 //! Every commit allocates a monotonically increasing commit epoch (under the
 //! commit lock, so epochs follow WAL order). While at least one snapshot
@@ -6,29 +6,30 @@
 //! `chains[(table, pk)]` holds `(until_epoch, row)` newest-first, and
 //! `committed[(table, pk)]` holds the live row's epoch.
 //!
+//! When a transaction commits, all its superseded states across all modified
+//! tables and keys are recorded atomically under `VersionState`'s write lock,
+//! and `visible_epoch` is advanced to `commit_epoch`. Readers taking a snapshot
+//! observe `read_epoch = visible_epoch`.
+//!
 //! A snapshot pinned at read epoch R sees, per key, the current row when its
-//! commit epoch is < R, else the row of the chain entry with the smallest
-//! `until` still >= R (that entry's row was valid up to `until`). Absent keys
+//! committed epoch is <= R, else the row of the chain entry with the smallest
+//! `until` still > R (that entry's row was valid up to `until`). Absent keys
 //! (never-inserted, or created after R) resolve to `None`; keys deleted after
 //! R resolve to their pre-delete row, so scans sweep chains for missing keys.
 //!
 //! Recording is skipped entirely when no snapshot is active (zero overhead
 //! for plain OLTP, and the common case stays exactly the old code path).
-//! History never survives restarts (in-memory only; post-open rows read as
-//! epoch 0) and multi-row commits install row-by-row, so a concurrent
-//! snapshot may observe a commit partially — per-row time travel, not atomic
-//! commit visibility. Both are documented v1 limits.
 //!
-//! Garbage collection: an entry with `until < oldest_active_R` is never
-//! consulted by any live reader (walks stop at the first `until < R`), so
-//! pruning drops those entries and committed epochs `< oldest`. With no
-//! active readers everything drains.
+//! Garbage collection: an entry with `until <= oldest_active_R` is never
+//! consulted by any live reader (walks stop at the first `until <= R`), so
+//! pruning drops those entries and committed epochs `<= oldest`. With no
+//! active readers everything drains to zero memory.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::{ActiveTxn, Database, Output, Session};
+use super::{ActiveTxn, Database, Output, Session, StagedWrite};
 use crate::error::{Error, Result};
 use crate::table::Table;
 use crate::types::Datum;
@@ -66,27 +67,30 @@ impl VersionState {
     }
 
     /// Drop history no live reader can consult (see module docs).
-    fn gc_locked(&mut self) {        match self.snapshots.values().copied().min() {
+    fn gc_locked(&mut self) {
+        match self.snapshots.values().copied().min() {
             None => {
                 self.chains.clear();
                 self.committed.clear();
             }
             Some(oldest) => {
                 self.chains.retain(|_, chain| {
-                    chain.retain(|(until, _)| *until >= oldest);
+                    chain.retain(|(until, _)| *until > oldest);
                     !chain.is_empty()
                 });
-                self.committed.retain(|_, e| *e >= oldest);
+                self.committed.retain(|_, e| *e > oldest);
             }
         }
     }
 }
 
-/// Snapshot pinned by `START TRANSACTION WITH CONSISTENT SNAPSHOT`.
-#[derive(Debug, Clone, Copy)]
+/// Snapshot pinned by `START TRANSACTION WITH CONSISTENT SNAPSHOT`,
+/// explicit `REPEATABLE READ` transaction start, or statement-scoped read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SnapshotPin {
     pub(crate) id: u64,
     pub(crate) read_epoch: u64,
+    pub(crate) is_statement: bool,
 }
 
 impl Database {
@@ -123,22 +127,49 @@ impl Database {
         };
         let tkey = (table.def.name.clone(), key.to_vec());
         vs.chains.entry(tkey.clone()).or_default().insert(0, (epoch, prev));
-        match new_enc {
-            Some(_) => {
-                vs.committed.insert(tkey, epoch);
+        vs.committed.insert(tkey, epoch);
+        Ok(())
+    }
+
+    /// Record all superseded states for a multi-row commit atomically under
+    /// one version buffer write lock.
+    pub(crate) fn record_commit_batch(
+        &self,
+        tables: &HashMap<String, Arc<Table>>,
+        staged: &HashMap<(String, Vec<u8>), StagedWrite>,
+        encoded_rows: &[Option<Vec<u8>>],
+        epoch: u64,
+    ) -> Result<()> {
+        let mut vs = self.versions.write().unwrap();
+        if vs.snapshots.is_empty() {
+            return Ok(());
+        }
+        for (((table_name, key), _), enc_opt) in staged.iter().zip(encoded_rows.iter()) {
+            let table = match tables.get(table_name) {
+                Some(t) => t,
+                None => continue,
+            };
+            let prev_raw = table.tree().get(key);
+            match (&prev_raw, enc_opt) {
+                (None, None) => continue,
+                (Some(a), Some(b)) if a == b => continue,
+                _ => {}
             }
-            None => {
-                vs.committed.remove(&tkey);
-            }
+            let prev = match prev_raw {
+                Some(raw) => Some(table.decode_stored(&raw)?),
+                None => None,
+            };
+            let tkey = (table_name.clone(), key.clone());
+            vs.chains.entry(tkey.clone()).or_default().insert(0, (epoch, prev));
+            vs.committed.insert(tkey, epoch);
         }
         Ok(())
     }
 
     /// Resolve `current` (the tree state) to what `session`'s snapshot sees.
     /// Passes through untouched when the session holds no snapshot.
-    /// Boundary: commit C is visible at read epoch R iff C < R (the pin
-    /// observes the allocation counter, so the next commit lands exactly on
-    /// R and must stay invisible).
+    /// Boundary: commit C is visible at read epoch R iff C <= R (since R
+    /// is loaded from `visible_epoch`, the last fully installed commit).
     pub(crate) fn snapshot_lookup(
         &self,
         session: &Session,
@@ -151,14 +182,14 @@ impl Database {
         };
         let vs = self.versions.read().unwrap();
         let tkey = (table.def.name.clone(), key.to_vec());
-        if vs.committed.get(&tkey).copied().unwrap_or(0) < snap.read_epoch {
+        if vs.committed.get(&tkey).copied().unwrap_or(0) <= snap.read_epoch {
             return Ok(current);
         }
         if let Some(chain) = vs.chains.get(&tkey) {
             let mut ans: Option<Vec<Datum>> = None;
             let mut found = false;
             for (until, row) in chain.iter() {
-                if *until >= snap.read_epoch {
+                if *until > snap.read_epoch {
                     ans = row.clone();
                     found = true;
                 } else {
@@ -196,7 +227,7 @@ impl Database {
             let mut ans: Option<Vec<Datum>> = None;
             let mut found = false;
             for (until, row) in chain.iter() {
-                if *until >= snap.read_epoch {
+                if *until > snap.read_epoch {
                     ans = row.clone();
                     found = true;
                 } else {
@@ -213,12 +244,12 @@ impl Database {
     }
 
     /// `START TRANSACTION WITH CONSISTENT SNAPSHOT`: begin a txn pinned at
-    /// the current commit epoch and register it for GC protection.
+    /// the current visible commit epoch and register it for GC protection.
     pub(crate) fn snapshot_begin(&self, session: &mut Session) -> Result<Output> {
         if session.txn.is_some() {
             return Err(Error::TxnConflict("transaction already active".into()));
         }
-        let read_epoch = self.commit_epoch.load(Ordering::SeqCst);
+        let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
@@ -230,12 +261,67 @@ impl Database {
             id: txn_id,
             staged: HashMap::new(),
         });
-        session.snapshot = Some(SnapshotPin { id, read_epoch });
+        session.snapshot = Some(SnapshotPin {
+            id,
+            read_epoch,
+            is_statement: false,
+        });
         self.metrics.txn_begin();
         Ok(Output::ok("BEGIN"))
     }
 
-    /// Release a session's snapshot pin and prune newly-unreachable history.
+    /// Pin snapshot for an active transaction (e.g. `BEGIN` under `RepeatableRead`
+    /// upon the first read query).
+    pub(crate) fn snapshot_pin_active(&self, session: &mut Session) {
+        if session.snapshot.is_some() {
+            return;
+        }
+        let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
+        let id = {
+            let mut vs = self.versions.write().unwrap();
+            let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
+            vs.snapshots.insert(id, read_epoch);
+            id
+        };
+        session.snapshot = Some(SnapshotPin {
+            id,
+            read_epoch,
+            is_statement: false,
+        });
+    }
+
+    /// Pin a statement-scoped snapshot for autocommit queries or `ReadCommitted`.
+    pub(crate) fn snapshot_pin_statement(&self, session: &mut Session) {
+        if session.snapshot.is_some() {
+            return;
+        }
+        let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
+        let id = {
+            let mut vs = self.versions.write().unwrap();
+            let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
+            vs.snapshots.insert(id, read_epoch);
+            id
+        };
+        session.snapshot = Some(SnapshotPin {
+            id,
+            read_epoch,
+            is_statement: true,
+        });
+    }
+
+    /// Release a statement-scoped snapshot if one was pinned for this query.
+    pub(crate) fn snapshot_end_statement(&self, session: &mut Session) {
+        if let Some(snap) = session.snapshot {
+            if snap.is_statement {
+                session.snapshot = None;
+                let mut vs = self.versions.write().unwrap();
+                vs.snapshots.remove(&snap.id);
+                vs.gc_locked();
+            }
+        }
+    }
+
+    /// Release a session's snapshot pin unconditionally and prune newly-unreachable history.
     pub(crate) fn snapshot_end(&self, session: &mut Session) {
         if let Some(snap) = session.snapshot.take() {
             let mut vs = self.versions.write().unwrap();

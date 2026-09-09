@@ -110,6 +110,25 @@ impl Parser {
         }
     }
 
+    fn parse_isolation_level(&mut self) -> Result<IsolationLevel> {
+        if self.eat_kw("REPEATABLE") {
+            self.expect_kw("READ")?;
+            Ok(IsolationLevel::RepeatableRead)
+        } else if self.eat_kw("READ") {
+            if self.eat_kw("COMMITTED") {
+                Ok(IsolationLevel::ReadCommitted)
+            } else if self.eat_kw("UNCOMMITTED") {
+                Ok(IsolationLevel::ReadCommitted)
+            } else {
+                Err(Error::ParseError("expected COMMITTED or UNCOMMITTED after READ".into()))
+            }
+        } else if self.eat_kw("SERIALIZABLE") {
+            Ok(IsolationLevel::Serializable)
+        } else {
+            Err(Error::ParseError(format!("unknown isolation level: {:?}", self.peek())))
+        }
+    }
+
     fn parse_statement(&mut self) -> Result<Statement> {
         match kw(self.peek()).as_deref() {
             Some("CREATE") => self.parse_create(),
@@ -125,21 +144,48 @@ impl Parser {
             Some("DELETE") => self.parse_delete(),
             Some("BEGIN") => {
                 self.pos += 1;
-                // ORMs open transactions as `BEGIN TRANSACTION`.
                 self.eat_kw("TRANSACTION");
-                Ok(Statement::Begin)
+                let mut isolation = None;
+                if self.eat_kw("ISOLATION") {
+                    self.expect_kw("LEVEL")?;
+                    isolation = Some(self.parse_isolation_level()?);
+                }
+                let mut read_only = false;
+                if self.eat_kw("READ") {
+                    if self.eat_kw("ONLY") {
+                        read_only = true;
+                    } else {
+                        self.eat_kw("WRITE");
+                    }
+                }
+                Ok(Statement::Begin { isolation, read_only })
             }
             Some("START") => {
-                // START TRANSACTION [WITH CONSISTENT SNAPSHOT]
+                // START TRANSACTION [WITH CONSISTENT SNAPSHOT] [ISOLATION LEVEL ...] [READ ONLY|READ WRITE]
                 self.pos += 1;
                 self.expect_kw("TRANSACTION")?;
                 let mut snapshot = false;
-                if self.eat_kw("WITH") {
-                    self.expect_kw("CONSISTENT")?;
-                    self.expect_kw("SNAPSHOT")?;
-                    snapshot = true;
+                let mut isolation = None;
+                let mut read_only = false;
+                while self.peek() != &Token::Eof {
+                    if self.eat_kw("WITH") {
+                        self.expect_kw("CONSISTENT")?;
+                        self.expect_kw("SNAPSHOT")?;
+                        snapshot = true;
+                    } else if self.eat_kw("ISOLATION") {
+                        self.expect_kw("LEVEL")?;
+                        isolation = Some(self.parse_isolation_level()?);
+                    } else if self.eat_kw("READ") {
+                        if self.eat_kw("ONLY") {
+                            read_only = true;
+                        } else {
+                            self.eat_kw("WRITE");
+                        }
+                    } else {
+                        break;
+                    }
                 }
-                Ok(Statement::StartTransaction { snapshot })
+                Ok(Statement::StartTransaction { snapshot, isolation, read_only })
             }
             Some("COMMIT") => {
                 self.pos += 1;
@@ -213,10 +259,27 @@ impl Parser {
             }
             Some("SET") => {
                 self.pos += 1;
-                let name = self.expect_ident()?;
-                self.expect_sym('=')?;
-                let value = self.parse_literal_operand()?;
-                Ok(Statement::SetVariable { name, value })
+                let is_session = self.eat_kw("SESSION");
+                let is_global = if !is_session { self.eat_kw("GLOBAL") } else { false };
+                if self.eat_kw("TRANSACTION") {
+                    self.expect_kw("ISOLATION")?;
+                    self.expect_kw("LEVEL")?;
+                    let level = self.parse_isolation_level()?;
+                    Ok(Statement::SetTransaction { isolation: level, global: is_global })
+                } else if self.eat_kw("NAMES") {
+                    let val = self.parse_literal_operand()?;
+                    Ok(Statement::SetVariable { name: "names".into(), value: val })
+                } else {
+                    let name = if self.eat_sym('@') {
+                        self.eat_sym('@');
+                        self.expect_ident()?
+                    } else {
+                        self.expect_ident()?
+                    };
+                    self.expect_sym('=')?;
+                    let value = self.parse_literal_operand()?;
+                    Ok(Statement::SetVariable { name, value })
+                }
             }
             Some("ANALYZE") => {
                 self.pos += 1;

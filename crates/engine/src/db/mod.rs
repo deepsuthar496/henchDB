@@ -73,6 +73,7 @@ impl Output {
 
 /// A client session: at most one active transaction and active database context.
 use std::time::Duration;
+use crate::sql::IsolationLevel;
 
 pub struct Session {
     pub(crate) txn: Option<ActiveTxn>,
@@ -81,6 +82,7 @@ pub struct Session {
     /// local sessions). Backs the `user()` system function.
     pub user: String,
     pub max_execution_time: Option<Duration>,
+    pub isolation_level: IsolationLevel,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
     /// Subquery evaluation state (derived-table materializations, correlated
@@ -103,6 +105,7 @@ impl Default for Session {
             current_db: "default".to_string(),
             user: "root".to_string(),
             max_execution_time: None,
+            isolation_level: IsolationLevel::RepeatableRead,
             snapshot: None,
             subq: subquery::SubqueryState::default(),
         }
@@ -144,6 +147,8 @@ pub struct Database {
     /// Monotonic commit epoch for MVCC (allocated under the commit lock, so
     /// epochs follow WAL order). Starts at 1; post-open rows read as epoch 0.
     commit_epoch: AtomicU64,
+    /// Latest fully installed commit epoch visible to new snapshot readers.
+    pub(crate) visible_epoch: AtomicU64,
     /// MVCC version buffer + snapshot registry (F3). Empty in plain OLTP.
     versions: RwLock<mvcc::VersionState>,
     /// Atomic telemetry: query/latency/WAL/connection counters + the
@@ -248,6 +253,7 @@ impl Database {
             next_txn: AtomicU64::new(1),
             epoch,
             commit_epoch: AtomicU64::new(1),
+            visible_epoch: AtomicU64::new(0),
             versions: RwLock::new(mvcc::VersionState::new()),
             metrics: Metrics::new(),
             read_only: AtomicBool::new(false),
@@ -346,20 +352,20 @@ impl Database {
         session.subq.fold.clear();
         let _guard = self.epoch.pin();
         let t0 = std::time::Instant::now();
-        let res = self.execute_inner(session, sql);
+        let trimmed = sql.trim();
+        let res = self.execute_routed(session, sql, trimmed);
         // Telemetry (hot path: atomics only). Classification from the first
         // keyword covers fast-path and parsed statements uniformly; errors
         // count like MySQL (attempted statements are still queries).
-        let kind = StmtKind::classify(sql.trim());
+        let kind = StmtKind::classify(trimmed);
         self.metrics
             .record_query(kind, t0.elapsed().as_micros() as u64);
         res
     }
 
-    fn execute_inner(&self, session: &mut Session, sql: &str) -> Result<Output> {
-        let trimmed = sql.trim();
+    fn execute_routed(&self, session: &mut Session, _sql: &str, trimmed: &str) -> Result<Output> {
         if trimmed.eq_ignore_ascii_case("begin") || trimmed.eq_ignore_ascii_case("begin;") {
-            return self.execute_stmt(session, Statement::Begin);
+            return self.execute_stmt(session, Statement::Begin { isolation: None, read_only: false });
         }
         if trimmed.eq_ignore_ascii_case("commit") || trimmed.eq_ignore_ascii_case("commit;") {
             return self.execute_stmt(session, Statement::Commit);
@@ -373,12 +379,44 @@ impl Database {
         if let Some(out) = self.try_fast_point_update(session, trimmed)? {
             return Ok(out);
         }
+        self.prepare_statement_snapshot(session, trimmed);
+        let res = self.execute_inner(session, trimmed);
+        self.cleanup_statement_snapshot(session);
+        res
+    }
+
+    fn prepare_statement_snapshot(&self, session: &mut Session, trimmed: &str) {
+        if trimmed.is_empty() {
+            return;
+        }
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        let is_read = first_word.eq_ignore_ascii_case("select")
+            || first_word.eq_ignore_ascii_case("explain")
+            || first_word.eq_ignore_ascii_case("with");
+        if session.in_transaction() {
+            if session.isolation_level == IsolationLevel::RepeatableRead {
+                if session.snapshot.is_none() && is_read {
+                    self.snapshot_pin_active(session);
+                }
+            } else if is_read {
+                self.snapshot_pin_statement(session);
+            }
+        } else if is_read {
+            self.snapshot_pin_statement(session);
+        }
+    }
+
+    fn cleanup_statement_snapshot(&self, session: &mut Session) {
+        self.snapshot_end_statement(session);
+    }
+
+    fn execute_inner(&self, session: &mut Session, trimmed: &str) -> Result<Output> {
         let stmt = parse_sql(trimmed)?;
         self.execute_stmt(session, stmt)
     }
 
     fn try_fast_point_select(&self, session: &Session, sql: &str) -> Result<Option<Output>> {
-        if session.txn.is_some() {
+        if session.txn.is_some() || session.snapshot.is_some() {
             return Ok(None);
         }
         let s = sql.strip_suffix(';').unwrap_or(sql).trim();
@@ -473,9 +511,12 @@ impl Database {
             | Statement::Grant { .. }
             | Statement::Revoke { .. }
             | Statement::ShowGrants { .. } => privilege::exec_user_mgmt(self, session, stmt),
-            Statement::Begin => {
+            Statement::Begin { isolation, read_only: _ } => {
                 if session.txn.is_some() {
                     return Err(Error::TxnConflict("transaction already active".into()));
+                }
+                if let Some(lvl) = isolation {
+                    session.isolation_level = lvl;
                 }
                 let id = self.next_txn.fetch_add(1, Ordering::Relaxed);
                 session.txn = Some(ActiveTxn {
@@ -498,12 +539,21 @@ impl Database {
                 self.snapshot_end(session);
                 Ok(Output::ok("ROLLBACK"))
             }
-            Statement::StartTransaction { snapshot } => {
+            Statement::StartTransaction { snapshot, isolation, read_only } => {
+                if let Some(lvl) = isolation {
+                    session.isolation_level = lvl;
+                }
                 if snapshot {
                     self.snapshot_begin(session)
                 } else {
-                    return self.execute_stmt(session, Statement::Begin);
+                    return self.execute_stmt(session, Statement::Begin { isolation, read_only });
                 }
+            }
+            Statement::SetTransaction { isolation, global } => {
+                if !global {
+                    session.isolation_level = isolation;
+                }
+                Ok(Output::ok("isolation level set"))
             }
             Statement::ShowTables => {
                 let prefix = format!("{}.", session.current_db);
@@ -550,6 +600,23 @@ impl Database {
                 )))
             }
             Statement::SetVariable { name, value } => {
+                if name.eq_ignore_ascii_case("transaction_isolation")
+                    || name.eq_ignore_ascii_case("tx_isolation")
+                {
+                    match &value {
+                        Datum::Text(s) => {
+                            let up = s.to_ascii_uppercase().replace('_', "-");
+                            if up.contains("READ-COMMITTED") || up.contains("READ COMMITTED") {
+                                session.isolation_level = IsolationLevel::ReadCommitted;
+                            } else if up.contains("REPEATABLE-READ") || up.contains("REPEATABLE READ") {
+                                session.isolation_level = IsolationLevel::RepeatableRead;
+                            } else if up.contains("SERIALIZABLE") {
+                                session.isolation_level = IsolationLevel::Serializable;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 if name.eq_ignore_ascii_case("max_execution_time") {
                     match value {
                         Datum::Int(ms) if ms > 0 => {
@@ -816,16 +883,15 @@ impl Database {
             while *frontier != start {
                 frontier = self.install_cv.wait(frontier).unwrap();
             }
+            self.record_commit_batch(&tables, &staged, &encoded_rows, commit_epoch)?;
             for (((table, key), _), enc_opt) in staged.iter().zip(encoded_rows.into_iter()) {
                 let t = &tables[table];
-                // MVCC: preserve the superseded state before overwriting
-                // (skipped internally when no snapshot reader is active).
-                self.record_install(t, key, enc_opt.as_deref(), commit_epoch)?;
                 match enc_opt {
                     Some(enc) => t.apply_raw(key, &enc)?,
                     None => t.remove_raw(key),
                 }
             }
+            self.visible_epoch.store(commit_epoch, Ordering::SeqCst);
             *frontier = end;
             drop(frontier);
             self.install_cv.notify_all();

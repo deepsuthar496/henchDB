@@ -214,6 +214,7 @@ impl Database {
             }
             self.record_install(table, &key, Some(&enc), commit_epoch)?;
             table.apply_raw(&key, &enc)?;
+            self.visible_epoch.store(commit_epoch, std::sync::atomic::Ordering::SeqCst);
             *frontier = end;
             drop(frontier);
             self.install_cv.notify_all();

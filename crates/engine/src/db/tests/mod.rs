@@ -11,6 +11,7 @@ mod batch;
 mod fk;
 mod joins;
 mod memo;
+mod mvcc;
 mod opt;
 mod privilege;
 mod subquery;

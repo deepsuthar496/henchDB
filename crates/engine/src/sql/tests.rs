@@ -359,11 +359,42 @@ fn parse_foreign_keys() {
 #[test]
 fn parse_start_transaction() {
     match parse_sql("START TRANSACTION").unwrap() {
-        Statement::StartTransaction { snapshot } => assert!(!snapshot),
+        Statement::StartTransaction { snapshot, isolation, read_only } => {
+            assert!(!snapshot);
+            assert_eq!(isolation, None);
+            assert!(!read_only);
+        }
         other => panic!("wrong stmt {other:?}"),
     }
     match parse_sql("START TRANSACTION WITH CONSISTENT SNAPSHOT").unwrap() {
-        Statement::StartTransaction { snapshot } => assert!(snapshot),
+        Statement::StartTransaction { snapshot, .. } => assert!(snapshot),
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("START TRANSACTION ISOLATION LEVEL READ COMMITTED").unwrap() {
+        Statement::StartTransaction { isolation, .. } => {
+            assert_eq!(isolation, Some(IsolationLevel::ReadCommitted));
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY").unwrap() {
+        Statement::Begin { isolation, read_only } => {
+            assert_eq!(isolation, Some(IsolationLevel::RepeatableRead));
+            assert!(read_only);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap() {
+        Statement::SetTransaction { isolation, global } => {
+            assert_eq!(isolation, IsolationLevel::Serializable);
+            assert!(!global);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+    match parse_sql("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED").unwrap() {
+        Statement::SetTransaction { isolation, global } => {
+            assert_eq!(isolation, IsolationLevel::ReadCommitted);
+            assert!(!global);
+        }
         other => panic!("wrong stmt {other:?}"),
     }
     assert!(parse_sql("START TRANSACTION WITH FOO").is_err());
