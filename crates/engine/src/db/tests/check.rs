@@ -182,3 +182,62 @@ fn mvcc_max_snapshot_age_expiration() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn resource_governance_max_intermediate_rows_enforced() {
+    let dir = std::env::temp_dir().join(format!("hdbres_inter_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = setup(&dir);
+    let mut s = db.new_session();
+
+    for i in 1..=10 {
+        db.execute(&mut s, &format!("INSERT INTO t VALUES ({i}, 'item{i}', 1.0)")).unwrap();
+    }
+    db.execute(&mut s, "CREATE TABLE u (uid INT PRIMARY KEY, tag TEXT)").unwrap();
+    for i in 1..=10 {
+        db.execute(&mut s, &format!("INSERT INTO u VALUES ({i}, 'tag{i}')")).unwrap();
+    }
+
+    // 1. Join intermediate limit
+    db.execute(&mut s, "SET max_intermediate_rows = 5").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.uid");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_rows limit (5) during join"));
+
+    // 2. Aggregation / group by intermediate limit
+    db.execute(&mut s, "SET max_intermediate_rows = 4").unwrap();
+    let res = db.execute(&mut s, "SELECT id, COUNT(*) FROM t GROUP BY id");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_rows limit (4) during aggregation"));
+
+    // 3. Sort intermediate limit
+    db.execute(&mut s, "SET max_intermediate_rows = 6").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM t ORDER BY score DESC");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_rows limit (6) during sort"));
+
+    // 4. Subquery IN intermediate limit
+    db.execute(&mut s, "SET max_intermediate_rows = 5").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM t WHERE id IN (SELECT uid FROM u)");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_rows limit (5) during subquery IN evaluation"));
+
+    // 5. Derived table intermediate limit
+    db.execute(&mut s, "SET max_intermediate_rows = 5").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM (SELECT id FROM t) AS d");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_rows limit (5) during subquery materialization"));
+
+    // Reset limit: all queries succeed cleanly!
+    db.execute(&mut s, "SET max_intermediate_rows = 0").unwrap();
+    let out = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.uid").unwrap();
+    assert_eq!(out.rows.len(), 10);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+

@@ -562,6 +562,13 @@ impl Database {
         }
 
         if !order_by.is_empty() {
+            if let Some(limit) = session.max_intermediate_rows {
+                if rows.len() > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_rows limit ({limit}) during sort"
+                    )));
+                }
+            }
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
                 keys.push(Self::single_col_idx(schema, display, col)?);

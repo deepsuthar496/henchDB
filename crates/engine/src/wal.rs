@@ -416,6 +416,7 @@ impl Wal {
         // Encode already happened outside; this section is fetch_add plus
         // one queue push — no syscalls, no file lock.
         let start = {
+            let _rank = crate::lock_rank::LockRankGuard::acquire(crate::lock_rank::LockRank::WalStage);
             let _seq = self.shared.stage_lock.lock().unwrap();
             let start = self
                 .shared
@@ -600,6 +601,7 @@ fn syncer_loop(shared: Arc<WalShared>) {
         }
 
         let round: Result<()> = (|| {
+            let _rank = crate::lock_rank::LockRankGuard::acquire(crate::lock_rank::LockRank::WalFlush);
             let _flush = shared.flush_lock.lock().unwrap();
             let frontier = drain_available(&shared, DRAIN_BATCH_CAP, &mut batch);
             if batch.is_empty() {
@@ -654,6 +656,7 @@ impl Wal {
         let mut batch: Vec<(usize, u64, Vec<u8>)> = Vec::new();
         let mut coalesce: Vec<u8> = Vec::new();
         {
+            let _rank = crate::lock_rank::LockRankGuard::acquire(crate::lock_rank::LockRank::WalFlush);
             let _flush = self.shared.flush_lock.lock().unwrap();
             let frontier = drain_available(&self.shared, u64::MAX, &mut batch);
             if !batch.is_empty() {

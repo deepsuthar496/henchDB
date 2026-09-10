@@ -14,6 +14,7 @@ pub mod epoch;
 pub mod error;
 pub mod failpoint;
 pub mod latch;
+pub mod lock_rank;
 pub mod metrics;
 pub mod page;
 pub mod pitr;

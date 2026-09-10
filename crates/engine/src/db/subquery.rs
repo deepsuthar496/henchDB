@@ -130,6 +130,14 @@ pub(crate) fn setup_derived(
                     return Err(e);
                 }
             };
+            if let Some(limit) = session.max_intermediate_rows {
+                if out.rows.len() > limit {
+                    teardown_derived(session, saved);
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_rows limit ({limit}) during subquery materialization"
+                    )));
+                }
+            }
             let table = match ephemeral_table(alias, &out) {
                 Ok(t) => t,
                 Err(e) => {
@@ -537,6 +545,13 @@ fn build_set(
         return Err(Error::InvalidQuery(
             "Subquery must return only one column".into(),
         ));
+    }
+    if let Some(limit) = session.max_intermediate_rows {
+        if out.rows.len() > limit {
+            return Err(Error::ExecutionError(format!(
+                "query exceeded max_intermediate_rows limit ({limit}) during subquery IN evaluation"
+            )));
+        }
     }
     let mut set = HashSet::new();
     let mut has_nullish = false;

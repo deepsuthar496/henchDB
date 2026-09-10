@@ -24,6 +24,12 @@ pub struct CheckReport {
     pub error_msg: Option<String>,
 }
 
+impl CheckReport {
+    pub fn is_ok(&self) -> bool {
+        self.error_msg.is_none()
+    }
+}
+
 impl Database {
     /// Perform comprehensive diagnostic integrity checks on a table and compute
     /// its deterministic logical CRC32 hash.

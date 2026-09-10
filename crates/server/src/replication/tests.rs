@@ -666,3 +666,120 @@ fn stale_primary_snapshot_refused_after_promotion() {
     let _ = std::fs::remove_dir_all(&pdir);
     let _ = std::fs::remove_dir_all(&rdir);
 }
+
+#[test]
+fn replica_crash_and_restart_catches_up() {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let pdir = base.join(format!("hdbrcr_p_{pid}"));
+    let rdir = base.join(format!("hdbrcr_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let pdb = primary_db(&pdir);
+    {
+        let mut s = pdb.new_session();
+        db_execute(&pdb, &mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    }
+    load_rows(&pdb, "t", 0, 100);
+    let (pt, pport, pdrain) = spawn_primary(&pdb, pdir.join("auth.bin"));
+    let paddr = format!("127.0.0.1:{pport}");
+
+    // Phase 1: Replica syncs initial 100 rows
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, rdrain) = spawn_replica(&rdb, &paddr, &rdir);
+    wait_for("replica sync 100", Duration::from_secs(30), || {
+        count(&rdb, "t") == 100
+    });
+
+    // Phase 2: Simulate replica crash (stop thread, drop DB instance)
+    rdrain.store(true, Ordering::Relaxed);
+    rt.join().unwrap();
+    drop(rdb);
+
+    // Phase 3: Primary receives 100 more writes while replica is offline
+    load_rows(&pdb, "t", 100, 100);
+    assert_eq!(count(&pdb, "t"), 200);
+
+    // Phase 4: Replica reopens from the same data directory, catches up
+    let rdb2 = Arc::new(Database::open(&rdir).unwrap());
+    rdb2.set_read_only(true);
+    let (rt2, rdrain2) = spawn_replica(&rdb2, &paddr, &rdir);
+    wait_for("replica catch-up after restart to 200", Duration::from_secs(30), || {
+        count(&rdb2, "t") == 200
+    });
+
+    // Verify all rows match primary bit-for-bit
+    {
+        let mut ps = pdb.new_session();
+        let mut rs = rdb2.new_session();
+        for probe in [0u64, 50, 99, 100, 150, 199] {
+            let p = pdb.execute(&mut ps, &format!("SELECT v FROM t WHERE id = {probe}")).unwrap();
+            let r = rdb2.execute(&mut rs, &format!("SELECT v FROM t WHERE id = {probe}")).unwrap();
+            assert_eq!(p.rows, r.rows, "mismatch at probe id {probe}");
+        }
+    }
+
+    rdrain2.store(true, Ordering::Relaxed);
+    rt2.join().unwrap();
+    pdrain.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+#[test]
+fn corrupt_wal_chunk_rejected_safely() {
+    use super::protocol::{write_frame, Frame};
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let rdir = base.join(format!("hdbcwal_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    // Create a mock server that sends a malformed/corrupted WAL chunk
+    let mock_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_port = mock_listener.local_addr().unwrap().port();
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, rdrain) = spawn_replica(&rdb, &format!("127.0.0.1:{mock_port}"), &rdir);
+
+    // Mock primary accepts connection and performs handshake
+    let mock_thread = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = mock_listener.accept() {
+            // Read Handshake
+            let _ = super::protocol::read_frame(&mut stream);
+            // Send HandshakeAck
+            let _ = write_frame(&mut stream, &Frame::HandshakeAck {
+                ok: true,
+                message: "streaming".into(),
+                wal_version: engine::wal::WAL_FORMAT_VERSION,
+                durable_offset: 100,
+            });
+            // Read StartReplication
+            let _ = super::protocol::read_frame(&mut stream);
+            // Send a corrupt WAL chunk: invalid CRC payload
+            let corrupt_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+            let _ = write_frame(&mut stream, &Frame::WalChunk {
+                offset: 8,
+                data: corrupt_data,
+            });
+            let _ = stream.flush();
+        }
+    });
+
+    // The replica must detect the bad WAL chunk and disconnect gracefully without panicking
+    wait_for("replica disconnected on corrupt chunk", Duration::from_secs(15), || {
+        status_val(&rdb, "Rpl_replica_status") == "DISCONNECTED"
+    });
+
+    mock_thread.join().unwrap();
+    rdrain.store(true, Ordering::Relaxed);
+    rt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+

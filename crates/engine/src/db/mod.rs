@@ -87,6 +87,7 @@ pub struct Session {
     pub max_execution_time: Option<Duration>,
     pub max_result_rows: Option<usize>,
     pub max_result_bytes: Option<usize>,
+    pub max_intermediate_rows: Option<usize>,
     pub isolation_level: IsolationLevel,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
@@ -112,6 +113,7 @@ impl Default for Session {
             max_execution_time: None,
             max_result_rows: None,
             max_result_bytes: None,
+            max_intermediate_rows: None,
             isolation_level: IsolationLevel::RepeatableRead,
             snapshot: None,
             subq: subquery::SubqueryState::default(),
@@ -200,6 +202,19 @@ impl Database {
 /// Default overflow-pool size: 8 frames x 256 KiB = 2 MiB resident. Small
 /// on purpose — datasets larger than RAM are the point of the pool.
 pub const DEFAULT_POOL_FRAMES: usize = 8;
+
+pub(crate) struct CommitLockGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    _rank: crate::lock_rank::LockRankGuard,
+}
+
+impl<'a> std::ops::Deref for CommitLockGuard<'a> {
+    type Target = ();
+    fn deref(&self) -> &Self::Target {
+        &self._guard
+    }
+}
+
 impl Database {
     // ------------------------------------------------------------------
     // Lifecycle
@@ -289,14 +304,21 @@ impl Database {
         })
     }
 
-    pub(crate) fn acquire_commit_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub(crate) fn acquire_commit_lock(&self) -> CommitLockGuard<'_> {
+        let rank = crate::lock_rank::LockRankGuard::acquire(crate::lock_rank::LockRank::CommitLock);
         if let Ok(guard) = self.commit_lock.try_lock() {
-            return guard;
+            return CommitLockGuard {
+                _guard: guard,
+                _rank: rank,
+            };
         }
         let t0 = std::time::Instant::now();
         let guard = self.commit_lock.lock().unwrap();
         self.metrics.record_lock_wait(t0.elapsed().as_micros() as u64);
-        guard
+        CommitLockGuard {
+            _guard: guard,
+            _rank: rank,
+        }
     }
 
     /// Archive directory, if enabled.
@@ -701,6 +723,13 @@ impl Database {
                         _ => return Err(Error::ParseError("max_result_bytes must be an integer".into())),
                     }
                 }
+                if name.eq_ignore_ascii_case("max_intermediate_rows") {
+                    match value {
+                        Datum::Int(r) if r > 0 => session.max_intermediate_rows = Some(r as usize),
+                        Datum::Int(_) => session.max_intermediate_rows = None,
+                        _ => return Err(Error::ParseError("max_intermediate_rows must be an integer".into())),
+                    }
+                }
                 if name.eq_ignore_ascii_case("max_snapshot_age") || name.eq_ignore_ascii_case("max_snapshot_age_secs") {
                     match value {
                         Datum::Int(s) if s > 0 => self.set_max_snapshot_age(Some(Duration::from_secs(s as u64))),
@@ -982,6 +1011,7 @@ impl Database {
         // Phase C: install in WAL order.
         crate::failpoint!("before_install");
         {
+            let _rank_install = crate::lock_rank::LockRankGuard::acquire(crate::lock_rank::LockRank::InstallFrontier);
             let mut frontier = self.install.lock().unwrap();
             while *frontier != start {
                 frontier = self.install_cv.wait(frontier).unwrap();

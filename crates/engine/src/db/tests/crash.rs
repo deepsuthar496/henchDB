@@ -314,3 +314,96 @@ fn crash_failpoint_before_wal_reset_idempotent_replay() {
     assert_eq!(out.rows[0][0], Datum::Int(2));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn disaster_recovery_backup_destroy_restore_and_hash_verify() {
+    // Fulfills senior audit §13 item 4:
+    // "backup -> destroy database -> restore -> CHECK TABLE -> logical hash -> compare original"
+    let base_dir = std::env::temp_dir().join(format!("hdb_dr_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base_dir);
+
+    let orig_dir = base_dir.join("orig_data");
+    let restore_dir = base_dir.join("restored_data");
+
+    let mut backup_archive = Vec::new();
+    let orig_acc_hash: u32;
+    let orig_tx_hash: u32;
+    let orig_db_hash: u32;
+
+    // 1. Establish database with relational tables, secondary indexes, and foreign keys
+    {
+        let db = Database::open(&orig_dir).unwrap();
+        let mut s = db.new_session();
+        db.execute(&mut s, "CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, balance FLOAT)").unwrap();
+        db.execute(&mut s, "CREATE INDEX idx_name ON accounts (name)").unwrap();
+        db.execute(&mut s, "CREATE TABLE txns (id INT PRIMARY KEY, account_id INT, amount FLOAT, FOREIGN KEY (account_id) REFERENCES accounts(id))").unwrap();
+
+        // Seed data under transactions
+        db.execute(&mut s, "BEGIN").unwrap();
+        db.execute(&mut s, "INSERT INTO accounts VALUES (1, 'Alice', 1000.0)").unwrap();
+        db.execute(&mut s, "INSERT INTO accounts VALUES (2, 'Bob', 2500.0)").unwrap();
+        db.execute(&mut s, "INSERT INTO accounts VALUES (3, 'Charlie', 500.0)").unwrap();
+        db.execute(&mut s, "COMMIT").unwrap();
+
+        db.execute(&mut s, "BEGIN").unwrap();
+        db.execute(&mut s, "INSERT INTO txns VALUES (101, 1, 100.0)").unwrap();
+        db.execute(&mut s, "INSERT INTO txns VALUES (102, 2, -50.0)").unwrap();
+        db.execute(&mut s, "INSERT INTO txns VALUES (103, 1, -25.0)").unwrap();
+        db.execute(&mut s, "COMMIT").unwrap();
+
+        // 2. Validate clean initial state with CHECK TABLE
+        let rep_acc = db.check_table(&s, "accounts").unwrap();
+        assert!(rep_acc.is_ok(), "accounts check failed: {:?}", rep_acc.error_msg);
+        let rep_tx = db.check_table(&s, "txns").unwrap();
+        assert!(rep_tx.is_ok(), "txns check failed: {:?}", rep_tx.error_msg);
+
+        // 3. Compute baseline canonical dataset hashes
+        orig_acc_hash = db.table_logical_hash(&s, "accounts").unwrap();
+        orig_tx_hash = db.table_logical_hash(&s, "txns").unwrap();
+        orig_db_hash = db.database_logical_hash(&s).unwrap();
+
+        // 4. Dump physical backup archive
+        db.dump(&mut backup_archive).unwrap();
+        assert!(!backup_archive.is_empty(), "backup archive should not be empty");
+    }
+
+    // 5. Complete catastrophe: destroy original database directory completely
+    fs::remove_dir_all(&orig_dir).unwrap();
+    assert!(!orig_dir.exists(), "original database directory must be completely wiped");
+
+    // 6. Disaster Recovery: restore into a fresh directory from backup stream
+    let restore_stats = Database::restore(&mut backup_archive.as_slice(), &restore_dir).unwrap();
+    assert_eq!(restore_stats.tables, 2);
+    assert_eq!(restore_stats.rows, 6); // 3 accounts + 3 txns
+
+    // 7. Open restored database and run full structural integrity validation
+    {
+        let db = Database::open(&restore_dir).unwrap();
+        let mut s = db.new_session();
+
+        // CHECK TABLE validates B+ tree monotonic order, NOT NULL constraints,
+        // secondary index bidirectionality, and foreign key integrity
+        let rep_acc = db.check_table(&s, "accounts").unwrap();
+        assert!(rep_acc.is_ok(), "restored accounts check failed: {:?}", rep_acc.error_msg);
+        let rep_tx = db.check_table(&s, "txns").unwrap();
+        assert!(rep_tx.is_ok(), "restored txns check failed: {:?}", rep_tx.error_msg);
+
+        // 8. Prove bit-for-bit logical dataset equivalence with original database
+        let restored_acc_hash = db.table_logical_hash(&s, "accounts").unwrap();
+        let restored_tx_hash = db.table_logical_hash(&s, "txns").unwrap();
+        let restored_db_hash = db.database_logical_hash(&s).unwrap();
+
+        assert_eq!(restored_acc_hash, orig_acc_hash, "accounts logical hash must match pre-disaster hash bit-for-bit");
+        assert_eq!(restored_tx_hash, orig_tx_hash, "txns logical hash must match pre-disaster hash bit-for-bit");
+        assert_eq!(restored_db_hash, orig_db_hash, "database canonical hash must match pre-disaster hash bit-for-bit");
+
+        // 9. Verify restored database cleanly continues read-write OLTP operations
+        db.execute(&mut s, "INSERT INTO accounts VALUES (4, 'Diana', 3000.0)").unwrap();
+        db.execute(&mut s, "INSERT INTO txns VALUES (104, 4, 200.0)").unwrap();
+        let out = db.execute(&mut s, "SELECT COUNT(*) FROM accounts").unwrap();
+        assert_eq!(out.rows[0][0], Datum::Int(4));
+    }
+
+    let _ = fs::remove_dir_all(&base_dir);
+}
+

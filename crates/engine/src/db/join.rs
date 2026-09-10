@@ -370,6 +370,13 @@ impl Database {
             Self::validate_scoped(&j.on, &exec_tables[..ji + 2])?;
             let scope: &[Arc<Table>] = &exec_tables[..ji + 2];
             rows = Self::join_step(scope, &j.on, j.kind, rows, &exec_inputs[ji + 1], deadline)?;
+            if let Some(limit) = session.max_intermediate_rows {
+                if rows.len() > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_rows limit ({limit}) during join"
+                    )));
+                }
+            }
         }
         // 5. WHERE over joined rows (subquery conjuncts fold per row
         //    against the joined scope; plain conjuncts take the fast path).
@@ -401,6 +408,13 @@ impl Database {
                 )
             });
         if !group_by.is_empty() {
+            if let Some(limit) = session.max_intermediate_rows {
+                if rows.len() > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_rows limit ({limit}) during aggregation"
+                    )));
+                }
+            }
             // Single-source GROUP BY through the batch pushdown (captured
             // EXPLAIN ANALYZE plans and multi-table scopes stay scalar);
             // decline falls through to the legacy path below.
@@ -452,6 +466,13 @@ impl Database {
         // ORDER BY resolves against scope columns pre-projection (MySQL
         // allows ordering by non-selected columns), then LIMIT applies.
         if !order_by.is_empty() {
+            if let Some(limit) = session.max_intermediate_rows {
+                if rows.len() > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_rows limit ({limit}) during sort"
+                    )));
+                }
+            }
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
                 keys.push(Self::resolve_scope(&exec_tables, col)?);
