@@ -101,14 +101,19 @@ pub fn serve_metrics(
 /// Bind the metrics listener, trying `port..port+8` like the PG listener.
 /// Returns `None` (with a stderr note) when everything is busy — metrics
 /// stay disabled rather than failing the whole server.
+#[allow(dead_code)]
 pub fn bind_metrics(port: u16) -> Option<(TcpListener, u16)> {
+    bind_metrics_on("0.0.0.0", port)
+}
+
+pub fn bind_metrics_on(host: &str, port: u16) -> Option<(TcpListener, u16)> {
     for p in port..port.saturating_add(9) {
-        match TcpListener::bind(("0.0.0.0", p)) {
+        match TcpListener::bind((host, p)) {
             Ok(l) => return Some((l, p)),
             Err(_) => continue,
         }
     }
-    eprintln!("metrics: ports {port}-{} all busy, prometheus exporter disabled", port.saturating_add(8));
+    eprintln!("metrics: ports {port}-{} all busy on {host}, prometheus exporter disabled", port.saturating_add(8));
     None
 }
 

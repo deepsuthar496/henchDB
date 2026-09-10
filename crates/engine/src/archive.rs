@@ -257,6 +257,7 @@ pub fn write_segment(
         f.write_all(&crc32(payload).to_le_bytes())?;
         f.sync_data()?;
     }
+    crate::failpoint!("during_archive_seal");
     std::fs::rename(&tmp_path, &final_path)?;
     // Directory fsync so the rename itself is durable.
     if let Ok(d) = std::fs::File::open(dir) {

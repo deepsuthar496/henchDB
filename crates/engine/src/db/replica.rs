@@ -156,6 +156,7 @@ impl Database {
     /// Idempotent for redos: Puts overwrite, Deletes remove, DDL guards on
     /// existence like the open-time replay path.
     pub fn apply_replica_batch(&self, batch: Vec<Record>) -> Result<()> {
+        crate::failpoint!("during_replica_apply");
         let mut dbs = self.databases.write().unwrap();
         let mut tables = self.tables.write().unwrap();
         for rec in batch {

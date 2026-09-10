@@ -188,6 +188,7 @@ fn read_generation(log_path: &Path) -> u64 {
 /// Crash-safe write of the `wal.gen` sidecar (pub(crate) so PITR can seal
 /// a rolled-forward directory with the next generation).
 pub(crate) fn write_generation(log_path: &Path, generation: u64) -> Result<()> {
+    crate::failpoint!("during_gen_sidecar_update");
     let tmp = generation_path(log_path);
     // Write-then-sync the single word; a torn sidecar reads back as 0,
     // which only ever forces a (safe) replica re-snapshot.

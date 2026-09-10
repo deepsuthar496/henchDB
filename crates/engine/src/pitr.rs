@@ -202,6 +202,7 @@ pub fn restore_pitr(
                     stats.bytes_replayed += frame.len() as u64;
                     included.extend_from_slice(frame);
                     stats.txns_replayed += 1;
+                    crate::failpoint!("during_restore_replay");
                 }
                 other => {
                     pending.entry(txn_of(other)).or_default().push(frame.to_vec());

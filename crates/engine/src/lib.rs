@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod db;
 pub mod epoch;
 pub mod error;
+pub mod failpoint;
 pub mod latch;
 pub mod metrics;
 pub mod page;

@@ -823,6 +823,23 @@ impl Table {
         }
         acc
     }
+
+    /// Diagnostic helper for `CHECK TABLE`: returns secondary index details and raw entries.
+    pub fn scan_secondary_index_entries(&self) -> Vec<(String, String, usize, Vec<Vec<u8>>)> {
+        let guard = self.indexes.read().unwrap();
+        guard
+            .iter()
+            .map(|idx| {
+                let entries = idx.tree.scan_all().into_iter().map(|(k, _)| k).collect();
+                (
+                    idx.def.name.clone(),
+                    idx.def.column.clone(),
+                    idx.col_idx,
+                    entries,
+                )
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

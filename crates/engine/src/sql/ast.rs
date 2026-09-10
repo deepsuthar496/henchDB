@@ -399,4 +399,7 @@ pub enum Statement {
     ShowGrants {
         for_user: Option<String>,
     },
+    CheckTable {
+        table: String,
+    },
 }

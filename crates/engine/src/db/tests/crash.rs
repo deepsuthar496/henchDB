@@ -210,3 +210,107 @@ fn crash_torn_wal_tail_corrupted_crc() {
     assert_eq!(out.rows[0][0], Datum::Int(3));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn crash_failpoint_before_snapshot_rename_preserves_wal() {
+    use crate::failpoint::{set, clear, FailMode, FailAction};
+
+    let dir = std::env::temp_dir().join(format!("hdbfp_snap_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+
+    {
+        let db = setup(&dir);
+        let mut s = db.new_session();
+        db.execute(&mut s, "INSERT INTO t VALUES (1, 'initial', 1.0)").unwrap();
+        db.execute(&mut s, "INSERT INTO t VALUES (2, 'second', 2.0)").unwrap();
+
+        // Inject panic right before snapshot rename
+        set("before_snapshot_rename", FailMode::Once, FailAction::Panic("test crash before rename"));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.checkpoint()
+        }));
+        assert!(res.is_err(), "failpoint should trigger panic");
+        clear();
+    }
+
+    // Reopen: snapshot.tmp was left over, snapshot.bin may be absent or old, WAL has the 2 rows
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(2));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_failpoint_during_multirow_install_recovers_to_durable_state() {
+    use crate::failpoint::{set, clear, FailMode, FailAction};
+
+    let dir = std::env::temp_dir().join(format!("hdbfp_multi_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+
+    {
+        let db = setup(&dir);
+        let mut s = db.new_session();
+        db.execute(&mut s, "INSERT INTO t VALUES (1, 'row1', 1.0)").unwrap();
+
+        // Inject panic midway through tree install of a multi-row transaction
+        // WAL has already been made durable in Phase B!
+        set("during_multirow_install", FailMode::Once, FailAction::Panic("test crash midway through install"));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut s2 = db.new_session();
+            db.execute(&mut s2, "BEGIN").unwrap();
+            db.execute(&mut s2, "INSERT INTO t VALUES (2, 'row2', 2.0)").unwrap();
+            db.execute(&mut s2, "INSERT INTO t VALUES (3, 'row3', 3.0)").unwrap();
+            db.execute(&mut s2, "COMMIT").unwrap();
+        }));
+        assert!(res.is_err(), "failpoint should trigger panic midway through install");
+        clear();
+    }
+
+    // Reopen: Because WAL commit record was already synced to disk before install,
+    // recovery replays the transaction atomically: all rows (1, 2, 3) must be present!
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(3));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_failpoint_before_wal_reset_idempotent_replay() {
+    use crate::failpoint::{set, clear, FailMode, FailAction};
+
+    let dir = std::env::temp_dir().join(format!("hdbfp_reset_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+
+    {
+        let db = setup(&dir);
+        let mut s = db.new_session();
+        db.execute(&mut s, "INSERT INTO t VALUES (1, 'row1', 1.0)").unwrap();
+
+        // Inject panic after snapshot rename, before wal.reset()
+        set("before_wal_reset", FailMode::Once, FailAction::Panic("test crash before wal reset"));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.checkpoint()
+        }));
+        assert!(res.is_err(), "failpoint should trigger panic");
+        clear();
+    }
+
+    // Both snapshot.bin and pre-checkpoint wal.log exist
+    // Reopen must replay WAL idempotently without duplicating or corrupting keys
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT * FROM t").unwrap();
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][0], Datum::Int(1));
+
+    // Can continue writing normally
+    db.execute(&mut s, "INSERT INTO t VALUES (2, 'row2', 2.0)").unwrap();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(2));
+    let _ = fs::remove_dir_all(&dir);
+}

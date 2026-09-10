@@ -47,7 +47,10 @@ pub(crate) mod memo;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub mod privilege;
+pub mod check;
 pub(crate) mod query;
+
+pub use check::CheckReport;
 pub(crate) mod replica;
 pub(crate) mod subquery;
 pub(crate) mod sysviews;
@@ -82,6 +85,8 @@ pub struct Session {
     /// local sessions). Backs the `user()` system function.
     pub user: String,
     pub max_execution_time: Option<Duration>,
+    pub max_result_rows: Option<usize>,
+    pub max_result_bytes: Option<usize>,
     pub isolation_level: IsolationLevel,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
@@ -105,6 +110,8 @@ impl Default for Session {
             current_db: "default".to_string(),
             user: "root".to_string(),
             max_execution_time: None,
+            max_result_rows: None,
+            max_result_bytes: None,
             isolation_level: IsolationLevel::RepeatableRead,
             snapshot: None,
             subq: subquery::SubqueryState::default(),
@@ -170,6 +177,24 @@ pub struct Database {
     pub(crate) archive_dir: Mutex<Option<PathBuf>>,
     /// RBAC principals + grants + staged passwords (see `privilege.rs`).
     pub(crate) privs: RwLock<privilege::PrivilegeStore>,
+    /// Configurable maximum snapshot age in milliseconds (0 = unlimited).
+    pub(crate) max_snapshot_age_ms: AtomicU64,
+}
+
+impl Database {
+    pub fn set_max_snapshot_age(&self, dur: Option<Duration>) {
+        self.max_snapshot_age_ms
+            .store(dur.map(|d| d.as_millis() as u64).unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub fn max_snapshot_age(&self) -> Option<Duration> {
+        let ms = self.max_snapshot_age_ms.load(Ordering::Relaxed);
+        if ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(ms))
+        }
+    }
 }
 
 /// Default overflow-pool size: 8 frames x 256 KiB = 2 MiB resident. Small
@@ -260,6 +285,7 @@ impl Database {
             replica_upstream: Mutex::new(String::new()),
             archive_dir: Mutex::new(None),
             privs: RwLock::new(privilege::PrivilegeStore::default()),
+            max_snapshot_age_ms: AtomicU64::new(0),
         })
     }
 
@@ -322,20 +348,28 @@ impl Database {
             data.push((table.table_def(), rows));
         }
         drop(tables);
+        crate::failpoint!("before_snapshot_temp_write");
         let tmp = self.dir.join("snapshot.bin.tmp");
         {
             let f = File::create(&tmp)?;
             let mut bw = std::io::BufWriter::with_capacity(128 * 1024, f);
             catalog::encode_snapshot(&mut bw, &db_list, &data)?;
             bw.flush()?;
+            crate::failpoint!("after_snapshot_temp_write");
+            crate::failpoint!("before_snapshot_fsync");
             bw.into_inner().map_err(|e| Error::Io(e.to_string()))?.sync_data()?;
+            crate::failpoint!("after_snapshot_fsync");
         }
+        crate::failpoint!("before_snapshot_rename");
         fs::rename(&tmp, self.dir.join("snapshot.bin"))?;
+        crate::failpoint!("after_snapshot_rename");
         // PITR: persist the about-to-be-truncated durable prefix first (see
         // `archive.rs`; an archive failure aborts before the truncate, and
         // open() redoes the intact WAL idempotently).
         self.archive_checkpoint_prefix()?;
+        crate::failpoint!("before_wal_reset");
         self.wal.reset()?;
+        crate::failpoint!("after_wal_reset");
         // Re-base the install frontier: offsets restart after the truncate.
         let frontier = self.wal.next_offset();
         *self.install.lock().unwrap() = frontier;
@@ -389,15 +423,25 @@ impl Database {
         if let Some(out) = self.try_fast_point_update(session, trimmed)? {
             return Ok(out);
         }
-        self.prepare_statement_snapshot(session, trimmed);
+        self.prepare_statement_snapshot(session, trimmed)?;
         let res = self.execute_inner(session, trimmed);
         self.cleanup_statement_snapshot(session);
         res
     }
 
-    fn prepare_statement_snapshot(&self, session: &mut Session, trimmed: &str) {
+    fn prepare_statement_snapshot(&self, session: &mut Session, trimmed: &str) -> Result<()> {
+        if let Some(snap) = &session.snapshot {
+            if let Some(max_age) = self.max_snapshot_age() {
+                if snap.created_at.elapsed() > max_age {
+                    return Err(Error::ExecutionError(format!(
+                        "snapshot exceeded maximum configured age limit ({:?})",
+                        max_age
+                    )));
+                }
+            }
+        }
         if trimmed.is_empty() {
-            return;
+            return Ok(());
         }
         let first_word = trimmed.split_whitespace().next().unwrap_or("");
         let is_read = first_word.eq_ignore_ascii_case("select")
@@ -414,6 +458,7 @@ impl Database {
         } else if is_read {
             self.snapshot_pin_statement(session);
         }
+        Ok(())
     }
 
     fn cleanup_statement_snapshot(&self, session: &mut Session) {
@@ -642,6 +687,27 @@ impl Database {
                         }
                     }
                 }
+                if name.eq_ignore_ascii_case("max_result_rows") || name.eq_ignore_ascii_case("max_rows") {
+                    match value {
+                        Datum::Int(r) if r > 0 => session.max_result_rows = Some(r as usize),
+                        Datum::Int(_) => session.max_result_rows = None,
+                        _ => return Err(Error::ParseError("max_result_rows must be an integer".into())),
+                    }
+                }
+                if name.eq_ignore_ascii_case("max_result_bytes") {
+                    match value {
+                        Datum::Int(b) if b > 0 => session.max_result_bytes = Some(b as usize),
+                        Datum::Int(_) => session.max_result_bytes = None,
+                        _ => return Err(Error::ParseError("max_result_bytes must be an integer".into())),
+                    }
+                }
+                if name.eq_ignore_ascii_case("max_snapshot_age") || name.eq_ignore_ascii_case("max_snapshot_age_secs") {
+                    match value {
+                        Datum::Int(s) if s > 0 => self.set_max_snapshot_age(Some(Duration::from_secs(s as u64))),
+                        Datum::Int(_) => self.set_max_snapshot_age(None),
+                        _ => return Err(Error::ParseError("max_snapshot_age must be an integer (seconds)".into())),
+                    }
+                }
                 Ok(Output::ok("variable set"))
             }
             Statement::CreateDatabase { name, if_not_exists } => {
@@ -667,6 +733,27 @@ impl Database {
             Statement::ShowEngineStatus => Ok(self.show_engine_status()),
             Statement::ShowProcesslist => Ok(self.show_processlist()),
             Statement::AnalyzeTable { table } => self.exec_analyze(session, &table),
+            Statement::CheckTable { table } => {
+                let report = self.check_table(session, &table)?;
+                let msg_text = report
+                    .error_msg
+                    .unwrap_or_else(|| format!("OK (hash: 0x{:08X})", report.hash));
+                Ok(Output {
+                    columns: vec![
+                        "Table".into(),
+                        "Op".into(),
+                        "Msg_type".into(),
+                        "Msg_text".into(),
+                    ],
+                    rows: vec![vec![
+                        Datum::Text(report.table),
+                        Datum::Text(report.op),
+                        Datum::Text(report.status),
+                        Datum::Text(msg_text),
+                    ]],
+                    message: "OK".into(),
+                })
+            }
             Statement::Explain { analyze, statement } => {
                 self.exec_explain(session, analyze, &statement)
             }
@@ -848,10 +935,12 @@ impl Database {
 
         let has_inserts = staged.values().any(|w| w.is_insert);
 
+        crate::failpoint!("before_wal_reserve");
         // Phase A: validation + append under the short commit_lock. The
         // MVCC commit epoch is allocated here so epochs follow WAL order.
         let (start, end, commit_epoch) = {
             let _guard = self.acquire_commit_lock();
+            crate::failpoint!("after_wal_reserve");
             // Duplicate-key check covers both installed state and commits
             // that are appended-but-not-yet-installed (in flight).
             if has_inserts {
@@ -869,6 +958,7 @@ impl Database {
                 }
             }
             let commit_epoch = self.alloc_commit_epoch();
+            crate::failpoint!("before_wal_write");
             let offsets = self.wal.append_records(&records)?;
             if has_inserts {
                 let mut in_flight = self.in_flight.lock().unwrap();
@@ -885,20 +975,28 @@ impl Database {
 
         // Phase B: group commit — one fsync by the syncer covers us plus
         // every other commit appended while the fsync was running.
+        crate::failpoint!("before_wal_sync");
         self.wal.wait_durable(end)?;
+        crate::failpoint!("after_wal_sync");
 
         // Phase C: install in WAL order.
+        crate::failpoint!("before_install");
         {
             let mut frontier = self.install.lock().unwrap();
             while *frontier != start {
                 frontier = self.install_cv.wait(frontier).unwrap();
             }
             self.record_commit_batch(&tables, &staged, &encoded_rows, commit_epoch)?;
+            let mut installed_rows = 0;
             for (((table, key), _), enc_opt) in staged.iter().zip(encoded_rows.into_iter()) {
                 let t = &tables[table];
                 match enc_opt {
                     Some(enc) => t.apply_raw(key, &enc)?,
                     None => t.remove_raw(key),
+                }
+                installed_rows += 1;
+                if installed_rows == 1 && staged.len() > 1 {
+                    crate::failpoint!("during_multirow_install");
                 }
             }
             self.visible_epoch.store(commit_epoch, Ordering::SeqCst);

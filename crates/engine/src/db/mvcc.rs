@@ -91,6 +91,7 @@ pub(crate) struct SnapshotPin {
     pub(crate) id: u64,
     pub(crate) read_epoch: u64,
     pub(crate) is_statement: bool,
+    pub(crate) created_at: std::time::Instant,
 }
 
 impl Database {
@@ -180,6 +181,14 @@ impl Database {
         let Some(snap) = &session.snapshot else {
             return Ok(current);
         };
+        if let Some(max_age) = self.max_snapshot_age() {
+            if snap.created_at.elapsed() > max_age {
+                return Err(Error::ExecutionError(format!(
+                    "snapshot exceeded maximum configured age limit ({:?})",
+                    max_age
+                )));
+            }
+        }
         let vs = self.versions.read().unwrap();
         let tkey = (table.def.name.clone(), key.to_vec());
         if vs.committed.get(&tkey).copied().unwrap_or(0) <= snap.read_epoch {
@@ -221,6 +230,14 @@ impl Database {
         let Some(snap) = &session.snapshot else {
             return Ok(Vec::new());
         };
+        if let Some(max_age) = self.max_snapshot_age() {
+            if snap.created_at.elapsed() > max_age {
+                return Err(Error::ExecutionError(format!(
+                    "snapshot exceeded maximum configured age limit ({:?})",
+                    max_age
+                )));
+            }
+        }
         let vs = self.versions.read().unwrap();
         let mut out = Vec::new();
         for ((t, k), chain) in vs.chains.iter() {
@@ -253,10 +270,11 @@ impl Database {
             return Err(Error::TxnConflict("transaction already active".into()));
         }
         let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
+        let now = std::time::Instant::now();
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            vs.snapshots.insert(id, (read_epoch, std::time::Instant::now()));
+            vs.snapshots.insert(id, (read_epoch, now));
             id
         };
         let txn_id = self.next_txn.fetch_add(1, Ordering::Relaxed);
@@ -268,6 +286,7 @@ impl Database {
             id,
             read_epoch,
             is_statement: false,
+            created_at: now,
         });
         self.metrics.txn_begin();
         Ok(Output::ok("BEGIN"))
@@ -280,16 +299,18 @@ impl Database {
             return;
         }
         let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
+        let now = std::time::Instant::now();
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            vs.snapshots.insert(id, (read_epoch, std::time::Instant::now()));
+            vs.snapshots.insert(id, (read_epoch, now));
             id
         };
         session.snapshot = Some(SnapshotPin {
             id,
             read_epoch,
             is_statement: false,
+            created_at: now,
         });
     }
 
@@ -299,16 +320,18 @@ impl Database {
             return;
         }
         let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
+        let now = std::time::Instant::now();
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            vs.snapshots.insert(id, (read_epoch, std::time::Instant::now()));
+            vs.snapshots.insert(id, (read_epoch, now));
             id
         };
         session.snapshot = Some(SnapshotPin {
             id,
             read_epoch,
             is_statement: true,
+            created_at: now,
         });
     }
 

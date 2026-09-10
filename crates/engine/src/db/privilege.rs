@@ -337,7 +337,9 @@ pub(crate) fn enforce(db: &Database, session: &Session, stmt: &Statement) -> Res
                 }
             }
         }
-        Statement::AnalyzeTable { table } => check_table(db, session, table, Privilege::Select),
+        Statement::AnalyzeTable { table } | Statement::CheckTable { table } => {
+            check_table(db, session, table, Privilege::Select)
+        }
         Statement::Explain { statement, .. } | Statement::ExplainMemo { statement } => enforce(db, session, statement),
         // Transaction framing, session state, read-only diagnostics, and
         // timeouts need no privilege.

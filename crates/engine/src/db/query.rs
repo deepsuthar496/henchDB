@@ -62,7 +62,7 @@ impl Database {
                 ("State".into(), ColumnType::Text),
                 ("Info".into(), ColumnType::Text),
             ]),
-            Statement::AnalyzeTable { .. } => Ok(vec![
+            Statement::AnalyzeTable { .. } | Statement::CheckTable { .. } => Ok(vec![
                 ("Table".into(), ColumnType::Text),
                 ("Op".into(), ColumnType::Text),
                 ("Msg_type".into(), ColumnType::Text),
@@ -238,7 +238,35 @@ impl Database {
             self.exec_select_joined(session, items, from, joins, selection, order_by, limit, group_by)
         };
         subquery::teardown_derived(session, saved);
-        out
+        let out = out?;
+        if let Some(max_rows) = session.max_result_rows {
+            if out.rows.len() > max_rows {
+                return Err(Error::ExecutionError(format!(
+                    "query result exceeded max_result_rows limit ({})",
+                    max_rows
+                )));
+            }
+        }
+        if let Some(max_bytes) = session.max_result_bytes {
+            let mut est_bytes = 0usize;
+            for row in &out.rows {
+                for d in row {
+                    est_bytes += match d {
+                        Datum::Null => 1,
+                        Datum::Int(_) | Datum::Float(_) | Datum::DateTime(_) => 8,
+                        Datum::Bool(_) => 1,
+                        Datum::Text(s) => s.len(),
+                    };
+                }
+            }
+            if est_bytes > max_bytes {
+                return Err(Error::ExecutionError(format!(
+                    "query result exceeded max_result_bytes limit ({} bytes)",
+                    max_bytes
+                )));
+            }
+        }
+        Ok(out)
     }
 
     /// Entry point for subquery levels (same setup/teardown discipline via

@@ -8,6 +8,7 @@ use crate::table::{Schema, TableDef};
 use crate::types::ColumnType;
 
 mod batch;
+mod check;
 mod crash;
 mod fk;
 mod joins;

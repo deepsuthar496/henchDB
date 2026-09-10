@@ -102,9 +102,14 @@ pub fn serve_primary(
 /// Bind the replication listener with the usual +1..+8 fallback.
 /// Returns the listener and the ACTUAL bound port (differs when `port` is
 /// 0 or a fallback was taken).
+#[allow(dead_code)]
 pub fn bind_repl(port: u16) -> Option<(TcpListener, u16)> {
+    bind_repl_on("0.0.0.0", port)
+}
+
+pub fn bind_repl_on(host: &str, port: u16) -> Option<(TcpListener, u16)> {
     for p in port..port.saturating_add(9) {
-        match TcpListener::bind(("0.0.0.0", p)) {
+        match TcpListener::bind((host, p)) {
             Ok(l) => {
                 let actual = l.local_addr().map(|a| a.port()).unwrap_or(p);
                 return Some((l, actual));
@@ -113,9 +118,10 @@ pub fn bind_repl(port: u16) -> Option<(TcpListener, u16)> {
         }
     }
     eprintln!(
-        "replication: ports {}-{} all busy, primary streaming disabled",
+        "replication: ports {}-{} all busy on {}, primary streaming disabled",
         port,
-        port.saturating_add(8)
+        port.saturating_add(8),
+        host
     );
     None
 }

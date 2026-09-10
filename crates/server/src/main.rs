@@ -62,11 +62,14 @@ struct ServerOpts {
     wal_archive_dir: Option<String>,
     /// Worker pool size (`--threads`, default 2x parallelism).
     threads: usize,
+    /// Host / interface to bind to (`--bind`, default 0.0.0.0).
+    bind: String,
 }
 
 impl ServerOpts {
     fn from_args(args: &[String]) -> Self {
         let port: u16 = arg_value(args, "--port").and_then(|p| p.parse().ok()).unwrap_or(3307);
+        let bind = arg_value(args, "--bind").unwrap_or_else(|| "0.0.0.0".into());
         let max_connections: usize = arg_value(args, "--max-connections")
             .and_then(|m| m.parse().ok())
             .unwrap_or(1024);
@@ -83,6 +86,7 @@ impl ServerOpts {
         let allow_metrics = !args.iter().any(|a| a == "--no-metrics");
         let allow_repl = !args.iter().any(|a| a == "--no-repl");
         ServerOpts {
+            bind,
             port,
             max_connections,
             idle_timeout,
@@ -799,6 +803,15 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     let auth_path = dir.join("auth.bin");
     let (auth_store, _) =
         auth::UserStore::load_or_bootstrap(&auth_path).map_err(engine::Error::Io)?;
+    if let Some(root_v) = auth_store.users.get("root") {
+        if root_v.is_empty_password() && (opts.bind == "0.0.0.0" || opts.bind == "::") {
+            eprintln!("================================================================================");
+            eprintln!("SECURITY WARNING: Database bound to public interface ({}) with EMPTY root password!", opts.bind);
+            eprintln!("Anyone on the network can connect as 'root' with full administrative privileges.");
+            eprintln!("Set a secure password: server passwd --dir {} --user root --password <SECRET>", dir.display());
+            eprintln!("================================================================================");
+        }
+    }
     let db = Arc::new(Database::open(dir)?);
     // RBAC boot import: engine enforcement mirrors the file's principals +
     // grants (root needs nothing stored: the code bypass covers it).
@@ -837,9 +850,9 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
             std::process::exit(2);
         }
     };
-    let listener = TcpListener::bind(("0.0.0.0", opts.port))?;
+    let listener = TcpListener::bind((opts.bind.as_str(), opts.port))?;
     listener.set_nonblocking(true)?;
-    println!("listening on 0.0.0.0:{} (dir: {})", opts.port, dir.display());
+    println!("listening on {}:{} (dir: {})", opts.bind, opts.port, dir.display());
     println!("protocols: mysql wire (HandshakeV10 + COM_QUERY + prepared statements, authenticated) + legacy framed text (auto-detect)");
     println!("tls: {}",
         if tls.is_some() { "enabled (CLIENT_SSL advertised)" } else { "disabled (plaintext only)" });
@@ -890,7 +903,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     if opts.allow_pg && opts.pg_port != 0 {
         let mut bound = None;
         for port in opts.pg_port..opts.pg_port.saturating_add(9) {
-            match TcpListener::bind(("0.0.0.0", port)) {
+            match TcpListener::bind((opts.bind.as_str(), port)) {
                 Ok(l) => {
                     bound = Some((l, port));
                     break;
@@ -903,7 +916,7 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
                 if pg_port != opts.pg_port {
                     eprintln!("pg: port {} busy, listening on {pg_port} instead", opts.pg_port);
                 }
-                println!("pg listening on 0.0.0.0:{pg_port} (protocol 3.0 simple query)");
+                println!("pg listening on {}:{pg_port} (protocol 3.0 simple query)", opts.bind);
                 println!("connect: psql -h 127.0.0.1 -p {pg_port} -U root");
                 let _ = pg_listener.set_nonblocking(true);
                 let pg = std::thread::spawn({
@@ -945,12 +958,12 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     // `--no-metrics` or `--metrics-port 0` disables it outright; busy ports
     // degrade to disabled, never to a dead server.
     if opts.allow_metrics && opts.metrics_port != 0 {
-        match metrics::bind_metrics(opts.metrics_port) {
+        match metrics::bind_metrics_on(&opts.bind, opts.metrics_port) {
             Some((ml, mport)) => {
                 if mport != opts.metrics_port {
                     eprintln!("metrics: port {} busy, listening on {mport} instead", opts.metrics_port);
                 }
-                println!("metrics listening on 0.0.0.0:{mport} (GET /metrics, GET /health)");
+                println!("metrics listening on {}:{mport} (GET /metrics, GET /health)", opts.bind);
                 let handle = std::thread::spawn({
                     let db = db.clone();
                     let draining = draining.clone();
@@ -965,12 +978,12 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     // Disabled in replica mode (a replica's local WAL is empty by design)
     // and via `--no-repl` / `--repl-port 0`.
     if !replica_mode && opts.allow_repl && opts.repl_port != 0 {
-        match replication::primary::bind_repl(opts.repl_port) {
+        match replication::primary::bind_repl_on(&opts.bind, opts.repl_port) {
             Some((rl, rport)) => {
                 if rport != opts.repl_port {
                     eprintln!("replication: port {} busy, listening on {rport} instead", opts.repl_port);
                 }
-                println!("replication primary listening on 0.0.0.0:{rport}");
+                println!("replication primary listening on {}:{rport}", opts.bind);
                 let handle = std::thread::spawn({
                     let db = db.clone();
                     let draining = draining.clone();

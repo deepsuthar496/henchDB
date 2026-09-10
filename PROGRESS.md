@@ -584,8 +584,31 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 
 ---
 
+### 22. 🛡️ Production Readiness Hardening: Deterministic Failpoints, Online Storage Integrity Diagnostics (`CHECK TABLE`), Resource Governance, Bind Security, CI Pipeline & Operations Runbooks
+* **Status**: ✅ **COMPLETED**
+* **Why it mattered**: The production readiness audit (`assesment.md`) identified remaining critical gaps before production deployment:
+  1. Durability and crash tests needed a deterministic failpoint framework able to inject panics/I/O faults cleanly at exact execution points without race conditions or test interference.
+  2. Storage corruption and drift lacked an online integrity audit mechanism (`CHECK TABLE`) to verify B+ tree sorting, schema constraints, secondary index bidirectionality, foreign key referential integrity, and compute canonical dataset hashes.
+  3. Memory exhaustion risks from unbounded query result sets and long-lived snapshot version chain retention.
+  4. Server bound to `0.0.0.0` unconditionally with no warning when root password is empty.
+  5. Missing automated CI workflow, standalone `LICENSE` file, and consolidated operations documentation.
+* **Delivered**:
+  - **Deterministic Failpoint Framework** (`crates/engine/src/failpoint.rs`, 165 lines, `std`-only): Thread-local isolated registry (`LOCAL_REGISTRY`) preventing test runner cross-talk in parallel execution, with global fallback and environment variable trigger (`HENCHDB_FAILPOINT`). Integrated at all durability boundaries: WAL reservation, write, and fsync; snapshot temp write, fsync, and atomic rename; WAL reset; multi-row B+ tree batch install; archive segment seal; recovery replay; and replication apply. Added 3 new crash failpoint tests in `db::tests::crash` (crash before rename, crash midway through multi-row install, crash before WAL reset).
+  - **Online Storage Integrity & Canonical Hashing** (`crates/engine/src/db/check.rs`, 272 lines): Added `CHECK TABLE <name>` AST, parser, and execution support. Validates B+ tree key monotonicity and PK decoding, column count and NOT NULL constraints, bidirectional secondary index pointer validity, and foreign key referential integrity. Implemented deterministic IEEE CRC32 dataset hashing per table and per database for cross-node replication and backup verification. Wire output formatted in MySQL `Table | Op | Msg_type | Msg_text` schema.
+  - **Resource Governance & Memory Bounds**: Implemented session-level `SET max_result_rows = ...` and `SET max_result_bytes = ...` limits enforced during query execution in `db/query.rs`. Exceeding limits returns `Error::ExecutionError`.
+  - **Long-Lived Snapshot Expiration**: Added `max_snapshot_age_ms` to `Database` and `SET max_snapshot_age = ...` session control. Stamped `Instant` creation time on `SnapshotPin` in `db/mvcc.rs`. Enforced expiration in statement snapshot setup, `snapshot_lookup`, and `snapshot_scan_extra`.
+  - **Configurable Server Binding & Security Guard**: Added `--bind <host>` (default `0.0.0.0`) CLI flag across MySQL wire, PostgreSQL wire, metrics exporter (`bind_metrics_on`), and replication primary (`bind_repl_on`). Emits prominent security warning to stderr on startup if bound to a public interface (`0.0.0.0` / `::`) while the administrative `root` account has an empty password.
+  - **Mandatory CI Baseline & Standalone License**: Added `.github/workflows/ci.yml` running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and test suites across Ubuntu and Windows in both debug and release configurations. Added top-level `LICENSE` (MIT).
+  - **Consolidated Operations Documentation**: Created `STATUS.md`, `PRODUCTION_READINESS.md`, `OPERATIONS.md`, `RECOVERY.md`, `REPLICATION.md`, and `SECURITY.md`.
+  - Strict 1,500-line file ceiling maintained across all repository files (`check_lines.py` verified).
+  - Engine remains strictly `std`-only with zero external dependencies.
+* **Evidence**: **306/306 tests green** (217 engine + 89 server); `cargo check --release` with zero warnings.
+* **Effort**: High.
+
+---
+
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**297 tests: 208 engine + 89 server** as of this writing).
+1. `cargo test` — all green (**306 tests: 217 engine + 89 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

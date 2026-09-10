@@ -287,6 +287,12 @@ impl Parser {
                 let table = self.expect_ident()?;
                 Ok(Statement::AnalyzeTable { table })
             }
+            Some("CHECK") => {
+                self.pos += 1;
+                self.expect_kw("TABLE")?;
+                let table = self.expect_ident()?;
+                Ok(Statement::CheckTable { table })
+            }
             Some("EXPLAIN") => {
                 self.pos += 1;
                 let analyze = self.eat_kw("ANALYZE");
