@@ -645,10 +645,36 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 * **Evidence**: **323/323 tests green** (224 engine + 99 server); `cargo check --release` with zero warnings.
 * **Effort**: High.
 
+### 2026-09-10 — P0 Production Readiness: EBR Unsafe Audit, B+Tree Concurrency Invariants, Crash Matrix, MVCC Oracle & CI Reliability Gate
+* **Context**:
+  Execute the remaining P0 production-readiness requirements from `docs/assesment.md`:
+  1. §2.1: Formal unsafe audit across all EBR and COW B+ tree raw-pointer publication and retirement locations.
+  2. §2.2, §2.3, §2.5: Multi-threaded EBR long-duration stress suite covering tree splits, merges, root collapses, rapid churn, and long-lived reader soaks.
+  3. B+ tree concurrency fix: Resolve leaf descent boundary races during concurrent splits in optimistic reader/writer paths.
+  4. §3: Automated systematic durability crash matrix across all WAL and checkpoint failpoints.
+  5. §4: MVCC system-level property testing and differential verification against an independent reference oracle.
+  6. §6: Production CI release gate check and scheduled nightly reliability testing workflow.
+* **Delivered**:
+  - **EBR & B+ Tree Unsafe Audit** (`crates/engine/src/btree.rs`, `crates/engine/src/epoch.rs`): Audited all unsafe blocks. Added exhaustive `// SAFETY:` rationale blocks documenting pointer provenance, lifetimes, memory orderings (`Acquire`, `Release`, `AcqRel`), exclusion guarantees, and EBR epoch quarantine invariants.
+  - **OLC B+ Tree Split Boundary & Range Monotonicity Fix** (`crates/engine/src/btree.rs`):
+    - Identified and fixed concurrent descent race where a writer descends into a leaf that was split concurrently, restarting descent from root when `key > keys.last()` on leaves with active `next` siblings.
+    - Added monotonic `last_key` tracking in optimistic range scans (`range()`) ensuring keys shifted or borrowed between adjacent leaves never cause duplicates or out-of-order records.
+    - Fixed `split_child_in_place` parent insertion to use exact child index `idx` and `idx + 1` for child and separator placement.
+  - **EBR Concurrency Stress Suite** (`crates/engine/src/db/tests/ebr_stress.rs`): Added reproducible, seeded stress suite (`HENCHDB_STRESS_SEED`):
+    - `ebr_stress_tree_splits_merges_and_root_collapses`: Multi-threaded writers and concurrent optimistic readers during aggressive split, borrow, merge, and root collapse churn.
+    - `ebr_stress_nested_guards_rapid_churn_and_reclamation`: 8 concurrent worker threads with nested epoch guards, rapid churn, verifying 100% reclamation with zero leaks.
+    - `ebr_stress_long_lived_reader_soak`: Verifies long readers hold pins safely across writer cycles, with full reclamation upon unpin.
+  - **Automated Durability Crash Matrix** (`crates/engine/src/db/tests/crash_matrix.rs`): Systematic crash testing across failpoints (`before_wal_write`, `before_wal_sync`, `after_wal_sync`, `before_install`, `during_multirow_install`, `before_snapshot_rename`, `before_wal_reset`) verifying restart recovery, ACID atomicity, `CHECK DATABASE` structural integrity, and subsequent live writes.
+  - **MVCC Reference Oracle Property Testing** (`crates/engine/src/db/tests/mvcc_property.rs`): Implemented independent `MvccReferenceOracle` verifying RepeatableRead snapshots across commits and rollbacks, and long-lived snapshots across version vacuum GC and fuzzy checkpoints.
+  - **Production CI & Scheduled Nightly Pipeline** (`.github/workflows/ci.yml`): Added release build check on PRs (`cargo check --release`) and scheduled/manual nightly reliability workflow running stress suites across multiple seeds with automated failure artifact capture.
+  - All source files strictly comply with the $\le 1,500$ line ceiling. Zero compiler warnings. Engine remains strictly `std`-only.
+* **Evidence**: **335/335 tests green** (236 engine + 99 server); `cargo check --release` 100% clean.
+* **Effort**: High.
+
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**323 tests: 224 engine + 99 server** as of this writing).
+1. `cargo test` — all green (**335 tests: 236 engine + 99 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

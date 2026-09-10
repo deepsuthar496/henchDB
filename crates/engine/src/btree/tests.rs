@@ -78,7 +78,7 @@
             }));
         }
         // Concurrent readers exercising the optimistic path.
-        for _ in 0..2 {
+        for _ in 0..4 {
             let t = t.clone();
             handles.push(thread::spawn(move || {
                 for _ in 0..500 {

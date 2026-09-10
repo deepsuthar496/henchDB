@@ -55,11 +55,17 @@ struct Retired {
     epoch: u64,
 }
 
+// SAFETY: `Retired` encapsulates an owned heap allocation that implements `Send` (guaranteed
+// by the `T: 'static + Send` bounds on `retire` and `retire_raw`). The raw pointer is transferred
+// to the reclamation queue and is never accessed across threads without synchronization.
 unsafe impl Send for Retired {}
 
 impl Drop for Retired {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // SAFETY: `drop_fn` was constructed via `dropper<T>` where `T` is the exact concrete
+            // type passed to `retire` or `retire_raw`. The pointer is non-null, uniquely owned
+            // by this `Retired` record, and has survived its quarantine period past all readers.
             unsafe {
                 (self.drop_fn)(self.ptr);
             }
@@ -153,6 +159,10 @@ impl EpochManager {
             }
         });
         let e = self.global_epoch.load(Ordering::Acquire);
+        // SAFETY: `p_ptr` was obtained from `Arc::as_ptr(&p)` where `p` is stored in the
+        // thread-local map and in `self.participants`. The allocation is alive for the
+        // lifetime of the thread and is protected by `self.participants` Mutex against
+        // premature reclamation. The atomic swap updates active_epoch safely without data races.
         let prev = unsafe { (*p_ptr).active_epoch.swap(e, Ordering::AcqRel) };
         Guard {
             participant: p_ptr,
@@ -285,6 +295,10 @@ pub struct Guard {
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
+        // SAFETY: `participant` points to this thread's registered `Participant` node.
+        // The pointer is valid because the `Participant` is retained in thread-local storage
+        // and the `EpochManager`'s participants registry. `Ordering::Release` ensures all
+        // reads performed during this critical section are ordered before the guard unpins.
         unsafe {
             (*self.participant)
                 .active_epoch

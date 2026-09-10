@@ -125,11 +125,16 @@ pub struct Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        // The node itself is dropped only when no `Arc` (and hence no reader
-        // traversing through one) references it, so the current body has no
-        // outstanding readers. Superseded bodies were retired separately.
+        // The node itself is dropped only when its outer Arc refcount reaches 0.
+        // By definition, no reader can reach this node or hold a reference to it.
+        // Superseded bodies were already retired through EBR; this drops the final
+        // active NodeBody that was allocated via Box::into_raw.
         let raw = *self.ptr.get_mut();
         if !raw.is_null() {
+            // SAFETY: `raw` was created via `Box::into_raw` during node creation or
+            // `WriteGuard::drop`. Since `&mut self` proves unique ownership and no
+            // outstanding references exist, converting back to `Box` and dropping
+            // is strictly safe and prevents memory leaks.
             drop(unsafe { Box::from_raw(raw) });
         }
     }
@@ -248,8 +253,11 @@ impl Drop for WriteGuard<'_> {
                     .node
                     .ptr
                     .swap(Box::into_raw(Box::new(body)), Ordering::AcqRel);
-                // The old body is immutable from here on; readers pinned
-                // during the swap keep it alive via EBR quarantine.
+                // SAFETY: `old` was allocated via `Box::into_raw` during earlier publication.
+                // The exclusive latch on `self.node` held throughout this guard guarantees no
+                // other thread swapped or mutated `ptr`. Concurrent optimistic readers that
+                // observed `old` hold an EBR pin, guaranteeing `old` remains valid and
+                // immutable until all such readers drop their guards and unpin.
                 unsafe { self.epoch.retire_raw(old) };
             }
         }
@@ -438,6 +446,7 @@ impl BTree {
             }
         }
         // Walk the leaf chain, validating each leaf after copying it.
+        let mut last_key: Option<Vec<u8>> = None;
         loop {
             let version = node.latch.wait_and_version();
             let (keys, vals, next) = match node.body() {
@@ -449,6 +458,11 @@ impl BTree {
             }
             let mut exhausted = true;
             for (k, v) in keys.into_iter().zip(vals) {
+                if let Some(ref last) = last_key {
+                    if k.as_slice() <= last.as_slice() {
+                        continue; // already emitted from a previous leaf / concurrent borrow
+                    }
+                }
                 if let Some(lo) = start {
                     if k.as_slice() < lo || (k.as_slice() == lo && !start_incl) {
                         continue;
@@ -459,6 +473,7 @@ impl BTree {
                         return out;
                     }
                 }
+                last_key = Some(k.clone());
                 out.push((k, v));
             }
             if let Some(n) = next {
@@ -1028,13 +1043,18 @@ fn upsert_rec(
 ) -> UpsertDescend {
     let mut g = node.lock(epoch);
     match &mut *g {
-        NodeBody::Leaf { keys, heads, vals, .. } => {
+        NodeBody::Leaf { keys, heads, vals, next } => {
             let idx = lower_bound(keys, heads, key);
             if idx < keys.len() && keys[idx] == key {
                 let prev = std::mem::replace(&mut vals[idx], val.to_vec());
                 return UpsertDescend::Done(Some(prev));
             }
             if keys.len() >= MAX_KEYS {
+                return UpsertDescend::Restart;
+            }
+            if next.is_some() && !keys.is_empty() && key > keys.last().unwrap().as_slice() {
+                // A concurrent split moved keys >= separator to right sibling `next`.
+                // Restart descent from root to route to the correct leaf.
                 return UpsertDescend::Restart;
             }
             keys.insert(idx, key.to_vec());
@@ -1104,9 +1124,14 @@ fn insert_rec(
 ) -> Descend {
     let mut g = node.lock(epoch);
     match &mut *g {
-        NodeBody::Leaf { keys, heads, vals, .. } => {
+        NodeBody::Leaf { keys, heads, vals, next } => {
             if keys.len() >= MAX_KEYS {
                 return Descend::Restart; // guard drop releases the latch
+            }
+            if next.is_some() && !keys.is_empty() && key > keys.last().unwrap().as_slice() {
+                // A concurrent split moved keys >= separator to right sibling `next`.
+                // Restart descent from root to route to the correct leaf.
+                return Descend::Restart;
             }
             let idx = lower_bound(keys, heads, key);
             if idx < keys.len() && keys[idx] == key {
@@ -1176,7 +1201,7 @@ fn split_child_in_place(
                 (sep, Node::new_internal(right_keys, right_children))
             }
         }
-    }; // child latch released here
+    };
     let at = lower_bound(p_keys, p_heads, &sep);
     p_keys.insert(at, sep.clone());
     p_heads.insert(at, key_head(&sep));

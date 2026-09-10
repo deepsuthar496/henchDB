@@ -1,29 +1,30 @@
-name: CI
+name: CI & Reliability Gate
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: '0 2 * * *' # Nightly reliability pipeline (§6.2)
+  workflow_dispatch:
 
 jobs:
-  check-and-test:
-    name: ${{ matrix.os }} / ${{ matrix.toolchain }} / ${{ matrix.profile }}
+  pr-checks:
+    name: PR Gate / ${{ matrix.os }} / ${{ matrix.profile }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        toolchain: [stable]
         profile: [debug, release]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust ${{ matrix.toolchain }}
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
 
       - name: Rustfmt check
@@ -34,6 +35,9 @@ jobs:
         if: matrix.profile == 'debug'
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Release compile check
+        run: cargo check --release
+
       - name: Run Tests (${{ matrix.profile }})
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then
@@ -42,3 +46,42 @@ jobs:
             cargo test --all-targets
           fi
         shell: bash
+
+  nightly-reliability:
+    name: Nightly Reliability Matrix (EBR, Crash, MVCC, Repl)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run EBR Concurrency Stress (Seed 1)
+        env:
+          HENCHDB_STRESS_SEED: 123456789
+        run: cargo test -p engine --lib db::tests::ebr_stress -- --nocapture
+
+      - name: Run EBR Concurrency Stress (Seed 2)
+        env:
+          HENCHDB_STRESS_SEED: 987654321
+        run: cargo test -p engine --lib db::tests::ebr_stress -- --nocapture
+
+      - name: Run Automated Crash Matrix
+        run: cargo test -p engine --lib db::tests::crash_matrix -- --nocapture
+
+      - name: Run MVCC Property Oracle
+        run: cargo test -p engine --lib db::tests::mvcc_property -- --nocapture
+
+      - name: Run Replication & Disaster Recovery Failure Matrix
+        run: cargo test -p server --bin server replication::tests -- --nocapture
+
+      - name: Upload Failure Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-failure-artifacts
+          path: |
+            target/
+            *.log
+          if-no-files-found: ignore
