@@ -570,7 +570,7 @@ impl Database {
                 }
             }
             let total_bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-            session.mem_tracker.reserve_context(total_bytes, "sort")?;
+            let _sort_res = session.mem_tracker.reserve_guard(total_bytes, "sort")?;
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
                 keys.push(Self::single_col_idx(schema, display, col)?);

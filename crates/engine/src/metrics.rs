@@ -118,6 +118,15 @@ pub struct MetricsSnapshot {
     pub repl_applied: u64,
     pub repl_lag: u64,
     pub repl_status: String,
+    pub query_errors: u64,
+    pub query_timeouts: u64,
+    pub query_memory_bytes: usize,
+    pub checkpoints_total: u64,
+    pub checkpoint_us: u64,
+    pub recovery_total: u64,
+    pub recovery_us: u64,
+    pub backups_total: u64,
+    pub restores_total: u64,
 }
 
 /// Live inputs gathered by the database for status/prometheus assembly.
@@ -180,6 +189,15 @@ pub struct Metrics {
     repl_applied: AtomicU64,
     repl_lag: AtomicU64,
     repl_status: Mutex<String>,
+    query_errors: AtomicU64,
+    query_timeouts: AtomicU64,
+    query_memory_bytes: AtomicUsize,
+    checkpoints_total: AtomicU64,
+    checkpoint_us: AtomicU64,
+    recovery_total: AtomicU64,
+    recovery_us: AtomicU64,
+    backups_total: AtomicU64,
+    restores_total: AtomicU64,
 }
 
 impl Metrics {
@@ -209,6 +227,15 @@ impl Metrics {
             repl_applied: AtomicU64::new(0),
             repl_lag: AtomicU64::new(0),
             repl_status: Mutex::new(String::new()),
+            query_errors: AtomicU64::new(0),
+            query_timeouts: AtomicU64::new(0),
+            query_memory_bytes: AtomicUsize::new(0),
+            checkpoints_total: AtomicU64::new(0),
+            checkpoint_us: AtomicU64::new(0),
+            recovery_total: AtomicU64::new(0),
+            recovery_us: AtomicU64::new(0),
+            backups_total: AtomicU64::new(0),
+            restores_total: AtomicU64::new(0),
         }
     }
 
@@ -220,6 +247,36 @@ impl Metrics {
     pub fn record_lock_wait(&self, elapsed_us: u64) {
         self.lock_waits.fetch_add(1, Ordering::Relaxed);
         self.lock_wait_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+
+    pub fn record_query_error(&self) {
+        self.query_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_query_timeout(&self) {
+        self.query_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_query_memory(&self, bytes: usize) {
+        self.query_memory_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_checkpoint(&self, elapsed_us: u64) {
+        self.checkpoints_total.fetch_add(1, Ordering::Relaxed);
+        self.checkpoint_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+
+    pub fn record_recovery(&self, elapsed_us: u64) {
+        self.recovery_total.fetch_add(1, Ordering::Relaxed);
+        self.recovery_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+
+    pub fn record_backup(&self) {
+        self.backups_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_restore(&self) {
+        self.restores_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one finished statement (hot path: atomics only).
@@ -368,6 +425,15 @@ impl Metrics {
             repl_applied: self.repl_applied.load(Ordering::Relaxed),
             repl_lag: self.repl_lag.load(Ordering::Relaxed),
             repl_status: self.repl_status.lock().unwrap().clone(),
+            query_errors: self.query_errors.load(Ordering::Relaxed),
+            query_timeouts: self.query_timeouts.load(Ordering::Relaxed),
+            query_memory_bytes: self.query_memory_bytes.load(Ordering::Relaxed),
+            checkpoints_total: self.checkpoints_total.load(Ordering::Relaxed),
+            checkpoint_us: self.checkpoint_us.load(Ordering::Relaxed),
+            recovery_total: self.recovery_total.load(Ordering::Relaxed),
+            recovery_us: self.recovery_us.load(Ordering::Relaxed),
+            backups_total: self.backups_total.load(Ordering::Relaxed),
+            restores_total: self.restores_total.load(Ordering::Relaxed),
         }
     }
 
@@ -514,6 +580,60 @@ impl Metrics {
             "slow_queries_total",
             "Queries taking longer than 1 second.",
             &snap.slow_queries.to_string(),
+        );
+        counter(
+            &mut out,
+            "query_errors_total",
+            "Total number of query execution errors.",
+            &snap.query_errors.to_string(),
+        );
+        counter(
+            &mut out,
+            "query_timeouts_total",
+            "Total number of queries exceeding execution timeout.",
+            &snap.query_timeouts.to_string(),
+        );
+        gauge(
+            &mut out,
+            "query_memory_bytes",
+            "Tracked query execution memory in bytes.",
+            &snap.query_memory_bytes.to_string(),
+        );
+        counter(
+            &mut out,
+            "checkpoints_total",
+            "Total number of checkpoints completed.",
+            &snap.checkpoints_total.to_string(),
+        );
+        counter(
+            &mut out,
+            "checkpoint_time_microseconds_total",
+            "Total time spent completing checkpoints in microseconds.",
+            &snap.checkpoint_us.to_string(),
+        );
+        counter(
+            &mut out,
+            "recovery_total",
+            "Total number of recovery operations completed.",
+            &snap.recovery_total.to_string(),
+        );
+        counter(
+            &mut out,
+            "recovery_time_microseconds_total",
+            "Total time spent recovering database in microseconds.",
+            &snap.recovery_us.to_string(),
+        );
+        counter(
+            &mut out,
+            "backups_total",
+            "Total number of database backup dumps created.",
+            &snap.backups_total.to_string(),
+        );
+        counter(
+            &mut out,
+            "restores_total",
+            "Total number of database restores performed.",
+            &snap.restores_total.to_string(),
         );
         counter(
             &mut out,

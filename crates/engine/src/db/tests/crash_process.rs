@@ -28,10 +28,21 @@ fn run_worker() {
     let db = Database::open(std::path::Path::new(&dir)).expect("child opens db");
     let mut s = db.new_session();
 
+    let extra_rows: usize = std::env::var("HENCHDB_PROCESS_CRASH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     // Execute multi-row, multi-table mixed transaction with FK and secondary index
     db.execute(&mut s, "BEGIN").unwrap();
     db.execute(&mut s, "INSERT INTO parent VALUES (3, 'p3')").unwrap();
     db.execute(&mut s, "INSERT INTO child VALUES (30, 3, 'c30')").unwrap();
+    for i in 0..extra_rows {
+        let pid = 100 + i as i64;
+        let cid = 1000 + i as i64;
+        let _ = db.execute(&mut s, &format!("INSERT INTO parent VALUES ({pid}, 'p{pid}')"));
+        let _ = db.execute(&mut s, &format!("INSERT INTO child VALUES ({cid}, {pid}, 'c{cid}')"));
+    }
     db.execute(&mut s, "UPDATE parent SET name = 'p1_updated' WHERE id = 1").unwrap();
     db.execute(&mut s, "DELETE FROM child WHERE id = 10").unwrap();
 
@@ -46,7 +57,14 @@ fn run_worker() {
 }
 
 fn run_real_process_crash(failpoint_name: &'static str) {
-    let test_id = format!("hdbproc_crash_{}_{}", failpoint_name, std::process::id());
+    run_real_process_crash_with_rows(failpoint_name, 0);
+}
+
+static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn run_real_process_crash_with_rows(failpoint_name: &'static str, extra_rows: usize) {
+    let seq = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let test_id = format!("hdbproc_crash_{}_{}_{}_{}", failpoint_name, extra_rows, std::process::id(), seq);
     let dir = std::env::temp_dir().join(test_id);
     let _ = fs::remove_dir_all(&dir);
 
@@ -87,6 +105,7 @@ fn run_real_process_crash(failpoint_name: &'static str) {
         .env("HENCHDB_PROCESS_CRASH_WORKER", "1")
         .env("HENCHDB_PROCESS_CRASH_DIR", dir.to_str().unwrap())
         .env("HENCHDB_PROCESS_CRASH_FAILPOINT", failpoint_name)
+        .env("HENCHDB_PROCESS_CRASH_ROWS", extra_rows.to_string())
         .status()
         .expect("spawn crash worker subprocess");
 
@@ -176,3 +195,29 @@ fn real_process_crash_before_snapshot_rename() {
 fn real_process_crash_before_wal_reset() {
     run_real_process_crash("before_wal_reset");
 }
+
+#[test]
+fn real_process_crash_randomized_stress_campaign() {
+    let failpoints = [
+        "before_wal_write",
+        "before_wal_sync",
+        "after_wal_sync",
+        "before_install",
+        "during_multirow_install",
+        "before_snapshot_rename",
+        "before_wal_reset",
+    ];
+
+    let cycles: usize = std::env::var("HENCHDB_CRASH_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+
+    let mut prng = crate::db::tests::ebr_stress::StressPrng::new(424242);
+    for c in 0..cycles {
+        let fp = failpoints[c % failpoints.len()];
+        let extra_rows = (prng.next_u64() % 4) as usize;
+        run_real_process_crash_with_rows(fp, extra_rows);
+    }
+}
+

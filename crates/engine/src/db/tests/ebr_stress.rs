@@ -264,3 +264,104 @@ fn ebr_stress_long_lived_reader_soak() {
     assert_eq!(stats_end.reclaimed_total, 500);
     assert_eq!(reclaimed_count.load(Ordering::SeqCst) as u64, 500);
 }
+
+#[test]
+fn ebr_stress_dynamic_thread_creation_and_termination() {
+    let seed = stress_seed();
+    let tree = Arc::new(BTree::new());
+    let ebr = EpochManager::new();
+    tree.set_epoch_manager(ebr.clone());
+
+    let reclaimed_count = Arc::new(AtomicUsize::new(0));
+    struct NodeCanary(Arc<AtomicUsize>);
+    impl Drop for NodeCanary {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Populate initial tree
+    for i in 1..=200 {
+        let k = encode_key(&Datum::Int(i)).unwrap();
+        let v = (i * 10).to_le_bytes().to_vec();
+        tree.upsert(&k, &v);
+    }
+
+    let stop_churn = Arc::new(AtomicBool::new(false));
+    let tree_w = tree.clone();
+    let ebr_w = ebr.clone();
+    let stop_w = stop_churn.clone();
+    let rc_w = reclaimed_count.clone();
+
+    // Background mutator thread constantly modifying tree and retiring objects
+    let mutator = std::thread::spawn(move || {
+        let mut prng = StressPrng::new(seed.wrapping_add(999));
+        let mut step = 0u64;
+        while !stop_w.load(Ordering::Relaxed) {
+            let k_val = prng.gen_range(1, 200) as i64;
+            let k = encode_key(&Datum::Int(k_val)).unwrap();
+            if step % 2 == 0 {
+                let v = (k_val * 100).to_le_bytes().to_vec();
+                tree_w.upsert(&k, &v);
+            } else {
+                tree_w.remove(&k);
+            }
+            if step % 10 == 0 {
+                ebr_w.retire(NodeCanary(rc_w.clone()));
+            }
+            step += 1;
+            std::thread::yield_now();
+        }
+    });
+
+    // Spawn 5 sequential waves of 8 short-lived worker threads
+    let waves = 5;
+    let threads_per_wave = 8;
+    for wave in 0..waves {
+        let mut handles = Vec::new();
+        for t_idx in 0..threads_per_wave {
+            let tree_r = tree.clone();
+            let ebr_r = ebr.clone();
+            let t_seed = seed.wrapping_add((wave * 100 + t_idx) as u64);
+
+            handles.push(std::thread::spawn(move || {
+                let mut prng = StressPrng::new(t_seed);
+                for _ in 0..50 {
+                    let _g = ebr_r.pin();
+                    let k_val = prng.gen_range(1, 200) as i64;
+                    let k = encode_key(&Datum::Int(k_val)).unwrap();
+                    let _ = tree_r.get(&k);
+                    if prng.next_u64() % 15 == 0 {
+                        ebr_r.try_reclaim();
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Between waves, trigger reclamation: terminated thread participants must be pruned
+        ebr.try_reclaim();
+    }
+
+    stop_churn.store(true, Ordering::Relaxed);
+    mutator.join().unwrap();
+
+    // Final drain of EBR
+    for _ in 0..15 {
+        ebr.try_reclaim();
+    }
+
+    let stats = ebr.stats();
+    assert_eq!(stats.active_guards, 0, "All guards should be dropped");
+    assert_eq!(stats.pending_reclamation, 0, "No retired objects leaked");
+    // Only the main thread's participant should remain registered (if pinned) or pruned
+    assert!(
+        stats.participants <= 2,
+        "Terminated thread participants must be automatically pruned from registry, found {}",
+        stats.participants
+    );
+}
+

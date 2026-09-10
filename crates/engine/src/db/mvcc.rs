@@ -82,6 +82,14 @@ impl VersionState {
             }
         }
     }
+
+    pub(crate) fn active_snapshots(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    pub(crate) fn chains_count(&self) -> usize {
+        self.chains.len()
+    }
 }
 
 /// Snapshot pinned by `START TRANSACTION WITH CONSISTENT SNAPSHOT`,
@@ -95,6 +103,16 @@ pub(crate) struct SnapshotPin {
 }
 
 impl Database {
+    /// Number of active MVCC snapshot pins currently registered.
+    pub fn active_snapshots_count(&self) -> usize {
+        self.versions.read().unwrap().active_snapshots()
+    }
+
+    /// Number of distinct keys with superseded MVCC history chains.
+    pub fn mvcc_chains_count(&self) -> usize {
+        self.versions.read().unwrap().chains_count()
+    }
+
     /// Next commit epoch (called under the commit lock; follows WAL order).
     pub(crate) fn alloc_commit_epoch(&self) -> u64 {
         self.commit_epoch.fetch_add(1, Ordering::SeqCst)

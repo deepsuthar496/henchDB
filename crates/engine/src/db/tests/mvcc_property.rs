@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::db::{Database, Datum};
 
@@ -220,9 +222,11 @@ fn mvcc_concurrent_randomized_differential_oracle_stress() {
                 let mut s = db_c.new_session();
                 let use_consistent_snap = prng.next_u64() % 2 == 0;
                 let snap_epoch = if use_consistent_snap {
+                    let _o_snap = oracle_c.read().unwrap();
                     db_c.execute(&mut s, "START TRANSACTION WITH CONSISTENT SNAPSHOT").unwrap();
                     s.snapshot.as_ref().map(|p| p.read_epoch).unwrap_or(0)
                 } else {
+                    let _o_snap = oracle_c.read().unwrap();
                     db_c.execute(&mut s, "BEGIN").unwrap();
                     // First read pins snapshot epoch under RepeatableRead
                     let _ = db_c.execute(&mut s, "SELECT * FROM kv WHERE id = 1").unwrap();
@@ -257,7 +261,10 @@ fn mvcc_concurrent_randomized_differential_oracle_stress() {
 
     // Main writer thread executing randomized commits and rollbacks
     let mut prng = crate::db::tests::ebr_stress::StressPrng::new(seed);
-    let n_batches = 50;
+    let n_batches = std::env::var("HENCHDB_MVCC_STRESS_OPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50);
     for b in 0..n_batches {
         let mut admin = db.new_session();
         let should_rollback = (b % 5) == 0;
@@ -321,3 +328,153 @@ fn mvcc_concurrent_randomized_differential_oracle_stress() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mvcc_oracle_race_focused_stress_suite() {
+    let dir = std::env::temp_dir().join(format!("hdbmvcc_race_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Arc::new(Database::open(&dir).unwrap());
+    let oracle = Arc::new(std::sync::RwLock::new(MvccReferenceOracle::default()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read_queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    {
+        let mut admin = db.new_session();
+        db.execute(&mut admin, "CREATE TABLE accounts (id INT PRIMARY KEY, val TEXT)").unwrap();
+        let init = vec![
+            (1, Some("a1".into())),
+            (2, Some("a2".into())),
+            (3, Some("a3".into())),
+            (4, Some("a4".into())),
+        ];
+        db.execute(&mut admin, "BEGIN").unwrap();
+        db.execute(&mut admin, "INSERT INTO accounts VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4')").unwrap();
+        db.execute(&mut admin, "COMMIT").unwrap();
+        let e = db.visible_epoch.load(Ordering::SeqCst);
+        oracle.write().unwrap().commit_batch_at(e, &init);
+    }
+
+    // Spawn 3 concurrent reader threads continually querying snapshots
+    let mut readers = Vec::new();
+    for r_idx in 0..3 {
+        let db_c = db.clone();
+        let oracle_c = oracle.clone();
+        let stop_c = stop.clone();
+        let read_q = read_queries.clone();
+
+        readers.push(std::thread::spawn(move || {
+            let mut prng = crate::db::tests::ebr_stress::StressPrng::new(9999 + r_idx as u64);
+            while !stop_c.load(Ordering::Relaxed) {
+                let mut s = db_c.new_session();
+                let is_consistent = prng.next_u64() % 2 == 0;
+                let snap_epoch = {
+                    let _o_lock = oracle_c.read().unwrap();
+                    if is_consistent {
+                        db_c.execute(&mut s, "START TRANSACTION WITH CONSISTENT SNAPSHOT").unwrap();
+                    } else {
+                        db_c.execute(&mut s, "BEGIN").unwrap();
+                        let _ = db_c.execute(&mut s, "SELECT * FROM accounts WHERE id = 1").unwrap();
+                    }
+                    s.snapshot.as_ref().map(|p| p.read_epoch).unwrap_or(0)
+                };
+
+                for _ in 0..4 {
+                    let k = prng.gen_range(1, 8) as i64;
+                    let exp = oracle_c.read().unwrap().read_visible(k, snap_epoch);
+                    let res = db_c.execute(&mut s, &format!("SELECT val FROM accounts WHERE id = {k}")).unwrap();
+                    if let Some(expected_val) = exp {
+                        assert_eq!(res.rows.len(), 1, "Key {k} must exist at snap epoch {snap_epoch}");
+                        assert_eq!(res.rows[0][0], Datum::Text(expected_val));
+                    } else {
+                        assert_eq!(res.rows.len(), 0, "Key {k} must not exist at snap epoch {snap_epoch}");
+                    }
+                    read_q.fetch_add(1, Ordering::Relaxed);
+                }
+                db_c.execute(&mut s, "COMMIT").unwrap();
+            }
+        }));
+    }
+
+    // Spawn background maintenance thread periodically triggering GC and fuzzy checkpoints
+    let db_maint = db.clone();
+    let stop_maint = stop.clone();
+    let maint_handle = std::thread::spawn(move || {
+        while !stop_maint.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            db_maint.gc_versions();
+            let _ = db_maint.checkpoint();
+        }
+    });
+
+    // Writer executes randomized multi-row updates, inserts, deletes, and rollbacks
+    let mut prng = crate::db::tests::ebr_stress::StressPrng::new(55555);
+    let n_ops = std::env::var("HENCHDB_MVCC_STRESS_OPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(60);
+    for b in 0..n_ops {
+        let mut admin = db.new_session();
+        let should_rollback = (b % 4) == 0;
+        let k = prng.gen_range(1, 8) as i64;
+
+        let check = db.execute(&mut admin, &format!("SELECT id FROM accounts WHERE id = {k}")).unwrap();
+        let exists = !check.rows.is_empty();
+
+        let (sql, writes) = if !exists {
+            let val = format!("acc_{b}_{k}");
+            (format!("INSERT INTO accounts VALUES ({k}, '{val}')"), vec![(k, Some(val))])
+        } else if b % 2 == 0 {
+            let val = format!("acc_mod_{b}_{k}");
+            (format!("UPDATE accounts SET val = '{val}' WHERE id = {k}"), vec![(k, Some(val))])
+        } else {
+            (format!("DELETE FROM accounts WHERE id = {k}"), vec![(k, None)])
+        };
+
+        db.execute(&mut admin, "BEGIN").unwrap();
+        db.execute(&mut admin, &sql).unwrap();
+
+        if should_rollback {
+            db.execute(&mut admin, "ROLLBACK").unwrap();
+        } else {
+            let mut o = oracle.write().unwrap();
+            db.execute(&mut admin, "COMMIT").unwrap();
+            let epoch = db.visible_epoch.load(Ordering::SeqCst);
+            o.commit_batch_at(epoch, &writes);
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.join().unwrap();
+    }
+    maint_handle.join().unwrap();
+
+    assert!(read_queries.load(Ordering::Relaxed) > 50);
+
+    // Final checkpoint, drop, and restart recovery
+    let final_epoch = db.visible_epoch.load(Ordering::SeqCst);
+    db.checkpoint().unwrap();
+    drop(db);
+
+    let recovered = Database::open(&dir).expect("reopen database after race stress");
+    let mut rec_s = recovered.new_session();
+    let check_reports = recovered.check_database(&rec_s).unwrap();
+    for rep in &check_reports {
+        assert!(rep.is_ok(), "CHECK DATABASE failed post-restart: {:?}", rep.error_msg);
+    }
+
+    // Verify all keys match oracle state
+    for k in 1..8 {
+        let exp = oracle.read().unwrap().read_visible(k, final_epoch);
+        let res = recovered.execute(&mut rec_s, &format!("SELECT val FROM accounts WHERE id = {k}")).unwrap();
+        if let Some(expected_val) = exp {
+            assert_eq!(res.rows.len(), 1, "Key {k} must exist post-recovery");
+            assert_eq!(res.rows[0][0], Datum::Text(expected_val));
+        } else {
+            assert_eq!(res.rows.len(), 0, "Key {k} must not exist post-recovery");
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+

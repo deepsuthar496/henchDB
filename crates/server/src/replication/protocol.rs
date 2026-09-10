@@ -281,6 +281,21 @@ pub fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>, CodecError> {
     decode_body(&body[1..]).map(Some)
 }
 
+/// Decode a raw frame buffer starting with REPL_MAGIC (used by tests & fuzzing).
+pub fn decode_raw_frame(bytes: &[u8]) -> Result<Frame, CodecError> {
+    if bytes.len() < 2 {
+        return Err(CodecError("frame too short".into()));
+    }
+    if bytes[0] != REPL_MAGIC {
+        return Err(CodecError("bad replication magic".into()));
+    }
+    decode_body(&bytes[1..])
+}
+
+pub fn encode_body_for_test(f: &Frame, out: &mut Vec<u8>) {
+    encode_body(f, out);
+}
+
 /// In-memory roundtrip helper (unit tests + framing checks without sockets).
 #[cfg(test)]
 pub fn roundtrip(frame: &Frame) -> Result<Frame, CodecError> {

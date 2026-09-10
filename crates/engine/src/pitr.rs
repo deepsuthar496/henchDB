@@ -437,4 +437,51 @@ mod tests {
         drop(db2);
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn pitr_faults_corrupt_archive_and_gaps() {
+        let (base, src, adir, dest, backup) = fresh_dirs("faults");
+        let db = Database::open(&src).unwrap();
+        db.set_archive_dir(&adir).unwrap();
+        let mut s = db.new_session();
+        db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        {
+            let f = std::fs::File::create(&backup).unwrap();
+            let mut w = std::io::BufWriter::with_capacity(128 * 1024, f);
+            db.dump(&mut w).unwrap();
+            w.flush().unwrap();
+        }
+        db.execute(&mut s, "INSERT INTO t VALUES (10)").unwrap();
+        db.checkpoint().unwrap();
+        db.execute(&mut s, "INSERT INTO t VALUES (20)").unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+
+        // 1. Missing archive directory fails with Error::Io
+        let missing_adir = base.join("nonexistent_archive");
+        let res_missing = restore_pitr(&backup, &dest, &missing_adir, &PitrTarget::default());
+        assert!(matches!(res_missing, Err(Error::Io(_))));
+
+        // 2. Corrupt segment CRC in archive directory fails closed with Error::Corrupted
+        let segments = crate::archive::list_segments(&adir).unwrap();
+        assert!(segments.len() >= 2);
+        let first_seg = &segments[0].path;
+        let mut bytes = std::fs::read(first_seg).unwrap();
+        bytes[10] ^= 0xFF; // Corrupt header
+        std::fs::write(first_seg, bytes).unwrap();
+
+        let res_corrupt = restore_pitr(&backup, &dest, &adir, &PitrTarget::default());
+        assert!(matches!(res_corrupt, Err(Error::Corrupted(_))));
+
+        // 3. Corrupt base backup fails closed with Error::Corrupted
+        let mut backup_bytes = std::fs::read(&backup).unwrap();
+        backup_bytes[2] ^= 0xFF; // Corrupt magic
+        std::fs::write(&backup, backup_bytes).unwrap();
+        let dest_corrupt = base.join("dest_corrupt");
+        let res_bad_backup = restore_pitr(&backup, &dest_corrupt, &adir, &PitrTarget::default());
+        assert!(matches!(res_bad_backup, Err(Error::Corrupted(_))));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
+

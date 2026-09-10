@@ -128,11 +128,24 @@ impl ServerOpts {
         if self.port == 0 {
             return Err(engine::Error::InvalidQuery("invalid port 0: must be between 1 and 65535".into()));
         }
-        if self.max_connections == 0 {
-            return Err(engine::Error::InvalidQuery("invalid --max-connections 0: must be at least 1".into()));
+        if self.max_connections == 0 || self.max_connections > 65536 {
+            return Err(engine::Error::InvalidQuery(format!(
+                "invalid --max-connections {}: must be between 1 and 65536",
+                self.max_connections
+            )));
         }
-        if self.threads == 0 {
-            return Err(engine::Error::InvalidQuery("invalid --threads 0: must be at least 1".into()));
+        if self.threads == 0 || self.threads > 1024 {
+            return Err(engine::Error::InvalidQuery(format!(
+                "invalid --threads {}: must be between 1 and 1024",
+                self.threads
+            )));
+        }
+        if let Some(timeout) = self.idle_timeout {
+            if timeout.is_zero() {
+                return Err(engine::Error::InvalidQuery(
+                    "invalid --wait-timeout 0: must be at least 1s".into(),
+                ));
+            }
         }
         if self.bind.parse::<std::net::IpAddr>().is_err() && self.bind != "localhost" {
             return Err(engine::Error::InvalidQuery(format!(
@@ -173,6 +186,22 @@ impl ServerOpts {
             return Err(engine::Error::InvalidQuery(
                 "invalid TLS configuration: --tls-cert and --tls-key must be provided together".into(),
             ));
+        }
+        if let (Some(cert), Some(key)) = (&self.tls_cert, &self.tls_key) {
+            let p_cert = Path::new(cert);
+            if !p_cert.exists() || !p_cert.is_file() {
+                return Err(engine::Error::InvalidQuery(format!(
+                    "invalid TLS cert path '{}': file does not exist or is not a regular file",
+                    cert
+                )));
+            }
+            let p_key = Path::new(key);
+            if !p_key.exists() || !p_key.is_file() {
+                return Err(engine::Error::InvalidQuery(format!(
+                    "invalid TLS key path '{}': file does not exist or is not a regular file",
+                    key
+                )));
+            }
         }
         if let Some(target) = &self.replica_of {
             if !target.contains(':') {

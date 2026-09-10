@@ -366,6 +366,7 @@ impl Database {
         }
         // 4. Left-deep joins (hash on equi-keys, nested loop otherwise).
         let mut rows = std::mem::take(&mut exec_inputs[0]);
+        let mut _join_res: Option<crate::db::mem_tracker::MemoryReservation> = None;
         for (ji, j) in exec_joins.iter().enumerate() {
             Self::validate_scoped(&j.on, &exec_tables[..ji + 2])?;
             let scope: &[Arc<Table>] = &exec_tables[..ji + 2];
@@ -378,7 +379,7 @@ impl Database {
                 }
             }
             let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-            session.mem_tracker.reserve_context(bytes, "join")?;
+            _join_res = Some(session.mem_tracker.reserve_guard(bytes, "join")?);
         }
         // 5. WHERE over joined rows (subquery conjuncts fold per row
         //    against the joined scope; plain conjuncts take the fast path).
@@ -418,7 +419,7 @@ impl Database {
                 }
             }
             let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-            session.mem_tracker.reserve_context(bytes, "aggregation")?;
+            let _agg_res = session.mem_tracker.reserve_guard(bytes, "aggregation")?;
             // Single-source GROUP BY through the batch pushdown (captured
             // EXPLAIN ANALYZE plans and multi-table scopes stay scalar);
             // decline falls through to the legacy path below.
@@ -478,7 +479,7 @@ impl Database {
                 }
             }
             let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-            session.mem_tracker.reserve_context(bytes, "sort")?;
+            let _sort_res = session.mem_tracker.reserve_guard(bytes, "sort")?;
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
                 keys.push(Self::resolve_scope(&exec_tables, col)?);

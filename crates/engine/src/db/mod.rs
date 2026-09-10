@@ -230,6 +230,7 @@ impl Database {
     /// Open (or create) a database directory: load the snapshot, then redo
     /// committed WAL records.
     pub fn open(dir: &Path) -> Result<Database> {
+        let t0 = std::time::Instant::now();
         fs::create_dir_all(dir)?;
         let epoch = crate::epoch::EpochManager::new();
         let pool = Arc::new(BufferPool::open(&dir.join("pages.bin"), DEFAULT_POOL_FRAMES, epoch.clone())?);
@@ -287,6 +288,8 @@ impl Database {
         Self::fk_ensure_all_auto_indexes(&tables)?;
 
         let install_frontier = wal.next_offset();
+        let metrics = Metrics::new();
+        metrics.record_recovery(t0.elapsed().as_micros() as u64);
         Ok(Database {
             databases: RwLock::new(databases),
             tables: RwLock::new(tables),
@@ -302,7 +305,7 @@ impl Database {
             commit_epoch: AtomicU64::new(1),
             visible_epoch: AtomicU64::new(0),
             versions: RwLock::new(mvcc::VersionState::new()),
-            metrics: Metrics::new(),
+            metrics,
             read_only: AtomicBool::new(false),
             replica_upstream: Mutex::new(String::new()),
             archive_dir: Mutex::new(None),
@@ -371,11 +374,16 @@ impl Database {
     /// `backup.rs` for the format and consistency contract.
     pub fn dump<W: std::io::Write>(&self, writer: &mut W) -> Result<crate::backup::BackupStats> {
         self.checkpoint()?;
-        self.dump_live(writer).map(|(stats, _)| stats)
+        let res = self.dump_live(writer).map(|(stats, _)| stats);
+        if res.is_ok() {
+            self.metrics.record_backup();
+        }
+        res
     }
 
     /// Flush a durable snapshot and truncate the WAL.
     pub fn checkpoint(&self) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let _guard = self.acquire_commit_lock();
         self.pool.sync_data()?;
 
@@ -419,6 +427,7 @@ impl Database {
         // History unreachable by live readers drains here (everything, when
         // no snapshot is active).
         self.gc_versions();
+        self.metrics.record_checkpoint(t0.elapsed().as_micros() as u64);
         Ok(())
     }
 
@@ -434,14 +443,20 @@ impl Database {
         }
         // Fresh subquery scope per statement (derived materializations,
         // correlation frames, and fold caches never leak across queries).
-        session.subq.eph.clear();
-        session.subq.outer.clear();
-        session.subq.fold.clear();
+        session.subq.clear();
         session.mem_tracker.reset();
         let _guard = self.epoch.pin();
         let t0 = std::time::Instant::now();
         let trimmed = sql.trim();
         let res = self.execute_routed(session, sql, trimmed);
+        self.metrics
+            .record_query_memory(session.mem_tracker.peak_bytes());
+        if let Err(ref e) = res {
+            self.metrics.record_query_error();
+            if matches!(e, Error::QueryTimeout) {
+                self.metrics.record_query_timeout();
+            }
+        }
         // Telemetry (hot path: atomics only). Classification from the first
         // keyword covers fast-path and parsed statements uniformly; errors
         // count like MySQL (attempted statements are still queries).

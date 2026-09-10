@@ -736,3 +736,79 @@ fn parse_user_management_and_grants() {
     assert!(parse_sql("GRANT SELECT ON *.* bob;").is_err());
     assert!(parse_sql("ALTER TABLE t ADD COLUMN c INT;").is_err());
 }
+
+#[test]
+fn fuzz_sql_parser_adversarial_inputs() {
+    let valid_samples = [
+        "SELECT id, name, score FROM users WHERE age >= 30 AND score < 100.5 ORDER BY id DESC LIMIT 10;",
+        "INSERT INTO accounts (id, balance, status) VALUES (1, 1000, 'active'), (2, 2500, 'pending');",
+        "UPDATE accounts SET balance = balance + 50 WHERE id = 1 AND status = 'active';",
+        "DELETE FROM orders WHERE created_at < '2025-01-01' AND (status = 'cancelled' OR amount = 0);",
+        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT, balance FLOAT, FOREIGN KEY (id) REFERENCES org(id));",
+        "SELECT a.id, b.val, COUNT(*), SUM(a.amt) FROM t1 a LEFT JOIN t2 b ON a.k = b.k GROUP BY a.id, b.val HAVING COUNT(*) > 1;",
+        "SELECT * FROM (SELECT id, val FROM items WHERE val IN ('a', 'b', 'c')) AS sub WHERE id BETWEEN 10 AND 100;",
+        "GRANT SELECT, INSERT ON db1.tbl TO 'alice'@'%';",
+        "BEGIN TRANSACTION;",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+    ];
+
+    // 1. Truncation stress: truncate valid queries at every single byte offset
+    for sample in &valid_samples {
+        for i in 0..=sample.len() {
+            let prefix = &sample[..i];
+            let result = std::panic::catch_unwind(|| {
+                let _ = parse_sql(prefix);
+            });
+            assert!(result.is_ok(), "SQL parser panicked on truncated query prefix: {prefix:?}");
+        }
+    }
+
+    // 2. Deeply nested parentheses & expressions (up to 300 levels)
+    for depth in [10, 50, 100, 250] {
+        let open_parens = "(".repeat(depth);
+        let close_parens = ")".repeat(depth);
+        let deep_expr = format!("SELECT {open_parens} 1 + 2 {close_parens};");
+        let result = std::panic::catch_unwind(|| {
+            let _ = parse_sql(&deep_expr);
+        });
+        assert!(result.is_ok(), "SQL parser panicked on nesting depth {depth}");
+
+        // Mismatched / unclosed parentheses
+        let mismatched = format!("SELECT {open_parens} 1 + 2;");
+        let result2 = std::panic::catch_unwind(|| {
+            let _ = parse_sql(&mismatched);
+        });
+        assert!(result2.is_ok(), "SQL parser panicked on unclosed parentheses at depth {depth}");
+    }
+
+    // 3. Deterministic XorShift PRNG for randomized fuzz mutations
+    let mut state = 0x853c49e6748fea9bu64;
+    let mut next_u64 = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let fuzz_chars = [
+        '\'', '"', '`', ';', ',', '(', ')', '[', ']', '{', '}',
+        '+', '-', '*', '/', '%', '=', '<', '>', '!', '~', '^',
+        '0', '9', ' ', '\t', '\n', '\r', '\0', '\\',
+        '\u{00FF}', '\u{202E}', '\u{FEFF}', '\u{1F600}',
+    ];
+
+    for _ in 0..2_500 {
+        let len = (next_u64() % 80) as usize;
+        let mut text = String::with_capacity(len);
+        for _ in 0..len {
+            let idx = (next_u64() as usize) % fuzz_chars.len();
+            text.push(fuzz_chars[idx]);
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = parse_sql(&text);
+        });
+        assert!(result.is_ok(), "SQL parser panicked on random adversarial string: {text:?}");
+    }
+}
+

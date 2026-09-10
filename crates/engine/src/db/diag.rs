@@ -239,4 +239,25 @@ impl Database {
         let extra = self.engine_extra();
         self.metrics.render_prometheus(&snap, &extra)
     }
+
+    /// Evaluates explicit production health status of the database (Assessment §19).
+    /// Explicit states:
+    /// - "healthy": storage is intact, can process writes or caught-up replica
+    /// - "replication-lagging": replica lag exceeds 10 MiB threshold
+    /// - "degraded": database is in read-only / failover fencing mode
+    /// - "storage-error": data directory or essential files are inaccessible
+    pub fn health_status(&self) -> &'static str {
+        if !self.dir.exists() {
+            return "storage-error";
+        }
+        let snap = self.metrics.snapshot();
+        if snap.repl_lag > 10 * 1024 * 1024 {
+            return "replication-lagging";
+        }
+        if self.read_only.load(std::sync::atomic::Ordering::Relaxed) {
+            return "degraded";
+        }
+        "healthy"
+    }
 }
+

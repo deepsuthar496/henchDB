@@ -267,3 +267,107 @@ fn fuzz_pg_wire_codecs() {
         let _ = parse_close_msg(&payload);
     }
 }
+
+#[test]
+fn fuzz_replication_protocol_frames() {
+    use crate::replication::protocol::{decode_raw_frame, roundtrip, Frame, REPL_MAGIC};
+    let mut rng = FuzzRng::new(0xFEED_FACE_CAFE_BABE);
+
+    // 1. Random byte slices
+    for _ in 0..4_000 {
+        let len = rng.range(0, 256);
+        let mut buf = rng.gen_bytes(len);
+        if !buf.is_empty() && rng.next_u64() % 2 == 0 {
+            buf[0] = REPL_MAGIC;
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = decode_raw_frame(&buf);
+        });
+        assert!(result.is_ok(), "decode_raw_frame panicked on random byte slice");
+    }
+
+    // 2. Valid frames and bit-flipped corruption
+    let frames = vec![
+        Frame::Handshake {
+            version: 1,
+            user: "repl_user".into(),
+            password: "secret_password".into(),
+        },
+        Frame::HandshakeAck {
+            ok: true,
+            message: "ok".into(),
+            wal_version: 4,
+            durable_offset: 1024,
+        },
+        Frame::StartReplication {
+            generation: 1,
+            from_offset: 500,
+        },
+        Frame::WalChunk {
+            offset: 500,
+            data: vec![1, 2, 3, 4, 5],
+        },
+        Frame::Heartbeat {
+            durable_offset: 2048,
+        },
+        Frame::HeartbeatAck,
+        Frame::SnapshotRequired,
+        Frame::SnapshotBegin {
+            total_bytes: 100_000,
+            end_offset: 2048,
+            generation: 1,
+        },
+        Frame::SnapshotChunk {
+            data: vec![10, 20, 30],
+        },
+        Frame::SnapshotEnd,
+    ];
+
+    for frame in frames {
+        let rt = roundtrip(&frame).expect("roundtrip must succeed for valid frame");
+        assert_eq!(rt, frame);
+
+        // Verify encode_body + decode_raw_frame roundtrip
+        let mut encoded = vec![REPL_MAGIC];
+        crate::replication::protocol::encode_body_for_test(&frame, &mut encoded);
+        let decoded = decode_raw_frame(&encoded).expect("decode_raw_frame on valid frame");
+        assert_eq!(decoded, frame);
+    }
+}
+
+#[test]
+fn fuzz_authentication_password_proofs() {
+    use crate::auth::*;
+    let mut rng = FuzzRng::new(0x1122_3344_5566_7788);
+
+    // 1. Fuzz SHA-256 and SHA-1 implementations with random byte buffers
+    for _ in 0..2_000 {
+        let len = rng.range(0, 512);
+        let buf = rng.gen_bytes(len);
+        let result = std::panic::catch_unwind(|| {
+            let _ = sha256(&buf);
+            let _ = sha1(&buf);
+        });
+        assert!(result.is_ok(), "SHA hash panicked on random buffer");
+    }
+
+    // 2. Fuzz auth token verification with corrupted tokens and scrambles
+    let verifier_sha2 = Verifier::new_sha2(b"correct_password");
+    let verifier_native = Verifier::new_native(b"correct_password");
+
+    for _ in 0..2_000 {
+        let scramble_len = rng.range(0, 40);
+        let scramble = rng.gen_bytes(scramble_len);
+        let token_len = rng.range(0, 40);
+        let token = rng.gen_bytes(token_len);
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = verify_sha2(&verifier_sha2.hash, &scramble, &token);
+            let _ = verify_native(&verifier_native.hash, &scramble, &token);
+        });
+        assert!(result.is_ok(), "verify functions panicked on random inputs");
+    }
+}
+
+

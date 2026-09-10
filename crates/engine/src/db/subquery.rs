@@ -50,6 +50,17 @@ pub(crate) struct SubqueryState {
     /// provably uncorrelated nodes are stored, so sharing a key across
     /// scopes is always sound.
     pub fold: HashMap<String, Folded>,
+    /// Active memory reservations for derived-table materializations.
+    pub res: HashMap<String, crate::db::mem_tracker::MemoryReservation>,
+}
+
+impl SubqueryState {
+    pub fn clear(&mut self) {
+        self.eph.clear();
+        self.outer.clear();
+        self.fold.clear();
+        self.res.clear();
+    }
 }
 
 pub(crate) struct OuterFrame {
@@ -139,10 +150,13 @@ pub(crate) fn setup_derived(
                 }
             }
             let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
-            if let Err(e) = session.mem_tracker.reserve_context(total_bytes, "subquery materialization") {
-                teardown_derived(session, saved);
-                return Err(e);
-            }
+            let res = match session.mem_tracker.reserve_guard(total_bytes, "subquery materialization") {
+                Ok(g) => g,
+                Err(e) => {
+                    teardown_derived(session, saved);
+                    return Err(e);
+                }
+            };
             let table = match ephemeral_table(alias, &out) {
                 Ok(t) => t,
                 Err(e) => {
@@ -154,6 +168,7 @@ pub(crate) fn setup_derived(
                 .entry(alias.clone())
                 .or_insert_with(|| session.subq.eph.get(alias).cloned());
             session.subq.eph.insert(alias.clone(), table);
+            session.subq.res.insert(alias.clone(), res);
         }
     }
     Ok(saved)
@@ -171,6 +186,7 @@ pub(crate) fn teardown_derived(
             }
             None => {
                 session.subq.eph.remove(&alias);
+                session.subq.res.remove(&alias);
             }
         }
     }
@@ -559,7 +575,7 @@ fn build_set(
         }
     }
     let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
-    session.mem_tracker.reserve_context(total_bytes, "subquery IN evaluation")?;
+    let _in_res = session.mem_tracker.reserve_guard(total_bytes, "subquery IN evaluation")?;
     let mut set = HashSet::new();
     let mut has_nullish = false;
     for r in &out.rows {

@@ -20,8 +20,11 @@ mod mvcc;
 mod mvcc_property;
 mod opt;
 mod privilege;
+mod resource_leak;
+mod storage_integrity;
 mod subquery;
 mod sysviews;
+mod timeout_cleanup;
 mod txn;
 
 fn setup(dir: &Path) -> Database {

@@ -140,6 +140,12 @@ impl QueryMemoryTracker {
     pub fn reset(&self) {
         self.current_bytes.store(0, Ordering::SeqCst);
     }
+
+    /// Reserve `bytes` and return an RAII `MemoryReservation` guard that releases
+    /// the memory automatically when dropped.
+    pub fn reserve_guard(&self, bytes: usize, context: &str) -> Result<MemoryReservation> {
+        MemoryReservation::new(self, bytes, context)
+    }
 }
 
 /// RAII reservation guard that releases memory upon drop.
@@ -232,5 +238,66 @@ mod tests {
         let err = tracker.reserve(usize::MAX).unwrap_err();
         assert!(err.to_string().contains("exceeded max_intermediate_bytes limit"));
         assert_eq!(tracker.current_bytes(), 0);
+    }
+
+    #[test]
+    fn query_memory_tracker_sequential_intermediates_reuse_memory() {
+        let tracker = QueryMemoryTracker::new(Some(500));
+        // 1. First stage: Hash Join uses 400 bytes
+        {
+            let _join_guard = tracker.reserve_guard(400, "join").unwrap();
+            assert_eq!(tracker.current_bytes(), 400);
+            // Attempting another 200 bytes while join is alive must fail
+            assert!(tracker.reserve(200).is_err());
+            assert_eq!(tracker.current_bytes(), 400); // no leak
+        }
+        // Join finished and guard dropped: memory released
+        assert_eq!(tracker.current_bytes(), 0);
+        assert_eq!(tracker.peak_bytes(), 400);
+
+        // 2. Second stage: Sort can now reuse the 400 bytes within the 500 byte limit
+        {
+            let _sort_guard = tracker.reserve_guard(400, "sort").unwrap();
+            assert_eq!(tracker.current_bytes(), 400);
+        }
+        assert_eq!(tracker.current_bytes(), 0);
+        assert_eq!(tracker.peak_bytes(), 400);
+    }
+
+    #[test]
+    fn query_memory_tracker_nested_and_concurrent_limits() {
+        let tracker = Arc::new(QueryMemoryTracker::new(Some(1000)));
+
+        // Nested reservation
+        {
+            let _outer = tracker.reserve_guard(300, "outer").unwrap();
+            assert_eq!(tracker.current_bytes(), 300);
+            {
+                let _inner = tracker.reserve_guard(400, "inner").unwrap();
+                assert_eq!(tracker.current_bytes(), 700);
+            }
+            assert_eq!(tracker.current_bytes(), 300);
+        }
+        assert_eq!(tracker.current_bytes(), 0);
+
+        // Concurrent reservations
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let t = tracker.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    if let Ok(guard) = t.reserve_guard(200, "worker") {
+                        assert!(t.current_bytes() <= 1000);
+                        std::thread::yield_now();
+                        drop(guard);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(tracker.current_bytes(), 0);
+        assert!(tracker.peak_bytes() <= 1000);
     }
 }

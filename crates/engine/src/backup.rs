@@ -362,10 +362,13 @@ impl Database {
             std::fs::write(target_dir.join("pages.bin"), &decoded.pages)?;
         }
         // Verify the restored catalog opens cleanly.
-        drop(Database::open(target_dir)?);
+        let db = Database::open(target_dir)?;
+        db.metrics().record_restore();
+        drop(db);
         Ok(RestoreStats { tables: decoded.tables.len(), rows: total_rows, bytes_read })
     }
 }
+
 
 /// A fully validated backup archive, decoded but not yet materialized.
 /// Replication snapshot-apply consumes this directly into the live

@@ -23,7 +23,8 @@ pub fn route(request_head: &str) -> &'static str {
     }
     match parts.next().unwrap_or_default() {
         "/metrics" | "/metrics/" => "metrics",
-        "/" | "/health" | "/health/" | "/healthz" => "health",
+        "/live" | "/live/" | "/livez" | "/healthz/live" => "live",
+        "/" | "/health" | "/health/" | "/healthz" | "/ready" | "/readyz" => "health",
         _ => "not_found",
     }
 }
@@ -32,7 +33,17 @@ pub fn route(request_head: &str) -> &'static str {
 pub fn handle_request(db: &Database, request_head: &str) -> (u16, String) {
     match route(request_head) {
         "metrics" => (200, db.prometheus_text()),
-        "health" => (200, "ok\n".to_string()),
+        "live" => (200, "alive\n".to_string()),
+        "health" => {
+            let status = db.health_status();
+            let code = match status {
+                "healthy" | "degraded" => 200,
+                "replication-lagging" => 503,
+                "storage-error" => 500,
+                _ => 200,
+            };
+            (code, format!("{status}\n"))
+        }
         _ => (404, "not found\n".to_string()),
     }
 }
@@ -41,9 +52,12 @@ fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
         404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     }
 }
+
 
 fn serve_one(db: &Database, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -135,7 +149,10 @@ mod tests {
     #[test]
     fn routes_classify() {
         assert_eq!(route("GET /metrics HTTP/1.1\r\n"), "metrics");
+        assert_eq!(route("GET /live HTTP/1.1\r\n"), "live");
+        assert_eq!(route("GET /healthz/live HTTP/1.1\r\n"), "live");
         assert_eq!(route("GET /health HTTP/1.1\r\n"), "health");
+        assert_eq!(route("GET /ready HTTP/1.1\r\n"), "health");
         assert_eq!(route("GET / HTTP/1.0\r\n"), "health");
         assert_eq!(route("GET /nope HTTP/1.1\r\n"), "not_found");
         assert_eq!(route("POST /metrics HTTP/1.1\r\n"), "not_found");
@@ -149,9 +166,12 @@ mod tests {
         assert_eq!(code, 200);
         assert!(body.contains("queries_total"));
         assert!(body.contains("# HELP"));
+        let (code, body) = handle_request(&db, "GET /live HTTP/1.1\r\n\r\n");
+        assert_eq!(code, 200);
+        assert_eq!(body, "alive\n");
         let (code, body) = handle_request(&db, "GET /health HTTP/1.1\r\n\r\n");
         assert_eq!(code, 200);
-        assert_eq!(body, "ok\n");
+        assert_eq!(body, "healthy\n");
         let (code, _) = handle_request(&db, "GET /favicon.ico HTTP/1.1\r\n\r\n");
         assert_eq!(code, 404);
     }
@@ -206,9 +226,10 @@ mod tests {
             if path == "/metrics" {
                 assert!(text.contains("queries_total"), "no metrics in body");
             } else {
-                assert!(text.ends_with("ok\n"), "bad health body");
+                assert!(text.ends_with("healthy\n"), "bad health body: {text}");
             }
         }
+
         handle.join().unwrap();
         assert!(shutdown.load(Ordering::Relaxed));
     }

@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use super::{Database, Session};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{decode_key, decode_sec_index_key, encode_key, encode_sec_index_key, Datum};
 use crate::wal::crc32;
 
@@ -33,7 +33,23 @@ impl CheckReport {
 impl Database {
     /// Perform comprehensive diagnostic integrity checks on a table and compute
     /// its deterministic logical CRC32 hash.
+    ///
+    /// Acquires `commit_lock` (§6b Rank 1) to inspect the primary tree, secondary
+    /// indexes, and foreign key relations at an atomic point-in-time commit epoch,
+    /// safe against concurrent writer interleaving while allowing concurrent readers.
     pub fn check_table(&self, session: &Session, table_name: &str) -> Result<CheckReport> {
+        let _guard = self.acquire_commit_lock();
+        let target = self.wal.next_offset();
+        {
+            let mut frontier = self.install.lock().unwrap();
+            while *frontier < target {
+                frontier = self.install_cv.wait(frontier).unwrap();
+            }
+        }
+        self.check_table_locked(session, table_name)
+    }
+
+    fn check_table_locked(&self, session: &Session, table_name: &str) -> Result<CheckReport> {
         let table = self.table(session, table_name)?;
         let qual_name = self.resolve_table_key(session, table_name);
 
@@ -281,7 +297,19 @@ impl Database {
 
     /// Perform comprehensive diagnostic integrity checks on all tables in the current
     /// database and return individual table reports plus a summary report (§48).
+    ///
+    /// Acquires `commit_lock` (§6b Rank 1) so all tables in the database are checked
+    /// under a single atomic point-in-time snapshot, guaranteeing cross-table foreign key
+    /// and index consistency during concurrent storage operations.
     pub fn check_database(&self, session: &Session) -> Result<Vec<CheckReport>> {
+        let _guard = self.acquire_commit_lock();
+        let target = self.wal.next_offset();
+        {
+            let mut frontier = self.install.lock().unwrap();
+            while *frontier < target {
+                frontier = self.install_cv.wait(frontier).unwrap();
+            }
+        }
         let prefix = format!("{}.", session.current_db);
         let tables_guard = self.tables.read().unwrap();
         let mut names: Vec<String> = Vec::new();
@@ -300,7 +328,11 @@ impl Database {
         let mut any_error = false;
 
         for name in &names {
-            let report = self.check_table(session, name)?;
+            let report = match self.check_table_locked(session, name) {
+                Ok(r) => r,
+                Err(Error::TableNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             if !report.is_ok() {
                 any_error = true;
             }
