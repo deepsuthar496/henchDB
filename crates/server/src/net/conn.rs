@@ -209,6 +209,35 @@ impl Conn {
         }
     }
 
+    /// Wait briefly for pipelined or rapid conversational input before yielding.
+    /// In interactive SQL sessions and benchmarks on localhost, the next request arrives
+    /// within 10-100 microseconds. Catching it here allows the worker thread to execute
+    /// the next step immediately without incurring an OS context switch and poller sleep.
+    pub(crate) fn wait_input_opportunistic(&self) -> bool {
+        if self.has_buffered_input() {
+            return true;
+        }
+        let _ = self.set_blocking(false);
+        let start = Instant::now();
+        let limit = std::time::Duration::from_micros(600);
+        while start.elapsed() < limit {
+            match self.has_pending_input() {
+                Ok(true) => {
+                    let _ = self.set_blocking(true);
+                    return true;
+                }
+                Ok(false) => {
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = self.set_blocking(true);
+        false
+    }
+
     pub(crate) fn describe(&self) -> &'static str {
         match &self.state {
             ConnState::NewMain(_) | ConnState::NewPg(_) => "handshake",

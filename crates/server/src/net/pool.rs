@@ -232,7 +232,7 @@ fn run_steps(
         match step {
             Err(_) | Ok(Disposition::Closed) => return (Some(conn), Disposition::Closed),
             Ok(Disposition::Idle) => {
-                if !conn.has_buffered_input() {
+                if !conn.wait_input_opportunistic() {
                     return (Some(conn), Disposition::Idle);
                 }
             }
