@@ -402,4 +402,7 @@ pub enum Statement {
     CheckTable {
         table: String,
     },
+    CheckDatabase {
+        database: Option<String>,
+    },
 }

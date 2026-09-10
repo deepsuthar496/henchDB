@@ -68,6 +68,17 @@ impl Drop for Retired {
     }
 }
 
+/// Summary metrics for the Epoch-Based Reclamation subsystem (Audit §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EbrStats {
+    pub participants: usize,
+    pub active_guards: usize,
+    pub retired_total: u64,
+    pub reclaimed_total: u64,
+    pub pending_reclamation: usize,
+    pub oldest_retired_age_epochs: u64,
+}
+
 /// The centralized Epoch Manager.
 pub struct EpochManager {
     /// Unique id: thread-local participants are keyed by this, so one thread
@@ -75,6 +86,8 @@ pub struct EpochManager {
     /// without their epochs aliasing each other.
     id: u64,
     global_epoch: AtomicU64,
+    retired_total: AtomicU64,
+    reclaimed_total: AtomicU64,
     participants: Mutex<Vec<Arc<Participant>>>,
     retired: Mutex<Vec<Retired>>,
 }
@@ -91,6 +104,8 @@ impl EpochManager {
         Arc::new(Self {
             id: NEXT_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
             global_epoch: AtomicU64::new(1),
+            retired_total: AtomicU64::new(0),
+            reclaimed_total: AtomicU64::new(0),
             participants: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
         })
@@ -153,6 +168,7 @@ impl EpochManager {
             drop(Box::from_raw(p as *mut T));
         }
         let epoch = self.global_epoch.load(Ordering::Acquire);
+        self.retired_total.fetch_add(1, Ordering::Relaxed);
         let mut queue = self.retired.lock().unwrap();
         queue.push(Retired {
             ptr,
@@ -177,6 +193,7 @@ impl EpochManager {
             drop(Box::from_raw(p as *mut T));
         }
         let epoch = self.global_epoch.load(Ordering::Acquire);
+        self.retired_total.fetch_add(1, Ordering::Relaxed);
         let mut queue = self.retired.lock().unwrap();
         queue.push(Retired {
             ptr: ptr as *mut (),
@@ -193,6 +210,30 @@ impl EpochManager {
     /// Current global epoch.
     pub fn current_epoch(&self) -> u64 {
         self.global_epoch.load(Ordering::Acquire)
+    }
+
+    /// Snapshot current EBR subsystem telemetry.
+    pub fn stats(&self) -> EbrStats {
+        let participants_guard = self.participants.lock().unwrap();
+        let participants = participants_guard.len();
+        let mut active_guards = 0usize;
+        for p in participants_guard.iter() {
+            if p.is_active() {
+                active_guards += 1;
+            }
+        }
+        let queue = self.retired.lock().unwrap();
+        let pending_reclamation = queue.len();
+        let cur = self.global_epoch.load(Ordering::Acquire);
+        let oldest_retired_age_epochs = queue.first().map(|r| cur.saturating_sub(r.epoch)).unwrap_or(0);
+        EbrStats {
+            participants,
+            active_guards,
+            retired_total: self.retired_total.load(Ordering::Relaxed),
+            reclaimed_total: self.reclaimed_total.load(Ordering::Relaxed),
+            pending_reclamation,
+            oldest_retired_age_epochs,
+        }
     }
 
     /// Attempt to advance the global epoch and reclaim retired objects.
@@ -228,7 +269,9 @@ impl EpochManager {
         let mut queue = self.retired.lock().unwrap();
         let initial_len = queue.len();
         queue.retain(|item| item.epoch >= horizon);
-        initial_len - queue.len()
+        let reclaimed = initial_len - queue.len();
+        self.reclaimed_total.fetch_add(reclaimed as u64, Ordering::Relaxed);
+        reclaimed
     }
 }
 
@@ -443,5 +486,44 @@ mod tests {
             ebr.try_reclaim();
         }
         assert_eq!(dropped_count.load(Ordering::SeqCst), total_retired);
+    }
+
+    #[test]
+    fn ebr_stats_telemetry_and_leak_detection() {
+        let ebr = EpochManager::new();
+        let s0 = ebr.stats();
+        assert_eq!(s0.retired_total, 0);
+        assert_eq!(s0.reclaimed_total, 0);
+        assert_eq!(s0.pending_reclamation, 0);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let g1 = ebr.pin();
+        let s1 = ebr.stats();
+        assert_eq!(s1.active_guards, 1);
+
+        ebr.retire(Droppable(dropped.clone()));
+        let s2 = ebr.stats();
+        assert_eq!(s2.retired_total, 1);
+        assert_eq!(s2.pending_reclamation, 1);
+
+        // While pinned, item cannot be reclaimed
+        ebr.try_reclaim();
+        let s3 = ebr.stats();
+        assert_eq!(s3.reclaimed_total, 0);
+        assert_eq!(s3.pending_reclamation, 1);
+
+        // Drop guard, then advance epoch and reclaim
+        drop(g1);
+        let s4 = ebr.stats();
+        assert_eq!(s4.active_guards, 0);
+
+        let reclaimed = ebr.try_reclaim();
+        assert_eq!(reclaimed, 1);
+        assert!(dropped.load(Ordering::SeqCst));
+
+        let s5 = ebr.stats();
+        assert_eq!(s5.reclaimed_total, 1);
+        assert_eq!(s5.pending_reclamation, 0);
+        assert_eq!(s5.oldest_retired_age_epochs, 0);
     }
 }

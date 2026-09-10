@@ -27,6 +27,8 @@ mod mock_innodb;
 mod net;
 mod replication;
 mod wire;
+#[cfg(test)]
+mod tests;
 
 /// Global shutdown flag: set by SIGINT/SIGTERM handlers and COM_SHUTDOWN.
 /// The accept loop polls it; connection threads observe it per command.
@@ -64,6 +66,8 @@ struct ServerOpts {
     threads: usize,
     /// Host / interface to bind to (`--bind`, default 0.0.0.0).
     bind: String,
+    /// Explicit override to allow binding to public interfaces with empty root password.
+    allow_insecure_bind: bool,
 }
 
 impl ServerOpts {
@@ -85,6 +89,7 @@ impl ServerOpts {
         let allow_pg = !args.iter().any(|a| a == "--no-pg");
         let allow_metrics = !args.iter().any(|a| a == "--no-metrics");
         let allow_repl = !args.iter().any(|a| a == "--no-repl");
+        let allow_insecure_bind = args.iter().any(|a| a == "--allow-insecure-bind");
         ServerOpts {
             bind,
             port,
@@ -110,8 +115,74 @@ impl ServerOpts {
             repl_password: arg_value(args, "--repl-password").unwrap_or_default(),
             read_only: args.iter().any(|a| a == "--read-only"),
             wal_archive_dir: arg_value(args, "--wal-archive-dir"),
-            threads: net::pool::parse_threads(args),
+            threads: match arg_value(args, "--threads") {
+                Some(s) => s.parse::<usize>().unwrap_or(0),
+                None => net::pool::default_threads(),
+            },
+            allow_insecure_bind,
         }
+    }
+
+    /// Startup configuration validation (§49).
+    fn validate(&self) -> engine::Result<()> {
+        if self.port == 0 {
+            return Err(engine::Error::InvalidQuery("invalid port 0: must be between 1 and 65535".into()));
+        }
+        if self.max_connections == 0 {
+            return Err(engine::Error::InvalidQuery("invalid --max-connections 0: must be at least 1".into()));
+        }
+        if self.threads == 0 {
+            return Err(engine::Error::InvalidQuery("invalid --threads 0: must be at least 1".into()));
+        }
+        if self.bind.parse::<std::net::IpAddr>().is_err() && self.bind != "localhost" {
+            return Err(engine::Error::InvalidQuery(format!(
+                "invalid bind address '{}': must be a valid IP address or 'localhost'",
+                self.bind
+            )));
+        }
+        // Port collision checks among enabled protocols
+        let mut used_ports: std::collections::HashMap<u16, &'static str> = std::collections::HashMap::new();
+        used_ports.insert(self.port, "MySQL");
+        if self.allow_pg && self.pg_port > 0 {
+            if let Some(other) = used_ports.insert(self.pg_port, "PostgreSQL") {
+                return Err(engine::Error::InvalidQuery(format!(
+                    "port conflict: pg-port {} conflicts with {other} service",
+                    self.pg_port
+                )));
+            }
+        }
+        if self.allow_metrics && self.metrics_port > 0 {
+            if let Some(other) = used_ports.insert(self.metrics_port, "Metrics") {
+                return Err(engine::Error::InvalidQuery(format!(
+                    "port conflict: metrics-port {} conflicts with {other} service",
+                    self.metrics_port
+                )));
+            }
+        }
+        if self.allow_repl && self.repl_port > 0 {
+            if let Some(other) = used_ports.insert(self.repl_port, "Replication") {
+                return Err(engine::Error::InvalidQuery(format!(
+                    "port conflict: repl-port {} conflicts with {other} service",
+                    self.repl_port
+                )));
+            }
+        }
+        if (self.tls_cert.is_some() && self.tls_key.is_none())
+            || (self.tls_cert.is_none() && self.tls_key.is_some())
+        {
+            return Err(engine::Error::InvalidQuery(
+                "invalid TLS configuration: --tls-cert and --tls-key must be provided together".into(),
+            ));
+        }
+        if let Some(target) = &self.replica_of {
+            if !target.contains(':') {
+                return Err(engine::Error::InvalidQuery(format!(
+                    "invalid --replica-of format '{}': expected host:port",
+                    target
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -798,6 +869,7 @@ fn print_output(out: &Output) {
 /// MySQL clients wait for the server handshake.
 fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     banner();
+    opts.validate()?;
     std::fs::create_dir_all(dir)?;
     // Fail closed when the auth store cannot bootstrap.
     let auth_path = dir.join("auth.bin");
@@ -806,9 +878,21 @@ fn serve(dir: &Path, opts: ServerOpts) -> engine::Result<()> {
     if let Some(root_v) = auth_store.users.get("root") {
         if root_v.is_empty_password() && (opts.bind == "0.0.0.0" || opts.bind == "::") {
             eprintln!("================================================================================");
-            eprintln!("SECURITY WARNING: Database bound to public interface ({}) with EMPTY root password!", opts.bind);
-            eprintln!("Anyone on the network can connect as 'root' with full administrative privileges.");
-            eprintln!("Set a secure password: server passwd --dir {} --user root --password <SECRET>", dir.display());
+            if opts.allow_insecure_bind {
+                eprintln!("SECURITY WARNING: Database bound to public interface ({}) with EMPTY root password!", opts.bind);
+                eprintln!("Allowed due to explicit override --allow-insecure-bind.");
+                eprintln!("Anyone on the network can connect as 'root' with full administrative privileges.");
+                eprintln!("Set a secure password: server passwd --dir {} --user root --password <SECRET>", dir.display());
+            } else {
+                eprintln!("SECURITY REFUSAL: Database attempted to bind to public interface ({}) with EMPTY root password!", opts.bind);
+                eprintln!("Anyone on the network would be able to connect as 'root' with full administrative privileges.");
+                eprintln!("To protect your data, startup is refused (§24). Either:");
+                eprintln!("  1. Set a secure password: server passwd --dir {} --user root --password <SECRET>", dir.display());
+                eprintln!("  2. Bind to localhost only: --bind 127.0.0.1");
+                eprintln!("  3. For local development only, override with: --allow-insecure-bind");
+                eprintln!("================================================================================");
+                std::process::exit(1);
+            }
             eprintln!("================================================================================");
         }
     }

@@ -340,6 +340,21 @@ pub(crate) fn enforce(db: &Database, session: &Session, stmt: &Statement) -> Res
         Statement::AnalyzeTable { table } | Statement::CheckTable { table } => {
             check_table(db, session, table, Privilege::Select)
         }
+        Statement::CheckDatabase { database } => {
+            if session.user == SUPERUSER {
+                Ok(())
+            } else {
+                let db_name = database.as_deref().unwrap_or(&session.current_db);
+                let store = db.privs.read().unwrap();
+                if has_priv(&store, &session.user, Privilege::Select, "*", "*")
+                    || has_priv(&store, &session.user, Privilege::Select, db_name, "*")
+                {
+                    Ok(())
+                } else {
+                    Err(denied(&session.user, "SELECT", &format!("{db_name}.*")))
+                }
+            }
+        }
         Statement::Explain { statement, .. } | Statement::ExplainMemo { statement } => enforce(db, session, statement),
         // Transaction framing, session state, read-only diagnostics, and
         // timeouts need no privilege.

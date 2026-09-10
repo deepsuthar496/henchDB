@@ -68,7 +68,13 @@ impl Database {
         extra.mvcc_snapshots = snapshots;
         extra.mvcc_versions = versions;
         extra.mvcc_oldest_snapshot_age_secs = oldest_age;
-        extra.ebr_pending = self.epoch.pending_count();
+        let ebr = self.epoch.stats();
+        extra.ebr_participants = ebr.participants;
+        extra.ebr_active_guards = ebr.active_guards;
+        extra.ebr_retired_total = ebr.retired_total;
+        extra.ebr_reclaimed_total = ebr.reclaimed_total;
+        extra.ebr_pending = ebr.pending_reclamation;
+        extra.ebr_oldest_retired_age_epochs = ebr.oldest_retired_age_epochs;
         extra.master_wal_offset = self.wal.next_offset();
         extra.replica_role = self.replica_role().to_string();
         extra.replica_generation = self.wal.generation();

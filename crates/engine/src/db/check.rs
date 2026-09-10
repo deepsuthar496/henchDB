@@ -278,4 +278,51 @@ impl Database {
         }
         Ok(crc32(&combined_buf))
     }
+
+    /// Perform comprehensive diagnostic integrity checks on all tables in the current
+    /// database and return individual table reports plus a summary report (§48).
+    pub fn check_database(&self, session: &Session) -> Result<Vec<CheckReport>> {
+        let prefix = format!("{}.", session.current_db);
+        let tables_guard = self.tables.read().unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for key in tables_guard.keys() {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                names.push(rest.to_string());
+            } else if session.current_db == "default" && !key.contains('.') {
+                names.push(key.clone());
+            }
+        }
+        drop(tables_guard);
+        names.sort();
+
+        let mut reports = Vec::with_capacity(names.len() + 1);
+        let mut combined_buf = Vec::new();
+        let mut any_error = false;
+
+        for name in &names {
+            let report = self.check_table(session, name)?;
+            if !report.is_ok() {
+                any_error = true;
+            }
+            combined_buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            combined_buf.extend_from_slice(name.as_bytes());
+            combined_buf.extend_from_slice(&report.hash.to_le_bytes());
+            reports.push(report);
+        }
+
+        let db_hash = crc32(&combined_buf);
+        reports.push(CheckReport {
+            table: format!("{}.*", session.current_db),
+            op: "check_database".into(),
+            status: if any_error { "error".into() } else { "status".into() },
+            hash: db_hash,
+            error_msg: if any_error {
+                Some("one or more tables failed integrity checks".into())
+            } else {
+                None
+            },
+        });
+
+        Ok(reports)
+    }
 }

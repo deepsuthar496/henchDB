@@ -241,3 +241,99 @@ fn resource_governance_max_intermediate_rows_enforced() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn resource_governance_max_intermediate_bytes_enforced() {
+    let dir = std::env::temp_dir().join(format!("hdbcheck_bytes_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
+    db.execute(&mut s, "CREATE TABLE u (uid INT PRIMARY KEY, val TEXT)").unwrap();
+
+    for i in 1..=10 {
+        db.execute(&mut s, &format!("INSERT INTO t VALUES ({i}, 'user_{i}', {i}.5)")).unwrap();
+        db.execute(&mut s, &format!("INSERT INTO u VALUES ({i}, 'val_{i}')")).unwrap();
+    }
+
+    // 1. Join intermediate byte limit
+    db.execute(&mut s, "SET max_intermediate_bytes = 100").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.uid");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_bytes limit (100) during join"));
+
+    // 2. Aggregation / group by intermediate byte limit
+    db.execute(&mut s, "SET max_intermediate_bytes = 80").unwrap();
+    let res = db.execute(&mut s, "SELECT id, COUNT(*) FROM t GROUP BY id");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_bytes limit (80) during aggregation"));
+
+    // 3. Sort intermediate byte limit
+    db.execute(&mut s, "SET max_intermediate_bytes = 120").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM t ORDER BY score DESC");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_bytes limit (120) during sort"));
+
+    // 4. Subquery IN intermediate byte limit
+    db.execute(&mut s, "SET max_intermediate_bytes = 50").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM t WHERE id IN (SELECT uid FROM u)");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_bytes limit (50) during subquery IN evaluation"));
+
+    // 5. Derived table intermediate byte limit
+    db.execute(&mut s, "SET max_intermediate_bytes = 50").unwrap();
+    let res = db.execute(&mut s, "SELECT * FROM (SELECT id FROM t) AS d");
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("max_intermediate_bytes limit (50) during subquery materialization"));
+
+    // Reset limit: all queries succeed cleanly!
+    db.execute(&mut s, "SET max_intermediate_bytes = 0").unwrap();
+    let out = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.uid").unwrap();
+    assert_eq!(out.rows.len(), 10);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_database_verifies_all_tables_and_summary_hash() {
+    let dir = std::env::temp_dir().join(format!("hdbcheck_db_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    db.execute(&mut s, "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute(&mut s, "CREATE TABLE t2 (uid INT PRIMARY KEY, score FLOAT)").unwrap();
+    db.execute(&mut s, "INSERT INTO t1 VALUES (1, 'alice')").unwrap();
+    db.execute(&mut s, "INSERT INTO t2 VALUES (10, 99.5)").unwrap();
+
+    let reports = db.check_database(&s).unwrap();
+    assert_eq!(reports.len(), 3); // t1, t2, and database summary row
+    assert_eq!(reports[0].table, "default.t1");
+    assert_eq!(reports[0].status, "status");
+    assert_eq!(reports[1].table, "default.t2");
+    assert_eq!(reports[1].status, "status");
+    assert_eq!(reports[2].table, "default.*");
+    assert_eq!(reports[2].op, "check_database");
+    assert_eq!(reports[2].status, "status");
+    assert!(reports[2].hash > 0);
+
+    // SQL CHECK DATABASE command execution
+    let out = db.execute(&mut s, "CHECK DATABASE;").unwrap();
+    assert_eq!(out.columns, vec!["Table", "Op", "Msg_type", "Msg_text"]);
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows[0][0], Datum::Text("default.t1".into()));
+    assert_eq!(out.rows[1][0], Datum::Text("default.t2".into()));
+    assert_eq!(out.rows[2][0], Datum::Text("default.*".into()));
+    assert_eq!(out.rows[2][1], Datum::Text("check_database".into()));
+    assert_eq!(out.rows[2][2], Datum::Text("status".into()));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+
+

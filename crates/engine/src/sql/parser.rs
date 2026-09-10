@@ -289,9 +289,17 @@ impl Parser {
             }
             Some("CHECK") => {
                 self.pos += 1;
-                self.expect_kw("TABLE")?;
-                let table = self.expect_ident()?;
-                Ok(Statement::CheckTable { table })
+                if self.eat_kw("DATABASE") {
+                    let db_name = match self.peek() {
+                        Token::Ident(_) => Some(self.expect_ident()?),
+                        _ => None,
+                    };
+                    Ok(Statement::CheckDatabase { database: db_name })
+                } else {
+                    self.expect_kw("TABLE")?;
+                    let table = self.expect_ident()?;
+                    Ok(Statement::CheckTable { table })
+                }
             }
             Some("EXPLAIN") => {
                 self.pos += 1;

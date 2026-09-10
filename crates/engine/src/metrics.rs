@@ -141,7 +141,12 @@ pub struct EngineExtra {
     pub mvcc_chains: usize,
     pub mvcc_versions: usize,
     pub mvcc_oldest_snapshot_age_secs: u64,
+    pub ebr_participants: usize,
+    pub ebr_active_guards: usize,
+    pub ebr_retired_total: u64,
+    pub ebr_reclaimed_total: u64,
     pub ebr_pending: usize,
+    pub ebr_oldest_retired_age_epochs: u64,
     /// Primary WAL written offset (log head) for `Rpl_master_wal_offset`.
     pub master_wal_offset: u64,
     /// Failover role + fencing state for `Replica_*` status rows.
@@ -405,7 +410,12 @@ impl Metrics {
             ("Slow_queries", snap.slow_queries.to_string()),
             ("Table_locks_waited", snap.lock_waits.to_string()),
             ("Table_locks_wait_time_us", snap.lock_wait_us.to_string()),
+            ("Ebr_participants", extra.ebr_participants.to_string()),
+            ("Ebr_active_guards", extra.ebr_active_guards.to_string()),
+            ("Ebr_retired_objects", extra.ebr_retired_total.to_string()),
+            ("Ebr_reclaimed_objects", extra.ebr_reclaimed_total.to_string()),
             ("Ebr_pending_reclamation", extra.ebr_pending.to_string()),
+            ("Ebr_oldest_retired_age_epochs", extra.ebr_oldest_retired_age_epochs.to_string()),
             ("Mvcc_chains", extra.mvcc_chains.to_string()),
             ("Mvcc_snapshots", extra.mvcc_snapshots.to_string()),
             ("Mvcc_versions", extra.mvcc_versions.to_string()),
@@ -519,9 +529,39 @@ impl Metrics {
         );
         gauge(
             &mut out,
+            "ebr_participants",
+            "Number of registered EBR participants.",
+            &extra.ebr_participants.to_string(),
+        );
+        gauge(
+            &mut out,
+            "ebr_active_guards",
+            "Number of currently active/pinned EBR reader guards.",
+            &extra.ebr_active_guards.to_string(),
+        );
+        counter(
+            &mut out,
+            "ebr_retired_objects_total",
+            "Lifetime total count of objects retired to EBR.",
+            &extra.ebr_retired_total.to_string(),
+        );
+        counter(
+            &mut out,
+            "ebr_reclaimed_objects_total",
+            "Lifetime total count of objects successfully reclaimed by EBR.",
+            &extra.ebr_reclaimed_total.to_string(),
+        );
+        gauge(
+            &mut out,
             "ebr_pending_reclamation",
             "Count of retired objects awaiting EBR epoch advancement.",
             &extra.ebr_pending.to_string(),
+        );
+        gauge(
+            &mut out,
+            "ebr_oldest_retired_age_epochs",
+            "Age in epochs of the oldest un-reclaimed retired object.",
+            &extra.ebr_oldest_retired_age_epochs.to_string(),
         );
         gauge(
             &mut out,

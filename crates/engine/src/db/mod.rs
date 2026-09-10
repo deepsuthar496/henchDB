@@ -88,6 +88,7 @@ pub struct Session {
     pub max_result_rows: Option<usize>,
     pub max_result_bytes: Option<usize>,
     pub max_intermediate_rows: Option<usize>,
+    pub max_intermediate_bytes: Option<usize>,
     pub isolation_level: IsolationLevel,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
@@ -114,6 +115,7 @@ impl Default for Session {
             max_result_rows: None,
             max_result_bytes: None,
             max_intermediate_rows: None,
+            max_intermediate_bytes: None,
             isolation_level: IsolationLevel::RepeatableRead,
             snapshot: None,
             subq: subquery::SubqueryState::default(),
@@ -328,6 +330,20 @@ impl Database {
 
     pub fn new_session(&self) -> Session {
         Session::default()
+    }
+
+    /// Fast estimated memory byte size of an in-memory row.
+    pub fn estimate_row_bytes(row: &[Datum]) -> usize {
+        let mut b = 0usize;
+        for d in row {
+            b += match d {
+                Datum::Null => 1,
+                Datum::Int(_) | Datum::Float(_) | Datum::DateTime(_) => 8,
+                Datum::Bool(_) => 1,
+                Datum::Text(s) => s.len(),
+            };
+        }
+        b
     }
 
     pub fn epoch(&self) -> &Arc<crate::epoch::EpochManager> {
@@ -730,6 +746,13 @@ impl Database {
                         _ => return Err(Error::ParseError("max_intermediate_rows must be an integer".into())),
                     }
                 }
+                if name.eq_ignore_ascii_case("max_intermediate_bytes") {
+                    match value {
+                        Datum::Int(b) if b > 0 => session.max_intermediate_bytes = Some(b as usize),
+                        Datum::Int(_) => session.max_intermediate_bytes = None,
+                        _ => return Err(Error::ParseError("max_intermediate_bytes must be an integer".into())),
+                    }
+                }
                 if name.eq_ignore_ascii_case("max_snapshot_age") || name.eq_ignore_ascii_case("max_snapshot_age_secs") {
                     match value {
                         Datum::Int(s) if s > 0 => self.set_max_snapshot_age(Some(Duration::from_secs(s as u64))),
@@ -780,6 +803,35 @@ impl Database {
                         Datum::Text(report.status),
                         Datum::Text(msg_text),
                     ]],
+                    message: "OK".into(),
+                })
+            }
+            Statement::CheckDatabase { database } => {
+                let target_db = database.unwrap_or_else(|| session.current_db.clone());
+                let old_db = std::mem::replace(&mut session.current_db, target_db);
+                let reports = self.check_database(session);
+                session.current_db = old_db;
+                let reports = reports?;
+                let mut rows = Vec::with_capacity(reports.len());
+                for r in reports {
+                    let msg = r
+                        .error_msg
+                        .unwrap_or_else(|| format!("OK (hash: 0x{:08X})", r.hash));
+                    rows.push(vec![
+                        Datum::Text(r.table),
+                        Datum::Text(r.op),
+                        Datum::Text(r.status),
+                        Datum::Text(msg),
+                    ]);
+                }
+                Ok(Output {
+                    columns: vec![
+                        "Table".into(),
+                        "Op".into(),
+                        "Msg_type".into(),
+                        "Msg_text".into(),
+                    ],
+                    rows,
                     message: "OK".into(),
                 })
             }

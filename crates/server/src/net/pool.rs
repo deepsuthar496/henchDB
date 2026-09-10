@@ -261,6 +261,7 @@ pub fn default_threads() -> usize {
 }
 
 /// Parse `--threads N` (falls back to the default on garbage).
+#[allow(dead_code)]
 pub fn parse_threads(args: &[String]) -> usize {
     crate::arg_value(args, "--threads")
         .and_then(|t| t.parse::<usize>().ok())

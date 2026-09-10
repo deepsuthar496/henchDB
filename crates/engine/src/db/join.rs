@@ -377,6 +377,14 @@ impl Database {
                     )));
                 }
             }
+            if let Some(limit) = session.max_intermediate_bytes {
+                let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+                if bytes > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_bytes limit ({limit}) during join"
+                    )));
+                }
+            }
         }
         // 5. WHERE over joined rows (subquery conjuncts fold per row
         //    against the joined scope; plain conjuncts take the fast path).
@@ -412,6 +420,14 @@ impl Database {
                 if rows.len() > limit {
                     return Err(Error::ExecutionError(format!(
                         "query exceeded max_intermediate_rows limit ({limit}) during aggregation"
+                    )));
+                }
+            }
+            if let Some(limit) = session.max_intermediate_bytes {
+                let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+                if bytes > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_bytes limit ({limit}) during aggregation"
                     )));
                 }
             }
@@ -470,6 +486,14 @@ impl Database {
                 if rows.len() > limit {
                     return Err(Error::ExecutionError(format!(
                         "query exceeded max_intermediate_rows limit ({limit}) during sort"
+                    )));
+                }
+            }
+            if let Some(limit) = session.max_intermediate_bytes {
+                let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+                if bytes > limit {
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_bytes limit ({limit}) during sort"
                     )));
                 }
             }

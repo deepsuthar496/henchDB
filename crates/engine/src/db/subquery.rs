@@ -138,6 +138,15 @@ pub(crate) fn setup_derived(
                     )));
                 }
             }
+            if let Some(byte_limit) = session.max_intermediate_bytes {
+                let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
+                if total_bytes > byte_limit {
+                    teardown_derived(session, saved);
+                    return Err(Error::ExecutionError(format!(
+                        "query exceeded max_intermediate_bytes limit ({byte_limit}) during subquery materialization (estimated {total_bytes} bytes)"
+                    )));
+                }
+            }
             let table = match ephemeral_table(alias, &out) {
                 Ok(t) => t,
                 Err(e) => {
@@ -550,6 +559,14 @@ fn build_set(
         if out.rows.len() > limit {
             return Err(Error::ExecutionError(format!(
                 "query exceeded max_intermediate_rows limit ({limit}) during subquery IN evaluation"
+            )));
+        }
+    }
+    if let Some(byte_limit) = session.max_intermediate_bytes {
+        let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
+        if total_bytes > byte_limit {
+            return Err(Error::ExecutionError(format!(
+                "query exceeded max_intermediate_bytes limit ({byte_limit}) during subquery IN evaluation (estimated {total_bytes} bytes)"
             )));
         }
     }

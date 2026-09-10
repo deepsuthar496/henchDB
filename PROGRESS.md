@@ -625,8 +625,30 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 
 ---
 
+### 2026-09-10 — 10/10 Production Readiness Hardening: EBR Telemetry, Resource Byte Governance, Startup Security Refusal, Config Validation & CHECK DATABASE
+* **Context**:
+  Address the updated production readiness master implementation plan (`docs/assessment.md`):
+  1. §5: Track EBR metrics (`EbrStats`: participants, active guards, retired objects, reclaimed objects, pending reclamation, oldest age) and expose via `SHOW STATUS` and Prometheus.
+  2. §18: Add `max_intermediate_bytes` resource governance tracking across joins, single-table sorts, GROUP BY aggregations, subquery derived table materializations, and subquery `IN` sets.
+  3. §24: Prevent unsafe startup when binding to public interfaces (`0.0.0.0` or `::`) with default/empty administrator credentials unless overridden via `--allow-insecure-bind`.
+  4. §48: Add `CHECK DATABASE [name]` SQL command and `Database::check_database` API providing structural validation across all tables in a database plus overall database CRC32 summary hash.
+  5. §49: Comprehensive startup configuration validation rejecting invalid ports (0), thread counts (0), connection limits (0), invalid IP bind addresses, port collisions, and incomplete TLS pairings with clear, actionable error messages.
+  6. §56: Create `docs/RELEASE_GATE.md` containing the dual-reviewer production release gate checklist.
+* **Delivered**:
+  - **EBR Telemetry & Leak Detection** (`crates/engine/src/epoch.rs`, `crates/engine/src/metrics.rs`, `crates/engine/src/db/diag.rs`): Added `EbrStats` telemetry struct, lifetime atomic counters `retired_total` and `reclaimed_total`, wired into `EngineExtra`, MySQL `SHOW STATUS`, and Prometheus text exporter (`ebr_participants`, `ebr_active_guards`, `ebr_retired_objects_total`, `ebr_reclaimed_objects_total`, `ebr_pending_reclamation`, `ebr_oldest_retired_age_epochs`). Added `ebr_stats_telemetry_and_leak_detection` test.
+  - **Intermediate Memory Byte Governance** (`crates/engine/src/db/mod.rs`, `crates/engine/src/db/join.rs`, `crates/engine/src/db/query.rs`, `crates/engine/src/db/subquery.rs`): Added `max_intermediate_bytes` to `Session` and `SET max_intermediate_bytes = N` SQL command. Enforced row byte estimation across left-deep hash joins, GROUP BY buckets, ORDER BY sorting, subquery IN evaluation, and derived table materialization. Added comprehensive test `resource_governance_max_intermediate_bytes_enforced`.
+  - **Security Defaults & Insecure Bind Refusal** (`crates/server/src/main.rs`): Server refuses to start when bound to public interfaces (`0.0.0.0`, `::`) with an empty root password, unless explicit `--allow-insecure-bind` development override flag is passed.
+  - **Startup Configuration Validation** (`crates/server/src/main.rs`, `crates/server/src/tests.rs`): Implemented `ServerOpts::validate()` checking port ranges (1..=65535), zero connection limits, zero thread counts, IP validity, port collisions across enabled protocols (MySQL, PG, metrics, replication), and incomplete TLS certificate configurations. Added 8 unit tests in `opts_tests`.
+  - **Online Database Integrity Audit** (`crates/engine/src/db/check.rs`, `crates/engine/src/sql/`): Added `CHECK DATABASE [name]` AST, parser, and execution support, validating all database tables and returning individual table reports plus database CRC32 logical hash. Added `check_database_verifies_all_tables_and_summary_hash` unit test.
+  - **Production Release Gate & Documentation**: Created `docs/RELEASE_GATE.md` and synced `docs/assessment.md`.
+  - All files strictly adhere to the $\le 1,500$ line ceiling. Engine remains strictly `std`-only (0 external dependencies). Zero compiler warnings on release build.
+* **Evidence**: **323/323 tests green** (224 engine + 99 server); `cargo check --release` with zero warnings.
+* **Effort**: High.
+
+---
+
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**310 tests: 220 engine + 90 server** as of this writing).
+1. `cargo test` — all green (**323 tests: 224 engine + 99 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.
