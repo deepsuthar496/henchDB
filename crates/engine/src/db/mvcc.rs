@@ -43,8 +43,8 @@ pub(crate) struct VersionState {
     committed: HashMap<(String, Vec<u8>), u64>,
     /// Superseded states per key, newest first.
     chains: HashMap<(String, Vec<u8>), Chain>,
-    /// Active snapshot readers: snapshot id -> pinned read epoch.
-    snapshots: HashMap<u64, u64>,
+    /// Active snapshot readers: snapshot id -> (pinned read epoch, created_at).
+    snapshots: HashMap<u64, (u64, std::time::Instant)>,
     next_snapshot_id: AtomicU64,
 }
 
@@ -68,7 +68,7 @@ impl VersionState {
 
     /// Drop history no live reader can consult (see module docs).
     fn gc_locked(&mut self) {
-        match self.snapshots.values().copied().min() {
+        match self.snapshots.values().map(|(e, _)| *e).min() {
             None => {
                 self.chains.clear();
                 self.committed.clear();
@@ -200,10 +200,13 @@ impl Database {
                 return Ok(ans);
             }
         }
-        // Defensive: history pruned beyond recognition; current is the only
-        // state left (the prune rule keeps every entry a live reader needs,
-        // so this is unreachable in practice).
-        Ok(current)
+        // If committed > snap.read_epoch and no history entry with until > snap.read_epoch
+        // exists, the version history is missing. Failing loudly prevents silently returning
+        // a future commit to an older snapshot reader (addressing audit P0.3).
+        Err(Error::ExecutionError(format!(
+            "snapshot isolation violation: version history missing for table '{}'",
+            table.def.name
+        )))
     }
 
     /// Keys whose history shows presence at the snapshot epoch but which are
@@ -253,7 +256,7 @@ impl Database {
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            vs.snapshots.insert(id, read_epoch);
+            vs.snapshots.insert(id, (read_epoch, std::time::Instant::now()));
             id
         };
         let txn_id = self.next_txn.fetch_add(1, Ordering::Relaxed);
@@ -280,7 +283,7 @@ impl Database {
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            vs.snapshots.insert(id, read_epoch);
+            vs.snapshots.insert(id, (read_epoch, std::time::Instant::now()));
             id
         };
         session.snapshot = Some(SnapshotPin {
@@ -299,7 +302,7 @@ impl Database {
         let id = {
             let mut vs = self.versions.write().unwrap();
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            vs.snapshots.insert(id, read_epoch);
+            vs.snapshots.insert(id, (read_epoch, std::time::Instant::now()));
             id
         };
         session.snapshot = Some(SnapshotPin {
@@ -349,10 +352,19 @@ impl Database {
         vs.committed.retain(|(t, _), _| !t.starts_with(prefix));
     }
 
-    /// (version chains, active snapshots) for engine diagnostics.
-    pub(crate) fn snapshot_counts(&self) -> (usize, usize) {
+    /// (version chains, active snapshots, total superseded version entries, oldest snapshot age in secs).
+    pub(crate) fn snapshot_stats(&self) -> (usize, usize, usize, u64) {
         let vs = self.versions.read().unwrap();
-        (vs.chains.len(), vs.snapshots.len())
+        let chains = vs.chains.len();
+        let snapshots = vs.snapshots.len();
+        let total_versions: usize = vs.chains.values().map(|c| c.len()).sum();
+        let oldest_age_secs = vs
+            .snapshots
+            .values()
+            .map(|(_, created)| created.elapsed().as_secs())
+            .max()
+            .unwrap_or(0);
+        (chains, snapshots, total_versions, oldest_age_secs)
     }
 
     /// (chain keys, total entries, active snapshots) — test observability.

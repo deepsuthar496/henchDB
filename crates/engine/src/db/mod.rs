@@ -263,6 +263,16 @@ impl Database {
         })
     }
 
+    pub(crate) fn acquire_commit_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        if let Ok(guard) = self.commit_lock.try_lock() {
+            return guard;
+        }
+        let t0 = std::time::Instant::now();
+        let guard = self.commit_lock.lock().unwrap();
+        self.metrics.record_lock_wait(t0.elapsed().as_micros() as u64);
+        guard
+    }
+
     /// Archive directory, if enabled.
     pub fn archive_dir(&self) -> Option<PathBuf> {
         self.archive_dir.lock().unwrap().clone()
@@ -297,7 +307,7 @@ impl Database {
 
     /// Flush a durable snapshot and truncate the WAL.
     pub fn checkpoint(&self) -> Result<()> {
-        let _guard = self.commit_lock.lock().unwrap();
+        let _guard = self.acquire_commit_lock();
         self.pool.sync_data()?;
 
         let dbs_guard = self.databases.read().unwrap();
@@ -732,7 +742,7 @@ impl Database {
     /// the catalog update that already happened.
     fn wal_commit(&self, records: Vec<Record>) -> Result<()> {
         let (start, end, n) = {
-            let _guard = self.commit_lock.lock().unwrap();
+            let _guard = self.acquire_commit_lock();
             // DDL builds its Commit without a timestamp; stamp it here so
             // every durable commit carries PITR time (ordering follows the
             // commit lock).
@@ -841,7 +851,7 @@ impl Database {
         // Phase A: validation + append under the short commit_lock. The
         // MVCC commit epoch is allocated here so epochs follow WAL order.
         let (start, end, commit_epoch) = {
-            let _guard = self.commit_lock.lock().unwrap();
+            let _guard = self.acquire_commit_lock();
             // Duplicate-key check covers both installed state and commits
             // that are appended-but-not-yet-installed (in flight).
             if has_inserts {

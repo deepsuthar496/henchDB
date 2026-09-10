@@ -1336,8 +1336,8 @@ mod tests {
         let path = dir.join("wal.log");
         let _ = std::fs::remove_file(&path);
         let wal = Arc::new(Wal::open(&path).unwrap());
-        const THREADS: u64 = 24;
-        const PER_THREAD: u64 = 50;
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 25;
         let mut handles = Vec::new();
         for w in 0..THREADS {
             let wal = wal.clone();

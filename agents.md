@@ -180,6 +180,30 @@ the roadmap item instead):
    made while holding the parent's exclusive latch so optimistic readers of
    that parent spin through the transition.
 
+## 6b. Global Concurrency Hierarchy & Lock Ordering (do not break)
+
+To guarantee deadlock-freedom across all concurrency mechanisms, locks and
+synchronization primitives must strictly follow this global acquisition hierarchy
+(top to bottom; never acquire a higher-ranked lock while holding a lower-ranked one):
+
+1. **`commit_lock`** (`Database::commit_lock`): Serializes commit validation, in-flight
+   registration, and WAL reservation. Short critical section (no fsync, no I/O).
+2. **`install_frontier`** (`Database::install` Mutex + `install_cv` Condvar): Orders
+   tree installs strictly by WAL offset sequence.
+3. **`stage_lock`** (`Wal::stage_lock`): Atomic sequencer for WAL reservation and
+   per-core staging FIFO pushes.
+4. **`flush_lock`** (`Wal::flush_lock`): Syncer lock for draining staged segments to disk.
+5. **`BTree` latches** (`Node::lock()`): Acquired strictly root→leaf down the tree. A writer
+   holding a parent never latches an ancestor or sibling. Eager splits guarantee no bottom-up
+   coupling.
+6. **`BufferPool` latches** (`page.rs`): Clock sweep and frame locks acquired during overflow page
+   faults/flushes; released before descending further.
+7. **`VersionState` lock** (`Database::versions` RwLock): Acquired under `commit_lock` to stage
+   superseded row versions into MVCC chains, or during snapshot begin/end.
+8. **Catalog / Auth locks** (`databases`, `tables`, `privs` RwLocks): Schema and RBAC metadata.
+9. **EBR `pin()`** (`epoch.rs`): Lock-free thread-local epoch registration. Acquires zero
+   mutexes/latches, so EBR operations never participate in or cause deadlocks.
+
 ## 7. Platform notes
 
 - Development machine is Windows; the portable core must always build and

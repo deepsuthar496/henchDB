@@ -197,7 +197,7 @@ impl Database {
         ];
 
         let (start, end, commit_epoch) = {
-            let _guard = self.commit_lock.lock().unwrap();
+            let _guard = self.acquire_commit_lock();
             let commit_epoch = self.alloc_commit_epoch();
             let offsets = self.wal.append_records(&records)?;
             (offsets.0, offsets.1, commit_epoch)

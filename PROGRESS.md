@@ -29,7 +29,7 @@ The project is **henchDB** (working title), an ACID-compliant relational databas
   - Range query: **3.59x–4.24x faster** (up to 82,444 vs 19,450 q/s @8c)
   - RW transactions: **1.79x–2.66x faster** (6,256 vs 2,350 txn/s @8c)
   - Durable updates: **1.40x–3.12x faster** under full physical disk fsync; up to 89,194 w/s under group commit
-- **Quality & Size Ceiling**: **281/281 tests passing** (197 engine + 84 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, `wire/`, `net/`, and `replication/` cleanly modularized).
+- **Quality & Size Ceiling**: **297/297 tests passing** (208 engine + 89 server), release builds with zero warnings, and every source file is strictly under 1,500 lines (with `sql/`, `db/`, `wire/`, `net/`, and `replication/` cleanly modularized).
 ---
 
 ## 2. What was done, in order (with the "how")
@@ -559,8 +559,33 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 
 ---
 
+### 21. 🛡️ Comprehensive Assessment Audit Hardening: EBR, Crash-Consistency, MVCC Differential Verification, Lock Ordering, Protocol Fuzzing & Observability
+* **Status**: ✅ **COMPLETED**
+* **Why it mattered**: The comprehensive code audit (`assesment.md`) identified crucial reliability, concurrency, and security gaps before henchDB could be deemed production-ready:
+  1. High risk in custom EBR & unsafe memory reclamation without stress and nested-guard leak verification.
+  2. WAL + checkpoint + recovery crash-consistency lacking real fault injection at every byte offset and intermediate state.
+  3. MVCC defensive fallback silently hiding potential history gaps, needing randomized differential testing against a reference model.
+  4. Interacting concurrency mechanisms lacking a formally documented lock-order graph.
+  5. B+ tree OLC needing adversarial concurrent writer/reader tests during splits, merges, and root collapses.
+  6. Long-lived snapshot readers risking unbounded memory growth without age and version tracking metrics.
+  7. Large wire protocol attack surface requiring adversarial fuzz testing of packet framing, prepared statement parameter decoders, and handshake parsers.
+  8. Missing first-class observability for slow queries, lock contention, EBR pressure, and MVCC version growth.
+* **Delivered**:
+  - **P0.1 / P1.5 (EBR Concurrency & Leak Verification)**: Added 4 tests in `crates/engine/src/epoch.rs` (`ebr_nested_guards_restore_outer_epoch`, `ebr_retire_raw_safety_contract`, `ebr_thread_termination_reclaims_dead_participants`, and `ebr_heavy_concurrent_contention_hammer` validating 100% reclamation across 8 concurrent threads). Verified `Node::drop` properly unlinks and reclaims `Box<NodeBody>`. Added `olc_adversarial_scans_during_splits_merges_and_root_collapses` in `btree/tests.rs` with 3 concurrent writers driving splits/merges/collapses against 3 concurrent lock-free readers validating monotonicity.
+  - **P0.2 (Fault-Injection & Crash-Consistency Recovery)**: Implemented `crates/engine/src/db/tests/crash.rs` with 5 rigorous fault-injection tests: byte-by-byte WAL truncation across multi-row transactions verifying atomic all-or-nothing recovery invariant; uncommitted multi-row atomic rollback; recovery after crash during checkpoint (`snapshot.tmp` cleanup); idempotent replay when crash occurs between snapshot rename and WAL reset; and torn WAL tail discard with CRC validation.
+  - **P0.3 (MVCC Correctness & Differential Testing)**: Removed defensive `Ok(current)` fallback in `crates/engine/src/db/mvcc.rs` — queries attempting to read pruned historical state now fail loudly with `Error::ExecutionError` instead of returning stale/future data. Built `mvcc_randomized_differential_testing` executing 1,000 randomized steps of concurrent multi-session transactions, mutations, point selects, range queries, commits, and rollbacks verified against an independent reference model.
+  - **P1.4 (Documented Global Lock Ordering Hierarchy)**: Formally documented the 10-level acquisition hierarchy in `AGENTS.md` (§6b) and `PROGRESS.md`: `commit_lock` -> `install_frontier` -> `stage_lock` -> `flush_lock` -> `BTree` latches (strictly root-to-leaf) -> `BufferPool` frame latches -> `VersionState` lock -> `Catalog`/`Auth` locks -> `EBR::pin` (lock-free). Added `Database::acquire_commit_lock()` with contention timing.
+  - **P1.6 & P1.7 (Long-Lived Snapshot Metrics & Wire Protocol Fuzzing)**: Snapshot pins now record `Instant::now()`, tracking oldest snapshot age in seconds. Added dedicated fuzzing suite in `crates/server/src/wire/fuzz.rs` covering length-encoded integers, length-encoded bytes/strings, NUL-terminated strings, MySQL handshake response decoding, SSL request detection, binary prepared statement parameter decoding (`decode_execute_params`, `decode_param_value` across all type tags 0..=255), query parameter substitution, and PostgreSQL wire startup and extended message parsers across 10,000+ randomized iterations with zero panics.
+  - **Observability Telemetry**: Added first-class counters and gauges across `SHOW STATUS`, `SHOW ENGINE STATUS`, and Prometheus `/metrics`: `Slow_queries` (queries $\ge 1$s), `Table_locks_waited` & `Table_locks_wait_time_us` (commit lock contention), `Ebr_pending_reclamation` (EBR queue pressure), `Mvcc_chains`, `Mvcc_snapshots`, `Mvcc_versions` (total in-memory versions), and `Mvcc_oldest_snapshot_age_secs`.
+  - Strict 1,500-line file ceiling maintained across all repository files (`check_lines.py` verified).
+  - Engine remains strictly `std`-only with zero external dependencies.
+* **Evidence**: **297/297 tests green** (208 engine + 89 server); release build compiles with zero warnings.
+* **Effort**: High.
+
+---
+
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**281 tests: 197 engine + 84 server** as of this writing).
+1. `cargo test` — all green (**297 tests: 208 engine + 89 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

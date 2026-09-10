@@ -63,9 +63,12 @@ impl Database {
                 extra.btree_nodes += s.nodes;
             }
         }
-        let (chains, snapshots) = self.snapshot_counts();
+        let (chains, snapshots, versions, oldest_age) = self.snapshot_stats();
         extra.mvcc_chains = chains;
         extra.mvcc_snapshots = snapshots;
+        extra.mvcc_versions = versions;
+        extra.mvcc_oldest_snapshot_age_secs = oldest_age;
+        extra.ebr_pending = self.epoch.pending_count();
         extra.master_wal_offset = self.wal.next_offset();
         extra.replica_role = self.replica_role().to_string();
         extra.replica_generation = self.wal.generation();
@@ -140,7 +143,8 @@ impl Database {
              {merges} merges, {in_place} in-place updates\n\
              \n\
              MVCC\n\
-             {snapshots} active snapshots, {chains} version chains\n\
+             {snapshots} active snapshots (oldest age: {oldest_age}s), {chains} version chains, {versions} version entries\n\
+             EBR pending reclamation: {ebr_pending}\n\
              \n\
              CONNECTIONS\n\
              {conns} connected, {txns} transactions open",
@@ -170,6 +174,9 @@ impl Database {
             in_place = extra.btree_in_place,
             snapshots = extra.mvcc_snapshots,
             chains = extra.mvcc_chains,
+            versions = extra.mvcc_versions,
+            oldest_age = extra.mvcc_oldest_snapshot_age_secs,
+            ebr_pending = extra.ebr_pending,
             conns = snap.active_conns,
             txns = snap.active_txns,
         );

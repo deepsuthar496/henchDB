@@ -321,4 +321,127 @@ mod tests {
         ebr.try_reclaim();
         assert!(dropped.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn ebr_nested_guards_restore_outer_epoch() {
+        let ebr = EpochManager::new();
+        let dropped1 = Arc::new(AtomicBool::new(false));
+        let dropped2 = Arc::new(AtomicBool::new(false));
+
+        let g1 = ebr.pin();
+        ebr.retire(Droppable(dropped1.clone()));
+        {
+            let g2 = ebr.pin();
+            ebr.retire(Droppable(dropped2.clone()));
+            ebr.try_reclaim();
+            assert!(!dropped1.load(Ordering::SeqCst));
+            assert!(!dropped2.load(Ordering::SeqCst));
+            drop(g2); // Inner guard drops: outer epoch remains pinned!
+        }
+        ebr.try_reclaim();
+        assert!(!dropped1.load(Ordering::SeqCst));
+        assert!(!dropped2.load(Ordering::SeqCst));
+
+        drop(g1); // Outer guard drops: now both can be reclaimed!
+        ebr.try_reclaim();
+        assert!(dropped1.load(Ordering::SeqCst));
+        assert!(dropped2.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ebr_retire_raw_safety_contract() {
+        use std::sync::atomic::AtomicUsize;
+        static RAW_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        #[allow(dead_code)]
+        struct Canary(usize);
+        impl Drop for Canary {
+            fn drop(&mut self) {
+                RAW_DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let ebr = EpochManager::new();
+        let initial = RAW_DROPS.load(Ordering::SeqCst);
+
+        let ptr = Box::into_raw(Box::new(Canary(42)));
+        let guard = ebr.pin();
+        unsafe { ebr.retire_raw(ptr) };
+
+        ebr.try_reclaim();
+        assert_eq!(RAW_DROPS.load(Ordering::SeqCst), initial);
+
+        drop(guard);
+        ebr.try_reclaim();
+        assert_eq!(RAW_DROPS.load(Ordering::SeqCst), initial + 1);
+    }
+
+    #[test]
+    fn ebr_thread_termination_reclaims_dead_participants() {
+        let ebr = EpochManager::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let ebr_clone = ebr.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = ebr_clone.pin();
+            // Thread exits while pinned (or cleans up via local drop)
+        });
+        handle.join().unwrap();
+
+        ebr.retire(Droppable(dropped.clone()));
+        // Try reclaim cleans up dead participants and frees memory
+        for _ in 0..5 {
+            ebr.try_reclaim();
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ebr_heavy_concurrent_contention_hammer() {
+        use std::sync::atomic::AtomicUsize;
+        let ebr = EpochManager::new();
+        let dropped_count = Arc::new(AtomicUsize::new(0));
+
+        struct CounterDrop(Arc<AtomicUsize>);
+        impl Drop for CounterDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let threads = 8;
+        let items_per_thread = 500;
+        let mut handles = Vec::new();
+
+        for _ in 0..threads {
+            let ebr = ebr.clone();
+            let dc = dropped_count.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..items_per_thread {
+                    let g = ebr.pin();
+                    if i % 5 == 0 {
+                        ebr.retire(CounterDrop(dc.clone()));
+                    }
+                    if i % 10 == 0 {
+                        ebr.try_reclaim();
+                    }
+                    drop(g);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total_retired = (threads * items_per_thread) / 5;
+        // Drain all remaining retired items
+        for _ in 0..10 {
+            ebr.try_reclaim();
+        }
+        assert_eq!(dropped_count.load(Ordering::SeqCst), total_retired);
+    }
 }

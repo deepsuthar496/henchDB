@@ -244,3 +244,237 @@ fn mvcc_set_variable_and_session_isolation() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mvcc_randomized_differential_testing() {
+    let dir = std::env::temp_dir().join(format!("hdb_mvcc_diff_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+
+    let mut init_s = db.new_session();
+    db.execute(&mut init_s, "CREATE TABLE kv (id INT PRIMARY KEY, val TEXT NOT NULL)").unwrap();
+
+    // Independent reference model
+    #[derive(Clone, Debug)]
+    struct RefSession {
+        in_txn: bool,
+        iso: IsolationLevel,
+        snapshot: Option<HashMap<i64, String>>,
+        staged: HashMap<i64, Option<String>>,
+    }
+
+    struct RefModel {
+        committed: HashMap<i64, String>,
+        sessions: Vec<RefSession>,
+    }
+
+    let mut model = RefModel {
+        committed: HashMap::new(),
+        sessions: vec![
+            RefSession { in_txn: false, iso: IsolationLevel::RepeatableRead, snapshot: None, staged: HashMap::new() },
+            RefSession { in_txn: false, iso: IsolationLevel::RepeatableRead, snapshot: None, staged: HashMap::new() },
+            RefSession { in_txn: false, iso: IsolationLevel::RepeatableRead, snapshot: None, staged: HashMap::new() },
+        ],
+    };
+
+    let mut db_sessions = vec![db.new_session(), db.new_session(), db.new_session()];
+
+    struct Prng(u64);
+    impl Prng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn range(&mut self, min: u64, max: u64) -> u64 {
+            min + (self.next() % (max - min + 1))
+        }
+    }
+
+    let mut rng = Prng(0xDEADBEEF_CAFE1234);
+
+    for step in 0..1000 {
+        let sid = (rng.range(0, 2)) as usize;
+        let op_type = rng.range(0, 6);
+
+        match op_type {
+            0 => {
+                // BEGIN
+                if !model.sessions[sid].in_txn {
+                    let iso = if rng.range(0, 1) == 0 {
+                        IsolationLevel::RepeatableRead
+                    } else {
+                        IsolationLevel::ReadCommitted
+                    };
+                    model.sessions[sid].in_txn = true;
+                    model.sessions[sid].iso = iso;
+                    model.sessions[sid].snapshot = None;
+                    model.sessions[sid].staged.clear();
+
+                    let sql = match iso {
+                        IsolationLevel::RepeatableRead => "START TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                        IsolationLevel::ReadCommitted => "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                        IsolationLevel::Serializable => "START TRANSACTION",
+                    };
+                    db.execute(&mut db_sessions[sid], sql).unwrap();
+                }
+            }
+            1 => {
+                // INSERT or UPDATE
+                let key = rng.range(1, 15) as i64;
+                let val = format!("v_{}_{}", key, step);
+
+                let ref_s = &mut model.sessions[sid];
+                if ref_s.in_txn {
+                    ref_s.staged.insert(key, Some(val.clone()));
+                } else {
+                    model.committed.insert(key, val.clone());
+                }
+
+                // Check in DB
+                let check = db.execute(&mut db_sessions[sid], &format!("SELECT val FROM kv WHERE id = {key}")).unwrap();
+                if check.rows.is_empty() {
+                    let _ = db.execute(&mut db_sessions[sid], &format!("INSERT INTO kv VALUES ({key}, '{val}')"));
+                } else {
+                    let _ = db.execute(&mut db_sessions[sid], &format!("UPDATE kv SET val = '{val}' WHERE id = {key}"));
+                }
+            }
+            2 => {
+                // DELETE
+                let key = rng.range(1, 15) as i64;
+                let ref_s = &mut model.sessions[sid];
+
+                let is_present = if ref_s.in_txn {
+                    if let Some(staged_val) = ref_s.staged.get(&key) {
+                        staged_val.is_some()
+                    } else if ref_s.iso == IsolationLevel::RepeatableRead {
+                        if ref_s.snapshot.is_none() {
+                            ref_s.snapshot = Some(model.committed.clone());
+                        }
+                        ref_s.snapshot.as_ref().unwrap().contains_key(&key)
+                    } else {
+                        model.committed.contains_key(&key)
+                    }
+                } else {
+                    model.committed.contains_key(&key)
+                };
+
+                if is_present {
+                    if ref_s.in_txn {
+                        ref_s.staged.insert(key, None);
+                    } else {
+                        model.committed.remove(&key);
+                    }
+                }
+                let _ = db.execute(&mut db_sessions[sid], &format!("DELETE FROM kv WHERE id = {key}"));
+            }
+            3 => {
+                // Point SELECT
+                let key = rng.range(1, 15) as i64;
+                let ref_s = &mut model.sessions[sid];
+
+                let expected = if ref_s.in_txn {
+                    if let Some(staged_val) = ref_s.staged.get(&key) {
+                        staged_val.clone()
+                    } else if ref_s.iso == IsolationLevel::RepeatableRead {
+                        if ref_s.snapshot.is_none() {
+                            ref_s.snapshot = Some(model.committed.clone());
+                        }
+                        ref_s.snapshot.as_ref().unwrap().get(&key).cloned()
+                    } else {
+                        model.committed.get(&key).cloned()
+                    }
+                } else {
+                    model.committed.get(&key).cloned()
+                };
+
+                let out = db.execute(&mut db_sessions[sid], &format!("SELECT val FROM kv WHERE id = {key}")).unwrap();
+                let actual = if out.rows.is_empty() {
+                    None
+                } else {
+                    match &out.rows[0][0] {
+                        Datum::Text(s) => Some(s.clone()),
+                        _ => None,
+                    }
+                };
+
+                assert_eq!(actual, expected, "Mismatch at step {step} for key {key}");
+            }
+            4 => {
+                // Range SELECT
+                let lo = rng.range(1, 8) as i64;
+                let hi = rng.range(8, 15) as i64;
+                let ref_s = &mut model.sessions[sid];
+
+                let expected_map: HashMap<i64, String> = if ref_s.in_txn {
+                    let base = if ref_s.iso == IsolationLevel::RepeatableRead {
+                        if ref_s.snapshot.is_none() {
+                            ref_s.snapshot = Some(model.committed.clone());
+                        }
+                        ref_s.snapshot.as_ref().unwrap().clone()
+                    } else {
+                        model.committed.clone()
+                    };
+                    let mut res = base;
+                    for (&k, opt_v) in &ref_s.staged {
+                        match opt_v {
+                            Some(v) => { res.insert(k, v.clone()); }
+                            None => { res.remove(&k); }
+                        }
+                    }
+                    res
+                } else {
+                    model.committed.clone()
+                };
+
+                let mut expected_rows: Vec<(i64, String)> = expected_map
+                    .into_iter()
+                    .filter(|(k, _)| *k >= lo && *k <= hi)
+                    .collect();
+                expected_rows.sort_by_key(|r| r.0);
+
+                let out = db.execute(
+                    &mut db_sessions[sid],
+                    &format!("SELECT id, val FROM kv WHERE id BETWEEN {lo} AND {hi} ORDER BY id"),
+                ).unwrap();
+
+                let mut actual_rows: Vec<(i64, String)> = Vec::new();
+                for r in &out.rows {
+                    if let (Datum::Int(k), Datum::Text(v)) = (&r[0], &r[1]) {
+                        actual_rows.push((*k, v.clone()));
+                    }
+                }
+
+                assert_eq!(actual_rows, expected_rows, "Range mismatch at step {step} for [{lo}..{hi}]");
+            }
+            5 => {
+                // COMMIT
+                if model.sessions[sid].in_txn {
+                    for (&k, opt_v) in &model.sessions[sid].staged {
+                        match opt_v {
+                            Some(v) => { model.committed.insert(k, v.clone()); }
+                            None => { model.committed.remove(&k); }
+                        }
+                    }
+                    model.sessions[sid].in_txn = false;
+                    model.sessions[sid].staged.clear();
+                    model.sessions[sid].snapshot = None;
+                    db.execute(&mut db_sessions[sid], "COMMIT").unwrap();
+                }
+            }
+            6 => {
+                // ROLLBACK
+                if model.sessions[sid].in_txn {
+                    model.sessions[sid].in_txn = false;
+                    model.sessions[sid].staged.clear();
+                    model.sessions[sid].snapshot = None;
+                    db.execute(&mut db_sessions[sid], "ROLLBACK").unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -160,6 +160,9 @@ impl Node {
             ptr: AtomicPtr::new(Box::into_raw(Box::new(body))),
         })
     }
+}
+
+impl Node {
 
     /// Shared view of the current body snapshot. The result is valid as long
     /// as the caller is protected: either an epoch pin covering the whole

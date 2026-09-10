@@ -103,6 +103,9 @@ pub struct MetricsSnapshot {
     pub com_commit: u64,
     pub com_rollback: u64,
     pub com_ddl: u64,
+    pub slow_queries: u64,
+    pub lock_waits: u64,
+    pub lock_wait_us: u64,
     pub query_us: u64,
     pub hist: [u64; HIST_BUCKET_COUNT],
     pub wal_records: u64,
@@ -136,6 +139,9 @@ pub struct EngineExtra {
     pub table_count: usize,
     pub mvcc_snapshots: usize,
     pub mvcc_chains: usize,
+    pub mvcc_versions: usize,
+    pub mvcc_oldest_snapshot_age_secs: u64,
+    pub ebr_pending: usize,
     /// Primary WAL written offset (log head) for `Rpl_master_wal_offset`.
     pub master_wal_offset: u64,
     /// Failover role + fencing state for `Replica_*` status rows.
@@ -154,6 +160,9 @@ pub struct Metrics {
     com_commit: AtomicU64,
     com_rollback: AtomicU64,
     com_ddl: AtomicU64,
+    slow_queries: AtomicU64,
+    lock_waits: AtomicU64,
+    lock_wait_us: AtomicU64,
     query_us: AtomicU64,
     hist: [AtomicU64; HIST_BUCKET_COUNT],
     wal_records: AtomicU64,
@@ -180,6 +189,9 @@ impl Metrics {
             com_commit: AtomicU64::new(0),
             com_rollback: AtomicU64::new(0),
             com_ddl: AtomicU64::new(0),
+            slow_queries: AtomicU64::new(0),
+            lock_waits: AtomicU64::new(0),
+            lock_wait_us: AtomicU64::new(0),
             query_us: AtomicU64::new(0),
             hist: std::array::from_fn(|_| AtomicU64::new(0)),
             wal_records: AtomicU64::new(0),
@@ -199,10 +211,19 @@ impl Metrics {
         self.start.elapsed().as_secs()
     }
 
+    /// Record commit lock contention wait.
+    pub fn record_lock_wait(&self, elapsed_us: u64) {
+        self.lock_waits.fetch_add(1, Ordering::Relaxed);
+        self.lock_wait_us.fetch_add(elapsed_us, Ordering::Relaxed);
+    }
+
     /// Record one finished statement (hot path: atomics only).
     pub fn record_query(&self, kind: StmtKind, elapsed_us: u64) {
         self.queries.fetch_add(1, Ordering::Relaxed);
         self.query_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        if elapsed_us >= 1_000_000 {
+            self.slow_queries.fetch_add(1, Ordering::Relaxed);
+        }
         let bucket = HIST_BOUNDS_US
             .iter()
             .position(|&b| elapsed_us <= b)
@@ -329,6 +350,9 @@ impl Metrics {
             com_commit: self.com_commit.load(Ordering::Relaxed),
             com_rollback: self.com_rollback.load(Ordering::Relaxed),
             com_ddl: self.com_ddl.load(Ordering::Relaxed),
+            slow_queries: self.slow_queries.load(Ordering::Relaxed),
+            lock_waits: self.lock_waits.load(Ordering::Relaxed),
+            lock_wait_us: self.lock_wait_us.load(Ordering::Relaxed),
             query_us: self.query_us.load(Ordering::Relaxed),
             hist,
             wal_records: self.wal_records.load(Ordering::Relaxed),
@@ -378,6 +402,14 @@ impl Metrics {
         let all = [
             ("Uptime", snap.uptime_secs.to_string()),
             ("Queries", snap.queries.to_string()),
+            ("Slow_queries", snap.slow_queries.to_string()),
+            ("Table_locks_waited", snap.lock_waits.to_string()),
+            ("Table_locks_wait_time_us", snap.lock_wait_us.to_string()),
+            ("Ebr_pending_reclamation", extra.ebr_pending.to_string()),
+            ("Mvcc_chains", extra.mvcc_chains.to_string()),
+            ("Mvcc_snapshots", extra.mvcc_snapshots.to_string()),
+            ("Mvcc_versions", extra.mvcc_versions.to_string()),
+            ("Mvcc_oldest_snapshot_age_secs", extra.mvcc_oldest_snapshot_age_secs.to_string()),
             ("Com_select", snap.com_select.to_string()),
             ("Com_insert", snap.com_insert.to_string()),
             ("Com_update", snap.com_update.to_string()),
@@ -458,8 +490,62 @@ impl Metrics {
         gauge(
             &mut out,
             "transactions_active",
-            "Currently open explicit transactions.",
+            "Transactions currently open across all connections.",
             &snap.active_txns.to_string(),
+        );
+        counter(
+            &mut out,
+            "queries_total",
+            "Statements parsed and executed.",
+            &snap.queries.to_string(),
+        );
+        counter(
+            &mut out,
+            "slow_queries_total",
+            "Queries taking longer than 1 second.",
+            &snap.slow_queries.to_string(),
+        );
+        counter(
+            &mut out,
+            "lock_waits_total",
+            "Count of commit lock contentions.",
+            &snap.lock_waits.to_string(),
+        );
+        counter(
+            &mut out,
+            "lock_wait_time_microseconds_total",
+            "Total time spent waiting for commit locks.",
+            &snap.lock_wait_us.to_string(),
+        );
+        gauge(
+            &mut out,
+            "ebr_pending_reclamation",
+            "Count of retired objects awaiting EBR epoch advancement.",
+            &extra.ebr_pending.to_string(),
+        );
+        gauge(
+            &mut out,
+            "mvcc_snapshots_active",
+            "Number of active MVCC snapshot readers.",
+            &extra.mvcc_snapshots.to_string(),
+        );
+        gauge(
+            &mut out,
+            "mvcc_chains_total",
+            "Number of distinct keys with superseded MVCC version chains.",
+            &extra.mvcc_chains.to_string(),
+        );
+        gauge(
+            &mut out,
+            "mvcc_versions_total",
+            "Total number of superseded row versions stored in memory.",
+            &extra.mvcc_versions.to_string(),
+        );
+        gauge(
+            &mut out,
+            "mvcc_oldest_snapshot_age_seconds",
+            "Age in seconds of the oldest active MVCC snapshot.",
+            &extra.mvcc_oldest_snapshot_age_secs.to_string(),
         );
         for (kind, val) in [
             ("select", snap.com_select),
@@ -482,19 +568,23 @@ impl Metrics {
             use std::fmt::Write as _;
             let _ = writeln!(
                 &mut out,
-                "# HELP {p}_query_duration_seconds Statement execution latency."
+                "# HELP {p}_query_duration_seconds Query execution latency histogram."
             );
             let _ = writeln!(&mut out, "# TYPE {p}_query_duration_seconds histogram");
-            let mut cumulative = 0u64;
-            for (i, le) in HIST_LE_LABELS.iter().enumerate() {
-                cumulative += snap.hist[i];
+            let mut cum = 0u64;
+            for (i, count) in snap.hist.iter().enumerate() {
+                cum += count;
                 let _ = writeln!(
                     &mut out,
-                    "{p}_query_duration_seconds_bucket{{le=\"{le}\"}} {cumulative}"
+                    "{p}_query_duration_seconds_bucket{{le=\"{}\"}} {cum}",
+                    HIST_LE_LABELS[i]
                 );
             }
-            let sum = snap.query_us as f64 / 1_000_000.0;
-            let _ = writeln!(&mut out, "{p}_query_duration_seconds_sum {sum:.6}");
+            let _ = writeln!(
+                &mut out,
+                "{p}_query_duration_seconds_sum {:.6}",
+                snap.query_us as f64 / 1_000_000.0
+            );
             let _ = writeln!(
                 &mut out,
                 "{p}_query_duration_seconds_count {}",

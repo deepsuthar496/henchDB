@@ -322,7 +322,7 @@ impl Database {
     /// the sender's generation stable, so serving snapshots never
     /// invalidates other connected replicas (and never erodes fencing).
     pub fn dump_live<W: Write>(&self, writer: &mut W) -> Result<(BackupStats, u64)> {
-        let _commit = self.commit_lock.lock().unwrap();
+        let _commit = self.acquire_commit_lock();
         let _install = self.install.lock().unwrap();
         let durable = self.wal_durable();
         let dbs: Vec<String> = {

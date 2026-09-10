@@ -47,6 +47,8 @@ pub mod tls;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod fuzz;
 
 pub use canned::canned_output;
 pub use constants::SERVER_CAPS;

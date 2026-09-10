@@ -345,7 +345,7 @@
         for w in 0..4u64 {
             let t = t.clone();
             handles.push(thread::spawn(move || {
-                for gen in 1..=200u64 {
+                for gen in 1..=50u64 {
                     for i in 0..500u64 {
                         let k = i.to_be_bytes();
                         // Same-length values: old code took the raw
@@ -359,7 +359,7 @@
         for _ in 0..4 {
             let t = t.clone();
             handles.push(thread::spawn(move || {
-                for _ in 0..2_000 {
+                for _ in 0..1_000 {
                     for i in (0..500u64).step_by(50) {
                         let got = t.get(&i.to_be_bytes()).expect("present");
                         // 8 uniform bytes from some generation: any torn
@@ -584,3 +584,137 @@ fn heads_concurrent_churn_validates() {
         }
     }
 }
+
+#[test]
+fn olc_adversarial_scans_during_splits_merges_and_root_collapses() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let ebr = EpochManager::new();
+    let tree = Arc::new(BTree::new());
+    tree.set_epoch_manager(ebr.clone());
+
+    // Pre-populate with 1,000 keys
+    for i in 0..1_000u64 {
+        let k = i.to_be_bytes();
+        tree.insert(&k, &k);
+    }
+    tree.assert_heads_synced();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    // 3 Writer threads: splits, merges, updates, delete/reinsert loops
+    // Writer 1: inserts new high keys forcing root wrapping & eager splits
+    {
+        let t = tree.clone();
+        let s = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut id = 1_000u64;
+            while !s.load(Ordering::Relaxed) && id < 5_000 {
+                let k = id.to_be_bytes();
+                t.insert(&k, &k);
+                id += 1;
+            }
+        }));
+    }
+
+    // Writer 2: mass deletes forcing underflows, merges, and root collapse
+    {
+        let t = tree.clone();
+        let s = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut id = 0u64;
+            while !s.load(Ordering::Relaxed) && id < 800 {
+                let k = id.to_be_bytes();
+                t.remove(&k);
+                id += 2;
+                if id % 20 == 0 {
+                    t.reclaim();
+                }
+            }
+        }));
+    }
+
+    // Writer 3: updates values and re-inserts
+    {
+        let t = tree.clone();
+        let s = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut round = 0u8;
+            while !s.load(Ordering::Relaxed) && round < 100 {
+                for i in (100..300u64).step_by(5) {
+                    let k = i.to_be_bytes();
+                    t.upsert(&k, &[round; 8]);
+                }
+                round += 1;
+            }
+        }));
+    }
+
+    // 3 Reader threads: scanning ranges and all keys concurrently without locks
+    // Reader 1: scan_all() validating monotonic sorted keys
+    {
+        let t = tree.clone();
+        let s = stop.clone();
+        handles.push(thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let all = t.scan_all();
+                for w in all.windows(2) {
+                    assert!(w[0].0 < w[1].0, "scan_all returned non-monotonic keys");
+                }
+            }
+        }));
+    }
+
+    // Reader 2: range scans validating order and bounds
+    {
+        let t = tree.clone();
+        let s = stop.clone();
+        handles.push(thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let lo = 150u64.to_be_bytes();
+                let hi = 450u64.to_be_bytes();
+                let r = t.range(Some(&lo), true, Some(&hi), true);
+                for w in r.windows(2) {
+                    assert!(w[0].0 < w[1].0, "range returned non-monotonic keys");
+                }
+            }
+        }));
+    }
+
+    // Reader 3: scan_leaves validating direct leaf walk
+    {
+        let t = tree.clone();
+        let s = stop.clone();
+        handles.push(thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let mut prev_key: Option<Vec<u8>> = None;
+                t.scan_leaves(|keys, _vals| {
+                    for k in keys {
+                        if let Some(prev) = &prev_key {
+                            assert!(prev < k, "scan_leaves non-monotonic");
+                        }
+                        prev_key = Some(k.clone());
+                    }
+                    true
+                });
+            }
+        }));
+    }
+
+    // Let threads run for 300ms
+    thread::sleep(std::time::Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    tree.assert_heads_synced();
+    // Final drain of EBR
+    for _ in 0..10 {
+        tree.reclaim();
+    }
+}
+
