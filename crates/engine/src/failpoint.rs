@@ -27,6 +27,8 @@ pub enum FailMode {
 pub enum FailAction {
     Panic(&'static str),
     Error(String),
+    Abort,
+    Exit(i32),
 }
 
 struct FailpointEntry {
@@ -123,6 +125,10 @@ pub fn eval(name: &str) -> Result<()> {
             };
             let action = if action_str.eq_ignore_ascii_case("error") {
                 FailAction::Error(format!("env failpoint triggered for {}", name))
+            } else if action_str.eq_ignore_ascii_case("abort") {
+                FailAction::Abort
+            } else if action_str.eq_ignore_ascii_case("exit") {
+                FailAction::Exit(137)
             } else {
                 FailAction::Panic("env failpoint panic triggered")
             };
@@ -152,6 +158,14 @@ fn fire_entry(name: &str, entry: &FailpointEntry) -> Result<()> {
                     "failpoint '{}' triggered: {}",
                     name, msg
                 )));
+            }
+            FailAction::Abort => {
+                eprintln!("failpoint '{}' triggered process abort", name);
+                std::process::abort();
+            }
+            FailAction::Exit(code) => {
+                eprintln!("failpoint '{}' triggered process exit({})", name, code);
+                std::process::exit(*code);
             }
         }
     }

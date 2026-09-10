@@ -377,14 +377,8 @@ impl Database {
                     )));
                 }
             }
-            if let Some(limit) = session.max_intermediate_bytes {
-                let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-                if bytes > limit {
-                    return Err(Error::ExecutionError(format!(
-                        "query exceeded max_intermediate_bytes limit ({limit}) during join"
-                    )));
-                }
-            }
+            let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+            session.mem_tracker.reserve_context(bytes, "join")?;
         }
         // 5. WHERE over joined rows (subquery conjuncts fold per row
         //    against the joined scope; plain conjuncts take the fast path).
@@ -423,14 +417,8 @@ impl Database {
                     )));
                 }
             }
-            if let Some(limit) = session.max_intermediate_bytes {
-                let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-                if bytes > limit {
-                    return Err(Error::ExecutionError(format!(
-                        "query exceeded max_intermediate_bytes limit ({limit}) during aggregation"
-                    )));
-                }
-            }
+            let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+            session.mem_tracker.reserve_context(bytes, "aggregation")?;
             // Single-source GROUP BY through the batch pushdown (captured
             // EXPLAIN ANALYZE plans and multi-table scopes stay scalar);
             // decline falls through to the legacy path below.
@@ -489,14 +477,8 @@ impl Database {
                     )));
                 }
             }
-            if let Some(limit) = session.max_intermediate_bytes {
-                let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-                if bytes > limit {
-                    return Err(Error::ExecutionError(format!(
-                        "query exceeded max_intermediate_bytes limit ({limit}) during sort"
-                    )));
-                }
-            }
+            let bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+            session.mem_tracker.reserve_context(bytes, "sort")?;
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
                 keys.push(Self::resolve_scope(&exec_tables, col)?);

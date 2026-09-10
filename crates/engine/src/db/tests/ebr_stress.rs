@@ -12,18 +12,18 @@ use crate::epoch::{EbrStats, EpochManager};
 use crate::types::{encode_key, Datum};
 
 /// Minimal fast deterministic PRNG (xorshift64*) for reproducible stress tests.
-struct StressPrng {
+pub(crate) struct StressPrng {
     state: u64,
 }
 
 impl StressPrng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 { 0x853c49e6748fea9b } else { seed },
         }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
@@ -32,7 +32,7 @@ impl StressPrng {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
-    fn gen_range(&mut self, low: u64, high: u64) -> u64 {
+    pub(crate) fn gen_range(&mut self, low: u64, high: u64) -> u64 {
         if low >= high {
             return low;
         }

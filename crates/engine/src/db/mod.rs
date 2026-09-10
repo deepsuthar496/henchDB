@@ -48,9 +48,11 @@ pub(crate) mod mvcc;
 pub(crate) mod plan;
 pub mod privilege;
 pub mod check;
+pub mod mem_tracker;
 pub(crate) mod query;
 
 pub use check::CheckReport;
+pub use mem_tracker::{MemoryReservation, QueryMemoryTracker};
 pub(crate) mod replica;
 pub(crate) mod subquery;
 pub(crate) mod sysviews;
@@ -92,6 +94,8 @@ pub struct Session {
     pub isolation_level: IsolationLevel,
     /// Pinned MVCC snapshot (`START TRANSACTION WITH CONSISTENT SNAPSHOT`).
     pub(crate) snapshot: Option<SnapshotPin>,
+    /// Intermediate query memory tracker with strict allocation accounting (§9).
+    pub mem_tracker: QueryMemoryTracker,
     /// Subquery evaluation state (derived-table materializations, correlated
     /// row frames, uncorrelated fold cache). Per-statement scope: cleared
     /// at the top of `execute`, managed by `db/subquery.rs`.
@@ -118,6 +122,7 @@ impl Default for Session {
             max_intermediate_bytes: None,
             isolation_level: IsolationLevel::RepeatableRead,
             snapshot: None,
+            mem_tracker: QueryMemoryTracker::default(),
             subq: subquery::SubqueryState::default(),
         }
     }
@@ -432,6 +437,7 @@ impl Database {
         session.subq.eph.clear();
         session.subq.outer.clear();
         session.subq.fold.clear();
+        session.mem_tracker.reset();
         let _guard = self.epoch.pin();
         let t0 = std::time::Instant::now();
         let trimmed = sql.trim();
@@ -710,7 +716,9 @@ impl Database {
                         _ => {}
                     }
                 }
-                if name.eq_ignore_ascii_case("max_execution_time") {
+                if name.eq_ignore_ascii_case("max_execution_time")
+                    || name.eq_ignore_ascii_case("statement_timeout")
+                {
                     match value {
                         Datum::Int(ms) if ms > 0 => {
                             session.max_execution_time = Some(Duration::from_millis(ms as u64));
@@ -746,10 +754,19 @@ impl Database {
                         _ => return Err(Error::ParseError("max_intermediate_rows must be an integer".into())),
                     }
                 }
-                if name.eq_ignore_ascii_case("max_intermediate_bytes") {
+                if name.eq_ignore_ascii_case("max_intermediate_bytes")
+                    || name.eq_ignore_ascii_case("query_memory_limit")
+                {
                     match value {
-                        Datum::Int(b) if b > 0 => session.max_intermediate_bytes = Some(b as usize),
-                        Datum::Int(_) => session.max_intermediate_bytes = None,
+                        Datum::Int(b) if b > 0 => {
+                            let lim = b as usize;
+                            session.max_intermediate_bytes = Some(lim);
+                            session.mem_tracker.set_limit(Some(lim));
+                        }
+                        Datum::Int(_) => {
+                            session.max_intermediate_bytes = None;
+                            session.mem_tracker.set_limit(None);
+                        }
                         _ => return Err(Error::ParseError("max_intermediate_bytes must be an integer".into())),
                     }
                 }

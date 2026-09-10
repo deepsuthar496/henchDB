@@ -11,6 +11,7 @@ mod batch;
 mod check;
 mod crash;
 mod crash_matrix;
+mod crash_process;
 mod ebr_stress;
 mod fk;
 mod joins;
@@ -81,6 +82,16 @@ fn query_execution_timeout() {    let dir = std::env::temp_dir().join(format!("h
     db.execute(&mut s, "SET max_execution_time = 0").unwrap();
     assert_eq!(s.max_execution_time, None);
     assert!(db.execute(&mut s, "SELECT COUNT(*) FROM t").is_ok());
+
+    // Verify PostgreSQL statement_timeout alias (Assessment §10)
+    db.execute(&mut s, "SET statement_timeout = 1").unwrap();
+    assert_eq!(s.max_execution_time, Some(std::time::Duration::from_millis(1)));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let res = db.execute(&mut s, "SELECT * FROM t JOIN u ON t.id = u.id WHERE t.v LIKE '%row%'");
+    assert_eq!(res, Err(Error::QueryTimeout));
+
+    db.execute(&mut s, "SET statement_timeout = 0").unwrap();
+    assert_eq!(s.max_execution_time, None);
 
     let _ = fs::remove_dir_all(&dir);
 }

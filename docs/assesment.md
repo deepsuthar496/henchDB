@@ -1,1712 +1,903 @@
+I checked commit **`5ecacaa`** against the previous production-readiness baseline.
+
+## Rating: **9.0 / 10**
+
+This is a **major improvement**. The commit closes most of the previously identified **P0 implementation gaps**: EBR stress testing, unsafe documentation, B+Tree concurrent split fixes, crash-matrix tests, MVCC reference testing, and scheduled reliability CI. The commit reports **335/335 tests passing** and a clean release check.
+
+However, I would **not call it 10/10 production-ready yet**, because several items are still *test claims/evidence gaps* rather than independently demonstrated production guarantees.
+
+### What improved
+
+* **EBR / unsafe audit:** strong improvement, with `SAFETY:` rationale added around raw-pointer ownership, reclamation, and atomic publication.
+* **B+Tree concurrency:** the leaf split/descent race was explicitly addressed, plus range-scan monotonicity protection.
+* **EBR stress:** seeded multi-threaded split/merge/root-collapse, nested guards, and long-lived reader tests were added.
+* **Crash testing:** a dedicated matrix now exercises seven durability failpoints and checks atomicity, integrity, recovery, and post-recovery writes.
+* **MVCC:** an independent reference oracle and long-lived snapshot/GC/checkpoint tests were added.
+* **CI:** PR release compilation plus scheduled/manual reliability testing and failure artifacts were added.
+
+### The important caveat
+
+The biggest remaining issue is that these are still mostly **in-process deterministic tests**, not the full production verification campaign.
+
+For example, the crash matrix uses `panic` + `catch_unwind`; that is useful, but it is **not equivalent to killing the OS process at an arbitrary point** and restarting it. Likewise, the EBR suite is substantial but not yet a 24–72h sanitizer-backed campaign, and the MVCC oracle workload is still relatively small/non-concurrent.
+
+Also, the GitHub status API currently returns **no attached status entries** for this SHA, so I cannot independently verify a completed CI run from the commit status. The repository does contain the new reliability workflow.
+
+---
+
+## Remaining implementation / production-readiness plan
+
 # henchDB — Remaining Production Readiness Implementation Plan
 
-> **Baseline:** `3f493a6e78396a9fb014427b27d219a31374a30b`
-> **Status:** Strong Release Candidate / Pre-Production
-> **Purpose:** This document contains **only the remaining work** required to reach a defensible production-ready v1.0.
+> **Baseline:** `5ecacaa3d7914dbda3228b0f6dbf1b144555c4d3`
 >
-> Do not re-implement features already completed in previous commits. Focus on verification, failure handling, scalability, security, and release engineering.
+> **Current rating:** **9.0 / 10**
+>
+> **Status:** Strong Release Candidate / Pre-Production
+>
+> **Goal:** Close the remaining verification, failure-testing, scalability, security, and release-engineering gaps required for a defensible production-ready v1.0.
 
 ---
 
-# 1. Current State
+# P0 — Must Close Before Production
 
-The following major items are already implemented and should be considered **DONE**:
+## 1. Complete EBR Memory-Safety Verification
 
-* EBR telemetry
-* EBR pending/reclamation metrics
-* runtime lock-rank checking
-* `max_result_rows`
-* `max_result_bytes`
-* `max_intermediate_rows`
-* `max_intermediate_bytes`
-* snapshot TTL
-* `CHECK TABLE`
-* `CHECK DATABASE`
-* logical database hashing
-* crash failpoints
-* backup/restore verification
-* replication crash/restart testing
-* corrupt WAL replication testing
-* public-bind security refusal
-* startup configuration validation
-* port collision validation
-* TLS configuration validation
-* authentication/RBAC foundations
-* CI workflow
-* operational/recovery/replication/security documentation
-* protocol randomized tests
-* networking latency optimization
+The unsafe audit and stress tests are now present. The remaining requirement is independent verification.
 
-Commit `3f493a6` reports 323 passing tests and a clean release check.
+### Implement
 
-The remaining work below is therefore about proving that those implementations remain correct under significantly more hostile conditions.
+* Audit every remaining:
 
----
+  * `unsafe`
+  * `unsafe impl`
+  * `AtomicPtr`
+  * `Box::from_raw`
+  * `Box::into_raw`
+  * raw pointer dereference
+  * pointer casts
+  * manual reclamation path.
+* Maintain a written invariant for every raw pointer:
 
-# 2. P0 — EBR / Unsafe Memory-Safety Verification
+  * allocation provenance
+  * ownership
+  * publication ordering
+  * reader protection
+  * reclamation condition.
+* Run long-duration EBR stress:
 
-## Goal
+  * 8–32 writers/readers
+  * splits
+  * merges
+  * root changes
+  * deletes/reinserts
+  * range scans
+  * point lookups
+  * nested guards
+  * thread creation/termination
+  * long-lived readers.
+* Run reproducible seeds and retain failing seeds.
+* Add sanitizer-backed testing:
 
-Turn the current EBR implementation from:
+  * AddressSanitizer where supported
+  * ThreadSanitizer where supported
+  * UndefinedBehaviorSanitizer where applicable
+  * Miri for Miri-compatible unsafe components.
+* Run at least 24h reliability stress, then 72h release soak.
+* Track:
 
-```text
-"heavily tested"
-```
+  * retired objects
+  * reclaimed objects
+  * pending reclamation
+  * oldest retired age
+  * active guards.
+* Prove no unbounded EBR growth.
 
-into:
+### Production gate
 
-```text
-"production-verified"
-```
-
-This is the **highest-priority remaining technical risk**.
-
----
-
-## 2.1 Audit every `unsafe`
-
-Search:
-
-```bash
-rg "unsafe|AtomicPtr|from_raw|into_raw|unsafe impl" crates/
-```
-
-For every production `unsafe`:
-
-* document ownership
-* document lifetime
-* document aliasing assumptions
-* document memory ordering
-* document reclamation guarantees
-* document `Send`/`Sync` reasoning
-* add a `// SAFETY:` explanation
-
-### Done when
-
-```text
-[ ] Every unsafe block reviewed
-[ ] Every unsafe impl justified
-[ ] Every raw pointer ownership rule documented
-[ ] No unexplained unsafe remains
-```
+* No sanitizer failures.
+* No UAF.
+* No data races.
+* No invalid reclamation.
+* No unexplained EBR growth.
+* Reproducible stress failures must be zero.
 
 ---
 
-## 2.2 Add long-running EBR stress tests
-
-Required workloads:
-
-```text
-root split
-root collapse
-leaf split
-leaf merge
-leaf unlink
-delete/reinsert
-overlapping writers
-long-lived readers
-nested guards
-thread termination
-rapid pin/unpin
-rapid retire/reclaim
-```
-
-Run with:
-
-```text
-1
-2
-4
-8
-16
-32
-```
-
-threads.
-
-Target:
-
-```text
-10M+
-operations
-```
-
-and preferably:
-
-```text
-100M+
-operations
-```
-
-in nightly testing.
-
----
-
-## 2.3 Make stress tests reproducible
-
-Every randomized failure must record:
-
-```text
-test name
-seed
-thread count
-operation count
-database configuration
-last operations
-```
-
-Example:
-
-```text
-HENCHDB_STRESS_SEED=123456
-```
-
-A failed nightly run must be reproducible locally.
-
----
-
-## 2.4 Sanitizer testing
-
-Add dedicated jobs for the concurrency suite.
-
-Use the strongest practical tools available:
-
-```text
-AddressSanitizer
-ThreadSanitizer
-UndefinedBehaviorSanitizer where applicable
-Miri-compatible tests
-```
-
-Do not necessarily execute all of these on every PR.
-
-Recommended:
-
-```text
-PR:
-    normal correctness
-
-Nightly:
-    sanitizers
-    Miri
-    long stress
-```
-
-### Release blocker
-
-Any sanitizer-detected memory problem blocks release.
-
----
-
-## 2.5 EBR leak detection under soak
-
-Verify:
-
-```text
-retired objects
-reclaimed objects
-pending objects
-oldest retired age
-participants
-active guards
-```
-
-over 24–72 hours.
-
-Required invariant:
-
-```text
-pending reclamation may fluctuate
-but must not grow without bound
-```
-
----
-
-# 3. P0 — Complete Automated Crash Matrix
-
-Current failpoints are good.
-
-The remaining work is to make the test suite **systematic**.
-
----
-
-## 3.1 Create failpoint inventory
-
-Maintain one authoritative list:
-
-```text
-WAL reserve
-WAL write
-partial WAL write
-WAL fsync
-commit marker
-install
-install frontier
-checkpoint
-snapshot write
-snapshot fsync
-snapshot rename
-WAL reset
-generation update
-generation sidecar
-archive write
-archive seal
-recovery replay
-replication send
-replication receive
-replication apply
-```
-
-Every durability boundary must either:
-
-```text
-have a failpoint
-```
-
-or explicitly document why it cannot fail independently.
-
----
-
-## 3.2 Generate crash scenarios
-
-For every failpoint:
-
-```text
-create database
-        ↓
-execute workload
-        ↓
-inject failure
-        ↓
-kill process
-        ↓
-restart
-        ↓
-recover
-        ↓
-CHECK DATABASE
-        ↓
-logical hash
-        ↓
-transaction verification
-```
-
-Randomize:
-
-```text
-transaction size
-row count
-operation
-failpoint
-timing
-checkpoint timing
-snapshot timing
-replication timing
-```
-
----
-
-## 3.3 Test transaction classes
-
-Every crash boundary should be tested against:
-
-```text
-single-row transaction
-multi-row transaction
-insert
-update
-delete
-mixed transaction
-secondary indexes
-foreign keys
-concurrent transactions
-```
-
----
-
-## 3.4 Recovery invariants
-
-After recovery:
-
-```text
-committed transaction exists
-uncommitted transaction does not exist
-partially written transaction is atomic
-indexes are consistent
-foreign keys are consistent
-B+ tree is valid
-MVCC history is valid
-WAL frontier is valid
-```
-
----
-
-## 3.5 Nightly crash campaign
-
-Target:
-
-```text
-1,000+
-```
-
-random crash/recovery cycles initially.
-
-Increase toward:
-
-```text
-10,000+
-```
-
-once stable.
-
-Persist failing cases.
-
----
-
-# 4. P0 — MVCC System-Level Property Testing
-
-Current MVCC differential testing is good.
-
-The remaining requirement is **cross-component MVCC testing**.
-
----
-
-## 4.1 Reference model
-
-Maintain a simple independent model:
-
-```text
-key
- ↓
-version history
- ↓
-commit timestamp
- ↓
-transaction state
-```
-
-Never implement the reference model using the same production algorithms.
-
----
-
-## 4.2 Random workload
-
-Generate:
-
-```text
-BEGIN
-COMMIT
-ROLLBACK
-INSERT
-UPDATE
-DELETE
-SELECT
-RANGE SCAN
-snapshot creation
-snapshot release
-```
-
-Target:
-
-```text
-100K+
-```
-
-operations per nightly scenario.
-
----
-
-## 4.3 Add concurrency
+# 2. Replace In-Process Crash Simulation With Real Process Crash Testing
+
+The current crash matrix is valuable, but `panic`/`catch_unwind` is not equivalent to an actual machine/process crash.
+
+### Implement
+
+Create a crash-test harness that:
+
+1. Starts a database subprocess.
+2. Creates a known baseline.
+3. Arms one failpoint.
+4. Executes the transaction.
+5. Forcefully terminates the process.
+6. Reopens the database in a new process.
+7. Runs recovery.
+8. Validates the resulting state.
+
+Test:
+
+* process kill
+* WAL write interruption
+* WAL fsync interruption
+* snapshot write interruption
+* snapshot rename interruption
+* WAL reset interruption
+* checkpoint interruption
+* archive interruption
+* replication apply interruption.
+
+### Transaction classes
+
+Cover:
+
+* single-row INSERT
+* multi-row INSERT
+* UPDATE
+* DELETE
+* mixed transaction
+* secondary indexes
+* foreign keys
+* multi-table changes
+* large transactions
+* empty transactions
+* repeated transactions.
+
+### Production gate
 
 Run:
 
-```text
-writer 1
-writer 2
-writer 3
-reader 1
-reader 2
-GC
-checkpoint
-```
+* 1,000+ automated crash/recovery cycles initially.
+* 10,000+ nightly reliability campaign.
 
-simultaneously.
+Every recovered database must satisfy:
 
----
-
-## 4.4 Test MVCC + GC
-
-Required scenario:
-
-```text
-long-lived snapshot
-        ↓
-millions of updates
-        ↓
-GC
-        ↓
-checkpoint
-        ↓
-restart
-        ↓
-historical read
-```
-
-Verify the historical result.
+* ACID atomicity
+* structural integrity
+* index consistency
+* FK consistency
+* logical hash consistency
+* successful subsequent writes.
 
 ---
 
-## 4.5 Test MVCC + replication
+# 3. Strengthen MVCC Differential Testing
+
+The reference oracle is now present, but the workload needs to become genuinely adversarial.
+
+### Implement
+
+Add randomized workloads covering:
+
+* INSERT
+* UPDATE
+* DELETE
+* rollback
+* commit
+* Repeatable Read
+* Read Committed
+* concurrent readers
+* concurrent writers
+* long-lived snapshots
+* GC
+* checkpoint
+* restart
+* recovery
+* replication.
+
+Use an independent reference model that tracks:
+
+* transaction state
+* commit order
+* visibility
+* deletes
+* version history
+* snapshot boundaries.
+
+### Scale
+
+* 10K randomized operations locally.
+* 100K+ randomized operations nightly.
+* Multiple deterministic seeds.
+* Concurrent workload variants.
+
+### Production gate
+
+No divergence between:
+
+* reference oracle
+* recovered database
+* live database
+* replica.
+
+---
+
+# 4. Complete Panic / Error-Path Audit
+
+Search the complete repository for:
+
+* `unwrap()`
+* `expect()`
+* `panic!`
+* `assert!`
+* `assert_eq!`
+* `unreachable!()`
+* `todo!()`
+* unchecked indexing
+* integer conversions that can fail
+* allocation failures.
+
+Classify every occurrence as:
+
+* safe internal invariant
+* test-only
+* unreachable-by-construction
+* externally triggerable failure.
+
+Externally triggerable conditions must return controlled errors.
+
+Test fault paths for:
+
+* disk full
+* permission denied
+* short write
+* failed fsync
+* corrupted WAL
+* corrupted snapshot
+* missing archive
+* network reset
+* malformed packet
+* authentication failure
+* TLS failure
+* invalid SQL
+* resource-limit exhaustion.
+
+---
+
+# 5. Prove CI Reliability Gates Actually Run
+
+The reliability workflow now exists, but production readiness requires evidence from actual runs.
+
+### Implement
+
+PR CI:
+
+* fmt
+* clippy with `-D warnings`
+* debug tests
+* release tests
+* release compile
+* Linux
+* Windows.
+
+Nightly:
+
+* EBR stress
+* crash matrix
+* MVCC property tests
+* replication failure tests
+* backup/restore
+* PITR
+* fuzzing
+* sanitizers
+* large-database tests
+* long-duration stress.
+
+### Add
+
+* uploaded logs
+* failing random seeds
+* core dumps where appropriate
+* sanitizer reports
+* benchmark artifacts
+* recovery artifacts.
+
+### Production gate
+
+* Required CI checks attached to protected branch.
+* At least several successful nightly reliability runs.
+* No green build based only on unit-test evidence.
+
+---
+
+# P1 — Required Production Hardening
+
+## 6. Real Protocol Fuzzing
+
+Add actual fuzz targets for:
+
+* MySQL protocol
+* PostgreSQL protocol
+* SQL parser
+* prepared statements
+* authentication
+* replication protocol
+* WAL decoding.
 
 Verify:
 
-```text
-primary visibility
-==
-replica visibility
-```
+* no panic
+* no UB
+* no infinite loop
+* no unbounded allocation
+* no connection-state corruption
+* no server crash.
 
-for:
-
-```text
-insert
-update
-delete
-rollback
-concurrent commits
-historical snapshots
-```
+Maintain a regression corpus.
 
 ---
 
-# 5. P0 — Panic / Error-Path Audit
-
-Perform a complete audit:
-
-```bash
-rg "unwrap\(|expect\(|panic!\(|assert!\(|unreachable!" crates/
-```
-
-Classify every occurrence.
-
-Allowed:
-
-```text
-provably impossible internal invariant
-```
-
-Potentially dangerous:
-
-```text
-network input
-filesystem input
-SQL input
-authentication
-replication data
-WAL/snapshot data
-configuration
-```
-
----
-
-## 5.1 Fault injection
+## 7. Replication / HA Failure Matrix
 
 Test:
 
-```text
-disk full
-permission denied
-short read
-short write
-broken pipe
-connection reset
-connection timeout
-corrupt WAL
-corrupt snapshot
-missing file
-invalid packet
-invalid authentication
-```
+* primary crash
+* replica crash
+* network disconnect
+* network partition
+* slow network
+* duplicate WAL
+* reordered WAL
+* truncated WAL
+* corrupt WAL
+* generation mismatch
+* disk full
+* restart
+* reconnect
+* repeated reconnect.
 
-Required:
+After recovery compare:
 
-```text
-controlled error
-no corruption
-no leaked resources
-no unrelated connection failure
-```
+* `CHECK DATABASE`
+* logical database hash
+* row counts
+* indexes
+* constraints.
 
----
+Explicitly document:
 
-# 6. P0 — Make CI a Real Production Gate
-
-The workflow exists.
-
-The remaining task is to make it authoritative.
-
----
-
-## 6.1 Required PR checks
-
-Every PR:
-
-```text
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
-cargo test --release
-cargo check --release
-```
-
-Platforms:
-
-```text
-Linux
-Windows
-```
+* promotion behavior
+* failover behavior
+* split-brain behavior
+* recovery guarantees
+* replication lag semantics.
 
 ---
 
-## 6.2 Nightly reliability pipeline
-
-Add jobs for:
-
-```text
-EBR stress
-B+ tree stress
-MVCC randomized testing
-crash matrix
-replication failure tests
-backup/restore
-PITR
-protocol fuzzing
-sanitizers
-large database tests
-```
-
----
-
-## 6.3 Upload failure artifacts
-
-On failure save:
-
-```text
-seed
-logs
-WAL
-database state
-crash point
-configuration
-benchmark output
-```
-
----
-
-## 6.4 Branch protection
-
-Configure:
-
-```text
-required status checks
-```
-
-so production code cannot merge when required checks fail.
-
----
-
-# 7. P1 — Real Protocol Fuzzing
-
-Current randomized protocol testing should be retained.
-
-Add actual coverage-guided fuzzing.
-
----
-
-## 7.1 Fuzz targets
-
-Create fuzz targets for:
-
-```text
-MySQL packet parser
-PostgreSQL packet parser
-SQL parser
-prepared statement parser
-authentication packets
-replication packets
-WAL payload parser
-```
-
----
-
-## 7.2 Fuzz invariants
-
-The parser must never:
-
-```text
-panic
-UB
-infinite loop
-allocate unbounded memory
-corrupt session state
-corrupt database state
-```
-
----
-
-## 7.3 Regression corpus
-
-Store minimized failures:
-
-```text
-fuzz/corpus/mysql/
-fuzz/corpus/postgres/
-fuzz/corpus/sql/
-fuzz/corpus/replication/
-```
-
-Every discovered failure becomes a permanent regression test.
-
----
-
-# 8. P1 — Replication / HA Failure Matrix
-
-Current replication crash/restart coverage is good.
-
-The remaining work is the full failure matrix.
-
----
-
-## 8.1 Required scenarios
-
-```text
-primary crash
-replica crash
-network disconnect
-network partition
-slow network
-duplicated WAL
-reordered WAL
-corrupt WAL
-truncated WAL
-generation mismatch
-replica disk full
-primary restart
-replica restart
-reconnect
-repeated reconnect
-```
-
----
-
-## 8.2 Consistency verification
-
-After recovery:
-
-```text
-CHECK DATABASE primary
-CHECK DATABASE replica
-```
-
-Then:
-
-```text
-primary logical hash
-==
-replica logical hash
-```
-
----
-
-## 8.3 Split-brain testing
+## 8. Backup + PITR Verification
 
 Test:
 
-```text
-primary unavailable
-        ↓
-replica promotion
-        ↓
-old primary returns
-```
+* full backup
+* incremental/archive recovery if supported
+* restore into empty directory
+* restore over damaged directory
+* missing archive
+* corrupt archive
+* missing WAL
+* WAL gap
+* recovery to timestamp
+* recovery to transaction/LSN if supported.
 
-The old primary must not create conflicting writes.
-
-If automatic failover is not supported:
-
-```text
-document that clearly
-```
-
-and prevent unsafe accidental promotion.
+Verify restored logical database against expected hashes.
 
 ---
 
-# 9. P1 — Backup / PITR Completion
+## 9. Replace Estimated Query Memory Limits With Real Accounting
 
-Backup/restore destructive testing is already implemented.
+`max_intermediate_bytes` currently provides useful protection, but row-size estimation is not equivalent to total process memory accounting.
 
-Extend it to a full PITR campaign.
+### Implement
 
----
+A `QueryMemoryTracker` with:
 
-## 9.1 PITR scenarios
-
-Test:
-
-```text
-full backup
-WAL archive
-restore
-WAL replay
-```
-
-Recovery targets:
-
-```text
-latest
-before transaction
-after transaction
-after checkpoint
-after restart
-```
-
----
-
-## 9.2 Backup corruption
-
-Test:
-
-```text
-truncated backup
-corrupt backup
-missing archive segment
-corrupt WAL archive
-wrong generation
-wrong checksum
-partial archive
-```
-
-Expected:
-
-```text
-clean failure
-```
-
-Never silently create incomplete state.
-
----
-
-# 10. P1 — Query Memory Accounting
-
-`max_intermediate_bytes` is now implemented.
-
-The remaining improvement is to make resource accounting more accurate.
-
-Current row-size estimation should not be treated as an exact process-memory limit.
-
----
-
-## 10.1 Add a query memory tracker
-
-Create something conceptually equivalent to:
-
-```text
-QueryMemoryTracker
-
-reserve(bytes)
-release(bytes)
-current()
-peak()
-limit()
-```
-
----
-
-## 10.2 Track major operators
-
-Account for:
-
-```text
-hash joins
-nested-loop joins
-sort
-GROUP BY
-hash tables
-derived tables
-subqueries
-IN lists
-temporary execution structures
-```
-
----
-
-## 10.3 Overflow-safe accounting
-
-Ensure byte calculations cannot overflow.
-
-Use checked or saturating arithmetic.
-
-Never let resource accounting itself panic.
-
----
-
-# 11. P1 — Query Timeouts
-
-Add:
-
-```text
-statement_timeout
-```
-
-Optionally:
-
-```text
-transaction_timeout
-idle_transaction_timeout
-```
-
-When timeout occurs:
-
-```text
-query stops
-memory released
-locks released
-snapshot released
-temporary state released
-controlled error returned
-```
-
-Test repeated timeout failures for leaks.
-
----
-
-# 12. P1 — Network Scalability
-
-The latency optimization is implemented.
-
-Now prove it scales.
-
----
-
-## 12.1 Connection levels
-
-Test:
-
-```text
-1
-10
-100
-1,000
-10,000
-```
-
-connections.
-
----
-
-## 12.2 Workloads
-
-```text
-idle
-point select
-range select
-insert
-update
-delete
-mixed OLTP
-pipeline
-slow client
-burst
-```
-
----
-
-## 12.3 Measure
-
-```text
-QPS
-p50
-p95
-p99
-CPU
-RSS
-FDs
-context switches
-```
-
-Compare:
-
-```text
-spin enabled
-spin disabled
-```
-
-If CPU usage becomes excessive, make the spin budget adaptive.
-
----
-
-# 13. P1 — Security Test Matrix
-
-Startup security has been improved.
-
-Complete the adversarial security suite.
-
----
-
-## 13.1 Authentication
-
-Test:
-
-```text
-valid credentials
-wrong password
-unknown user
-empty password
-expired credential
-malformed authentication
-repeated failed authentication
-concurrent authentication
-connection reuse
-```
-
----
-
-## 13.2 RBAC
-
-Test every:
-
-```text
-role
-×
-operation
-×
-database
-×
-table
-```
-
-Operations:
-
-```text
-SELECT
-INSERT
-UPDATE
-DELETE
-CREATE
-DROP
-ALTER
-CHECK TABLE
-CHECK DATABASE
-CHECKPOINT
-BACKUP
-RESTORE
-REPLICATION
-ADMIN
-```
-
-Verify:
-
-```text
-authorization happens before side effects
-```
-
----
-
-# 14. P1 — TLS Operational Testing
-
-Test:
-
-```text
-valid certificate
-expired certificate
-wrong CA
-wrong hostname
-invalid certificate
-invalid private key
-TLS handshake failure
-certificate rotation
-```
-
-Document:
-
-```text
-certificate lifecycle
-rotation
-trust model
-supported TLS versions
-client authentication
-```
-
----
-
-# 15. P1 — Configuration Hardening
-
-Extend startup validation to verify:
-
-```text
-data directory exists/can be created
-data directory writable
-WAL directory writable
-backup directory writable
-TLS files exist
-TLS files readable
-certificate/private-key match
-numeric values do not overflow
-resource limits are sane
-```
-
-All failures must happen before the server begins accepting connections.
-
----
-
-# 16. P1 — Storage Integrity Stress
-
-`CHECK TABLE` and `CHECK DATABASE` are implemented.
-
-Now run them continuously during stress.
-
-Workload:
-
-```text
-writers
-+
-readers
-+
-splits
-+
-merges
-+
-checkpoint
-+
-snapshot
-```
-
-Periodically execute:
-
-```text
-CHECK DATABASE
-```
-
-Verify:
-
-```text
-B+ tree ordering
-indexes
-foreign keys
-row integrity
-logical hash
-```
-
----
-
-# 17. P1 — Resource Leak Testing
-
-Repeatedly perform:
-
-```text
-connect
-query
-transaction
-snapshot
-checkpoint
-disconnect
-```
-
-Measure:
-
-```text
-RSS
-file descriptors
-threads
-EBR participants
-EBR pending objects
-snapshots
-locks
-temporary files
-WAL handles
-```
-
-No metric may grow indefinitely without an expected cause.
-
----
-
-# 18. P1 — Observability Completion
-
-Ensure production metrics include:
-
-```text
-query latency
-query errors
-active connections
-connection errors
-
-transactions committed
-transactions aborted
-
-WAL bytes
-WAL flush latency
-checkpoint duration
-recovery duration
-
-replication lag
-replication errors
-
-backup duration
-restore duration
-
-snapshot count
-oldest snapshot age
-
-EBR participants
-EBR active guards
-EBR pending reclamation
-EBR oldest retired age
-
-lock waits
-lock wait duration
-
-memory usage
-```
-
----
-
-# 19. P1 — Health Checks
-
-Provide health states such as:
-
-```text
-alive
-healthy
-recovering
-degraded
-replication-lagging
-storage-error
-```
-
-Do not report healthy merely because the process is alive.
-
----
-
-# 20. P1 — 24-Hour Soak Test
-
-Run a realistic workload for:
-
-```text
-24 hours minimum
-```
-
-Include:
-
-```text
-concurrent clients
-OLTP
-reads
-writes
-updates
-deletes
-joins
-GROUP BY
-ORDER BY
-snapshots
-checkpoints
-replication
-```
-
-Required:
-
-```text
-0 crashes
-0 deadlocks
-0 corruption
-0 unbounded memory growth
-0 unbounded EBR growth
-0 replication divergence
-```
-
----
-
-# 21. P1 — 72-Hour Release Soak
-
-Before v1.0:
-
-```text
-72 hours continuous
-```
-
-with production-like workload.
-
-Record:
-
-```text
-commit SHA
-machine
-OS
-configuration
-workload
-start time
-end time
-metrics
-logs
-```
-
----
-
-# 22. P1 — Large Database Testing
-
-Test increasingly large datasets:
-
-```text
-100 MB
-1 GB
-10 GB
-100 GB where infrastructure permits
-```
-
-Measure:
-
-```text
-startup
-recovery
-checkpoint
-backup
-restore
-scan
-index operations
-replication
-```
-
-Look for nonlinear degradation.
-
----
-
-# 23. P1 — Performance Regression Gate
-
-Maintain fixed benchmark datasets.
+* `reserve(bytes)`
+* `release(bytes)`
+* `current_bytes`
+* `peak_bytes`
+* `limit`.
 
 Track:
 
-```text
-point SELECT
-range SELECT
-INSERT
-UPDATE
-DELETE
-transactions/sec
-JOIN
-GROUP BY
-ORDER BY
-concurrent workload
-```
+* joins
+* hash tables
+* sorts
+* GROUP BY
+* derived tables
+* subqueries
+* IN lists
+* temporary structures
+* intermediate buffers.
 
-Record:
+Use overflow-safe arithmetic.
 
-```text
-commit SHA
-machine
-OS
-Rust version
-dataset
-thread count
-configuration
-```
+### Production gate
 
-Recommended initial release rule:
-
-```text
->10% unexplained regression
-=
-release blocker
-```
+Memory limit must remain bounded even with adversarial queries.
 
 ---
 
-# 24. P2 — Upgrade Testing
+## 10. Query Timeout Support
 
-Create databases using the previous supported release.
+Implement:
 
-Then open them with the new release.
+* `statement_timeout`
+* optional `transaction_timeout`
+* optional `idle_transaction_timeout`.
+
+Timeout must safely interrupt:
+
+* scans
+* joins
+* sorts
+* aggregation
+* subqueries
+* large writes.
+
+Verify cleanup of:
+
+* locks
+* transactions
+* memory
+* temporary data
+* EBR guards.
+
+---
+
+## 11. Network Scalability Testing
+
+Benchmark:
+
+* 1 client
+* 10 clients
+* 100 clients
+* 1,000 clients
+* 10,000 clients.
+
+Workloads:
+
+* idle
+* point SELECT
+* range SELECT
+* INSERT
+* UPDATE
+* DELETE
+* mixed OLTP
+* pipelined requests
+* burst traffic
+* slow clients.
+
+Measure:
+
+* QPS
+* p50
+* p95
+* p99
+* CPU
+* RSS
+* file descriptors
+* thread count
+* context switches
+* connection failures.
+
+Compare the current opportunistic spin behavior against spin-disabled behavior.
+
+---
+
+## 12. Authentication / RBAC Matrix
+
+Test every role against:
+
+* database creation
+* table creation
+* SELECT
+* INSERT
+* UPDATE
+* DELETE
+* indexes
+* DDL
+* transactions
+* backup
+* restore
+* replication
+* CHECK DATABASE
+* administrative commands.
+
+Verify:
+
+> Permission denial occurs before externally visible side effects.
+
+---
+
+## 13. TLS Operational Testing
 
 Test:
 
-```text
-old database
-↓
-new binary
-↓
-startup
-↓
-recovery
-↓
-CHECK DATABASE
-↓
-logical hash
-↓
-read
-↓
-write
-```
+* valid certificate
+* expired certificate
+* wrong CA
+* wrong hostname
+* invalid certificate
+* invalid private key
+* certificate/key mismatch
+* failed handshake
+* client disconnect during handshake
+* certificate rotation.
 
-Document storage-format compatibility.
+Document operational certificate replacement.
 
 ---
 
-# 25. P2 — Release Engineering
+## 14. Configuration Hardening
 
-Define:
+Validate before listeners start:
 
-```text
-semantic versioning
-```
+* data directory
+* WAL directory
+* backup directory
+* file permissions
+* TLS files
+* certificate/key match
+* numeric ranges
+* integer overflow
+* connection limits
+* thread limits
+* memory limits
+* timeout values.
 
-Each release must contain:
+All invalid configuration must fail closed with actionable errors.
 
-```text
-binary
-checksums
-release notes
-configuration reference
-migration notes
-security notes
-backup instructions
-upgrade instructions
-```
+---
+
+## 15. Storage Integrity Under Concurrent Activity
+
+Run `CHECK DATABASE` while simultaneously performing:
+
+* inserts
+* updates
+* deletes
+* splits
+* merges
+* checkpoints
+* snapshots
+* readers.
+
+Validate:
+
+* B+Tree structure
+* secondary indexes
+* primary keys
+* foreign keys
+* MVCC chains
+* logical hashes.
+
+Document the consistency semantics of `CHECK DATABASE` under concurrent DDL.
+
+---
+
+## 16. Resource Leak Campaign
+
+Repeatedly execute:
+
+* connect
+* disconnect
+* query
+* transaction
+* rollback
+* snapshot
+* checkpoint
+* backup
+* restore.
+
+Track:
+
+* RSS
+* FD count
+* thread count
+* EBR retired objects
+* EBR pending objects
+* active snapshots
+* locks
+* temporary files
+* WAL handles.
+
+Require stable steady-state resource usage.
+
+---
+
+## 17. Observability Completion
+
+Expose metrics for:
+
+* query latency
+* query errors
+* active connections
+* transactions
+* WAL writes
+* WAL fsync
+* checkpoints
+* recovery
+* replication
+* replication lag
+* backup
+* restore
+* snapshots
+* EBR
+* lock waits
+* query memory
+* query timeouts.
+
+---
+
+## 18. Health Checks
+
+Expose clear states:
+
+* alive
+* healthy
+* recovering
+* degraded
+* replication-lagging
+* storage-error.
+
+Health status must distinguish "process alive" from "database operational."
+
+---
+
+## 19. 24–72 Hour Soak
+
+Run a realistic mixed workload with:
+
+* concurrent clients
+* reads
+* writes
+* transactions
+* checkpoints
+* snapshots
+* GC
+* replication
+* backups.
+
+Production gate:
+
+* zero crashes
+* zero deadlocks
+* zero corruption
+* zero unexplained memory growth
+* zero EBR growth
+* zero replica divergence.
+
+Run at least one dedicated **72-hour release soak** before declaring v1.0.
+
+---
+
+## 20. Large Database Testing
+
+Test approximately:
+
+* 100 MB
+* 1 GB
+* 10 GB
+* 100 GB where infrastructure permits.
+
+Measure:
+
+* startup
+* recovery
+* checkpoint
+* backup
+* restore
+* sequential scans
+* indexes
+* replication
+* CHECK DATABASE.
+
+Record resource usage and timings.
+
+---
+
+## 21. Performance Regression Gate
+
+Create fixed benchmark datasets and workloads.
+
+Track:
+
+* throughput
+* p50
+* p95
+* p99
+* CPU
+* RSS
+* storage usage.
+
+Any unexplained regression greater than **10%** is a release blocker.
 
 Record:
 
-```text
-Git SHA
-Rust version
-target platform
-build configuration
-```
+* commit SHA
+* Rust version
+* OS
+* CPU
+* storage
+* configuration.
 
 ---
 
-# 26. P2 — Reproducible Builds
+# P2 — Release Engineering
 
-Document:
+## 22. Upgrade Testing
 
-```text
-toolchain
-build environment
-target
-release flags
-dependency state
-```
+Test:
 
-Verify that the release can be reproduced from the tagged source.
+* previous-version database → current version
+* interrupted upgrade
+* failed migration
+* rollback
+* backup before upgrade
+* recovery after failed upgrade.
+
+Document compatibility guarantees.
 
 ---
 
-# 27. P2 — Dependency / Supply Chain Audit
-
-Audit the entire workspace.
+## 23. Reproducible Release Builds
 
 Record:
 
-```text
-dependency tree
-licenses
-known vulnerabilities
-transitive dependencies
-build scripts
-release artifacts
-```
+* commit SHA
+* Rust toolchain
+* target
+* dependency versions
+* build configuration.
 
-Automate this in CI.
+Produce reproducible binaries where practical.
 
 ---
 
-# 28. P2 — Operational Runbooks
+## 24. Dependency / Supply-Chain Audit
 
-Complete runbooks for:
+Add:
 
-```text
-database won't start
-WAL corruption
-failed recovery
-replica lag
-replica divergence
-disk full
-high memory
-high CPU
-stuck snapshot
-EBR growth
-failed backup
-failed restore
-PITR failure
-TLS failure
-authentication lockout
-```
-
-Each runbook must contain:
-
-```text
-symptoms
-diagnosis
-metrics/logs to inspect
-recovery procedure
-verification procedure
-```
+* dependency audit
+* outdated dependency review
+* license review
+* vulnerability scanning
+* lockfile verification.
 
 ---
 
-# 29. P2 — Configuration Documentation
+## 25. Release Artifacts
 
-Document every production setting:
+Produce:
 
-```text
-bind
-ports
-threads
-connection limits
-WAL
-checkpoint
-snapshot TTL
-query limits
-memory limits
-TLS
-authentication
-replication
-backup
-metrics
-```
-
-For every setting specify:
-
-```text
-default
-minimum
-maximum
-recommended production value
-security impact
-performance impact
-```
+* Linux binaries
+* Windows binaries
+* checksums
+* release notes
+* version metadata
+* configuration examples
+* migration notes
+* security notes
+* backup/recovery documentation.
 
 ---
 
-# 30. P2 — Release Gate Automation
+## 26. Operational Runbooks
 
-`docs/RELEASE_GATE.md` exists.
+Document procedures for:
 
-Now connect every checkbox to actual evidence.
-
-Bad:
-
-```text
-[x] 72h soak completed
-```
-
-Good:
-
-```text
-[x] 72h soak completed
-    commit: abc123
-    run: #12345
-    duration: 72h
-    failures: 0
-    artifact: soak-report.tar.gz
-```
+* startup
+* shutdown
+* backup
+* restore
+* PITR
+* corruption recovery
+* replication failure
+* replica rebuild
+* disk-full recovery
+* certificate rotation
+* credential rotation
+* upgrade
+* rollback.
 
 ---
 
-# 31. Final Production Gate
+## 27. Documentation Cleanup
 
-Before declaring v1.0:
+Rename the misspelled:
 
-```text
-[ ] Unsafe code audited
-[ ] EBR long stress passes
-[ ] Sanitizers pass
-[ ] Miri-compatible tests pass
-[ ] B+ tree concurrency stress passes
+`docs/assesment.md`
 
-[ ] Complete crash matrix passes
-[ ] 1,000+ nightly crash scenarios pass
-[ ] ACID recovery invariants pass
+to:
 
-[ ] MVCC differential testing passes
-[ ] MVCC + GC passes
-[ ] MVCC + checkpoint passes
-[ ] MVCC + restart passes
-[ ] MVCC + replication passes
+`docs/assessment.md`
 
-[ ] Panic/error audit complete
-[ ] Fault injection passes
+or preferably:
 
-[ ] PR CI required
-[ ] Nightly reliability CI operational
-[ ] Failure artifacts uploaded
+`docs/PRODUCTION_ASSESSMENT.md`
 
-[ ] Protocol fuzzing operational
-[ ] Fuzz corpus regression tests pass
-
-[ ] Replication failure matrix passes
-[ ] Primary/replica hashes agree
-[ ] Split-brain behavior verified
-
-[ ] Backup/restore passes
-[ ] PITR passes
-[ ] Backup corruption tests pass
-
-[ ] Query memory accounting complete
-[ ] Query timeout complete
-[ ] Resource leak tests pass
-
-[ ] Network 1/10/100/1K/10K load tests pass
-[ ] CPU behavior under opportunistic spin validated
-
-[ ] Authentication matrix passes
-[ ] RBAC matrix passes
-[ ] TLS failure tests pass
-[ ] Configuration validation complete
-
-[ ] Storage integrity stress passes
-[ ] Observability complete
-[ ] Health checks complete
-
-[ ] 24h soak passes
-[ ] 72h release soak passes
-[ ] Large database tests pass
-[ ] Performance regression gate passes
-
-[ ] Upgrade test passes
-[ ] Reproducible release verified
-[ ] Supply-chain audit complete
-[ ] Operational runbooks complete
-
-[ ] Two independent reviewers approve release
-[ ] No unresolved P0/P1 defects
-```
+Ensure all internal references are updated.
 
 ---
 
-# 32. Release Decision
+# Final Production Gate
 
-The final decision must be:
+## P0
 
-```text
-                ┌────────────────────┐
-                │ All P0 gates pass? │
-                └─────────┬──────────┘
-                          │
-                    NO ───┴─── YES
-                    │           │
-                    ▼           ▼
-               NO RELEASE   P1 gates pass?
-                                │
-                           NO ──┴── YES
-                           │          │
-                           ▼          ▼
-                      NO RELEASE   24–72h soak
-                                      │
-                                 FAIL ─┴─ PASS
-                                  │        │
-                                  ▼        ▼
-                             NO RELEASE   Release
-                                           │
-                                           ▼
-                                      v1.0 PROD
-```
+* [ ] Complete unsafe/raw-pointer audit
+* [ ] EBR sanitizer/Miri verification
+* [ ] 24–72h EBR stress
+* [ ] Real process crash testing
+* [ ] 1,000+ crash/recovery cycles
+* [ ] 10,000+ nightly crash cycles
+* [ ] MVCC concurrent differential testing
+* [ ] Panic/error-path audit
+* [ ] Verified CI/nightly evidence
 
----
+## P1
 
-# 33. Priority Summary
+* [ ] Real protocol fuzzing
+* [ ] Full replication failure matrix
+* [ ] PITR testing
+* [ ] Real query memory tracker
+* [ ] Query timeout support
+* [ ] 10,000-client network testing
+* [ ] Complete authentication/RBAC matrix
+* [ ] TLS failure/rotation testing
+* [ ] Configuration hardening
+* [ ] Concurrent storage integrity testing
+* [ ] Resource leak campaign
+* [ ] Complete observability
+* [ ] Health states
+* [ ] 24h soak
+* [ ] 72h release soak
+* [ ] Large database testing
+* [ ] Performance regression gate
 
-If development time is limited, use this exact order:
+## P2
 
-## 🔴 P0 — Do first
-
-```text
-1. EBR unsafe audit
-2. EBR long-duration stress
-3. Sanitizers / Miri
-4. Complete crash matrix
-5. MVCC system-level property testing
-6. Panic/error-path audit
-7. Required CI + nightly reliability pipeline
-```
-
-## 🟠 P1 — Then
-
-```text
-8. Protocol fuzzing
-9. Replication failure matrix
-10. PITR testing
-11. Query memory tracker
-12. Query timeouts
-13. Network scalability
-14. Security matrix
-15. TLS operational testing
-16. Configuration hardening
-17. Storage integrity stress
-18. Resource leak testing
-19. Observability
-20. Health checks
-21. 24h/72h soak
-22. Large database testing
-23. Performance regression gate
-```
-
-## 🟡 P2 — Final release preparation
-
-```text
-24. Upgrade testing
-25. Reproducible builds
-26. Supply-chain audit
-27. Release artifacts
-28. Operational runbooks
-29. Configuration documentation
-30. Automated release evidence
-31. Dual-reviewer release approval
-```
+* [ ] Upgrade compatibility testing
+* [ ] Reproducible builds
+* [ ] Supply-chain/dependency audit
+* [ ] Release artifacts
+* [ ] Operational runbooks
+* [ ] Configuration documentation
+* [ ] Automated release evidence
+* [ ] Final production checklist
 
 ---
 
-# 34. The Most Important Rule
+# Recommended Order
 
-Do not interpret:
+1. **Real process crash/recovery harness**
+2. **EBR sanitizer/Miri verification**
+3. **Long-duration EBR/B+Tree stress**
+4. **Concurrent MVCC differential testing**
+5. **CI/nightly evidence**
+6. **Protocol fuzzing**
+7. **Replication failure matrix**
+8. **PITR**
+9. **Query memory tracker**
+10. **Query timeouts**
+11. **Network scalability**
+12. **Security/TLS/configuration**
+13. **Resource leak campaign**
+14. **24h/72h soak**
+15. **Large database testing**
+16. **Performance regression gate**
+17. **Upgrade/release/reproducibility**
+18. **Final production sign-off**
 
-```text
-323/323 tests passing
-```
+# Production Decision
 
-as:
+**Do not mark henchDB 10/10 yet.**
 
-```text
-production proven
-```
+`5ecacaa` is a **strong 9.0/10 release candidate**. The architecture and test coverage have advanced substantially. The remaining work is now primarily about **independent proof under real process crashes, prolonged concurrency, sanitizers, adversarial workloads, scale, and actual CI/release evidence**, rather than adding basic database functionality.
 
-The remaining objective is to turn:
-
-```text
-unit-test confidence
-```
-
-into:
-
-```text
-adversarial + randomized + fault-injected + sanitized + long-duration
-confidence
-```
-
-The most important final evidence should therefore be:
-
-```text
-EBR stress
-        +
-crash campaign
-        +
-MVCC differential testing
-        +
-replication failure testing
-        +
-fuzzing
-        +
-24–72h soak
-        +
-clean CI
-```
-
-When those are continuously automated and passing, henchDB moves from a strong database project to a defensible production release.
+**Bottom line:** `5ecacaa` is the strongest checkpoint so far. I would be comfortable calling it **pre-production / serious release candidate**, but not yet production-ready. The path from **9.0 → 10.0** is now mostly *verification and evidence*, not another large feature implementation.

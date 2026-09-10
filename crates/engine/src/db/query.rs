@@ -569,14 +569,8 @@ impl Database {
                     )));
                 }
             }
-            if let Some(byte_limit) = session.max_intermediate_bytes {
-                let total_bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
-                if total_bytes > byte_limit {
-                    return Err(Error::ExecutionError(format!(
-                        "query exceeded max_intermediate_bytes limit ({byte_limit}) during sort (estimated {total_bytes} bytes)"
-                    )));
-                }
-            }
+            let total_bytes: usize = rows.iter().map(|r| Self::estimate_row_bytes(r)).sum();
+            session.mem_tracker.reserve_context(total_bytes, "sort")?;
             let mut keys = Vec::with_capacity(order_by.len());
             for (col, _) in &order_by {
                 keys.push(Self::single_col_idx(schema, display, col)?);

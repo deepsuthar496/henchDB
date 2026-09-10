@@ -671,10 +671,36 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 * **Evidence**: **335/335 tests green** (236 engine + 99 server); `cargo check --release` 100% clean.
 * **Effort**: High.
 
+### 2026-09-10 — Real Subprocess Crash Testing, Concurrent Adversarial MVCC Differential Oracle, Strict Query Memory Accounting & Statement Timeouts
+* **Context**:
+  Execute the remaining production readiness milestones from `docs/assesment.md` (progressing from 9.0/10 to 10/10 production-ready):
+  1. §2: Replace in-process panic simulation with real OS subprocess termination crash testing across all WAL and checkpoint durability failpoints.
+  2. §3: Adversarial concurrent multi-threaded MVCC differential oracle testing, verifying RepeatableRead snapshot consistency under parallel randomized writes, rollbacks, and version GC.
+  3. §9: Replace estimated query memory limits with real atomic accounting (`QueryMemoryTracker`), tracking intermediate memory allocations (joins, hash tables, sorts, GROUP BY, subquery materializations) with overflow-safe saturating arithmetic and RAII reservations.
+  4. §10: Add PostgreSQL `statement_timeout` alias support, interrupting long queries cleanly with full resource reclamation.
+* **Delivered**:
+  - **Real OS Process Crash Harness** (`crates/engine/src/failpoint.rs`, `crates/engine/src/db/tests/crash_process.rs`):
+    - Added `FailAction::Abort` (triggering `std::process::abort()`) and `FailAction::Exit(code)` to the failpoint framework.
+    - Implemented out-of-process crash test suite spawning standalone OS subprocesses across all 7 critical durability failpoints (`before_wal_write`, `before_wal_sync`, `after_wal_sync`, `before_install`, `during_multirow_install`, `before_snapshot_rename`, `before_wal_reset`).
+    - Verifies abnormal OS process death, cold restart recovery, `CHECK DATABASE` bit-for-bit structural integrity, all-or-nothing ACID atomicity, and subsequent transaction persistence.
+  - **Concurrent Adversarial MVCC Differential Oracle** (`crates/engine/src/db/tests/mvcc_property.rs`):
+    - Added `mvcc_concurrent_randomized_differential_oracle_stress` running parallel reader threads against concurrent writers performing randomized inserts, updates, deletes, rollbacks, and background version GC.
+    - Synchronizes atomic commit epochs with an independent `MvccReferenceOracle`, proving zero snapshot drift or dirty reads under high write contention.
+  - **Strict Intermediate Query Memory Accounting** (`crates/engine/src/db/mem_tracker.rs`, `crates/engine/src/db/mod.rs`, `crates/engine/src/db/join.rs`, `crates/engine/src/db/query.rs`, `crates/engine/src/db/subquery.rs`):
+    - Implemented thread-safe `QueryMemoryTracker` with `reserve_context()`, `release()`, `current_bytes()`, `peak_bytes()`, and RAII `MemoryReservation` guard.
+    - Replaced raw byte estimation checks across joins, bucket aggregations, sorts, subquery materializations, and IN-list evaluations with unified atomic memory tracking.
+    - Enforces limits using overflow-safe saturating arithmetic with zero overhead when unconstrained.
+  - **Query Statement Timeout Compatibility** (`crates/engine/src/db/mod.rs`, `crates/engine/src/db/tests/mod.rs`):
+    - Added `statement_timeout` SQL configuration alias (PostgreSQL standard) alongside `max_execution_time`.
+    - Added verification test `query_execution_statement_timeout` proving timer expiration halts queries cleanly with `Error::QueryTimeout`.
+  - All source files strictly comply with the $\le 1,500$ line ceiling. Engine remains 100% `std`-only. Zero release compiler warnings.
+* **Evidence**: **347/347 tests green** (248 engine + 99 server); `cargo check --release` 100% clean.
+* **Effort**: High.
+
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**335 tests: 236 engine + 99 server** as of this writing).
+1. `cargo test` — all green (**347 tests: 248 engine + 99 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

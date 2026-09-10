@@ -138,14 +138,10 @@ pub(crate) fn setup_derived(
                     )));
                 }
             }
-            if let Some(byte_limit) = session.max_intermediate_bytes {
-                let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
-                if total_bytes > byte_limit {
-                    teardown_derived(session, saved);
-                    return Err(Error::ExecutionError(format!(
-                        "query exceeded max_intermediate_bytes limit ({byte_limit}) during subquery materialization (estimated {total_bytes} bytes)"
-                    )));
-                }
+            let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
+            if let Err(e) = session.mem_tracker.reserve_context(total_bytes, "subquery materialization") {
+                teardown_derived(session, saved);
+                return Err(e);
             }
             let table = match ephemeral_table(alias, &out) {
                 Ok(t) => t,
@@ -562,14 +558,8 @@ fn build_set(
             )));
         }
     }
-    if let Some(byte_limit) = session.max_intermediate_bytes {
-        let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
-        if total_bytes > byte_limit {
-            return Err(Error::ExecutionError(format!(
-                "query exceeded max_intermediate_bytes limit ({byte_limit}) during subquery IN evaluation (estimated {total_bytes} bytes)"
-            )));
-        }
-    }
+    let total_bytes: usize = out.rows.iter().map(|r| Database::estimate_row_bytes(r)).sum();
+    session.mem_tracker.reserve_context(total_bytes, "subquery IN evaluation")?;
     let mut set = HashSet::new();
     let mut has_nullish = false;
     for r in &out.rows {
