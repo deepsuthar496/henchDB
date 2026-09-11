@@ -214,7 +214,14 @@ impl Database {
             }
             self.record_install(table, &key, Some(&enc), commit_epoch)?;
             table.apply_raw(&key, &enc)?;
+            if let Some(ref observer) = *self.commit_observer.read().unwrap() {
+                let decoded_row = table.decode_stored(&enc).ok();
+                observer(commit_epoch, &[(table_name.to_string(), key.clone(), decoded_row)]);
+            }
             self.visible_epoch.store(commit_epoch, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut vs) = self.versions.write() {
+                vs.gc_locked();
+            }
             *frontier = end;
             drop(frontier);
             self.install_cv.notify_all();

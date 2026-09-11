@@ -282,6 +282,7 @@ pub fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>, CodecError> {
 }
 
 /// Decode a raw frame buffer starting with REPL_MAGIC (used by tests & fuzzing).
+#[cfg(test)]
 pub fn decode_raw_frame(bytes: &[u8]) -> Result<Frame, CodecError> {
     if bytes.len() < 2 {
         return Err(CodecError("frame too short".into()));
@@ -292,6 +293,7 @@ pub fn decode_raw_frame(bytes: &[u8]) -> Result<Frame, CodecError> {
     decode_body(&bytes[1..])
 }
 
+#[cfg(test)]
 pub fn encode_body_for_test(f: &Frame, out: &mut Vec<u8>) {
     encode_body(f, out);
 }

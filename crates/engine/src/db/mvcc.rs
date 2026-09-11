@@ -40,12 +40,12 @@ type Chain = Vec<(u64, Option<Vec<Datum>>)>;
 
 pub(crate) struct VersionState {
     /// Latest committed epoch per live key.
-    committed: HashMap<(String, Vec<u8>), u64>,
+    pub(crate) committed: HashMap<(String, Vec<u8>), u64>,
     /// Superseded states per key, newest first.
-    chains: HashMap<(String, Vec<u8>), Chain>,
+    pub(crate) chains: HashMap<(String, Vec<u8>), Chain>,
     /// Active snapshot readers: snapshot id -> (pinned read epoch, created_at).
-    snapshots: HashMap<u64, (u64, std::time::Instant)>,
-    next_snapshot_id: AtomicU64,
+    pub(crate) snapshots: HashMap<u64, (u64, std::time::Instant)>,
+    pub(crate) next_snapshot_id: AtomicU64,
 }
 
 impl VersionState {
@@ -67,7 +67,7 @@ impl VersionState {
     }
 
     /// Drop history no live reader can consult (see module docs).
-    fn gc_locked(&mut self) {
+    pub(crate) fn gc_locked(&mut self) {
         match self.snapshots.values().map(|(e, _)| *e).min() {
             None => {
                 self.chains.clear();
@@ -118,8 +118,7 @@ impl Database {
         self.commit_epoch.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Record the superseded state of one install at `epoch`. Skips silently
-    /// when no snapshot reader is active.
+    /// Record the superseded state of one install at `epoch`.
     pub(crate) fn record_install(
         &self,
         table: &Arc<Table>,
@@ -128,9 +127,6 @@ impl Database {
         epoch: u64,
     ) -> Result<()> {
         let mut vs = self.versions.write().unwrap();
-        if vs.snapshots.is_empty() {
-            return Ok(());
-        }
         let prev_raw = table.tree().get(key);
         match (&prev_raw, new_enc) {
             (None, None) => return Ok(()), // deleting an absent key: no state
@@ -160,9 +156,6 @@ impl Database {
         epoch: u64,
     ) -> Result<()> {
         let mut vs = self.versions.write().unwrap();
-        if vs.snapshots.is_empty() {
-            return Ok(());
-        }
         for (((table_name, key), _), enc_opt) in staged.iter().zip(encoded_rows.iter()) {
             let table = match tables.get(table_name) {
                 Some(t) => t,
@@ -287,13 +280,13 @@ impl Database {
         if session.txn.is_some() {
             return Err(Error::TxnConflict("transaction already active".into()));
         }
-        let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
         let now = std::time::Instant::now();
-        let id = {
+        let (read_epoch, id) = {
             let mut vs = self.versions.write().unwrap();
+            let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
             vs.snapshots.insert(id, (read_epoch, now));
-            id
+            (read_epoch, id)
         };
         let txn_id = self.next_txn.fetch_add(1, Ordering::Relaxed);
         session.txn = Some(ActiveTxn {
@@ -316,13 +309,13 @@ impl Database {
         if session.snapshot.is_some() {
             return;
         }
-        let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
         let now = std::time::Instant::now();
-        let id = {
+        let (read_epoch, id) = {
             let mut vs = self.versions.write().unwrap();
+            let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
             vs.snapshots.insert(id, (read_epoch, now));
-            id
+            (read_epoch, id)
         };
         session.snapshot = Some(SnapshotPin {
             id,
@@ -337,13 +330,13 @@ impl Database {
         if session.snapshot.is_some() {
             return;
         }
-        let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
         let now = std::time::Instant::now();
-        let id = {
+        let (read_epoch, id) = {
             let mut vs = self.versions.write().unwrap();
+            let read_epoch = self.visible_epoch.load(Ordering::SeqCst);
             let id = vs.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
             vs.snapshots.insert(id, (read_epoch, now));
-            id
+            (read_epoch, id)
         };
         session.snapshot = Some(SnapshotPin {
             id,

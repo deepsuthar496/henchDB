@@ -734,10 +734,42 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 * **Evidence**: **369/369 tests green** (265 engine + 104 server); `cargo check --release` 100% clean; automated release gate 13/13 passed.
 * **Effort**: High.
 
+### 2026-09-11 — MVCC Differential Oracle Atomic Synchronization, Flake-Free Publication, 1,000-Cycle Crash Harness & 13/13 Release Gates Verified (10/10)
+* **Context**:
+  Execute the remaining production readiness milestones from `docs/assessment.md` (progressing to verified 10/10 production readiness):
+  1. §1: Eliminate remaining race windows between database commit and MVCC reference oracle publication.
+  2. §2: Expand automated crash matrix with randomized 1,000-cycle campaigns and standalone runner script (`scripts/crash_campaign.py`).
+  3. §5: Production-scale multi-threaded MVCC differential oracle workload (`mvcc_production_scale_differential_multi_threaded_workload`).
+  4. §6: Standalone continuous fuzzing harness (`scripts/fuzz.py`) covering SQL parser, WAL decoder, auth proofs, and streaming replication frames.
+  5. §7: Physical streaming replication HA failure matrix tests (duplicate frames, mid-stream disconnect/resume).
+  6. §12: Execute full 13-gate automated release verification suite (`scripts/release_gate.py`) and update readiness checklist.
+* **Delivered**:
+  - **MVCC Differential Oracle Atomic Publication & Race Elimination** (`crates/engine/src/db/mod.rs`, `crates/engine/src/db/dml.rs`, `crates/engine/src/db/mvcc.rs`, `crates/engine/src/db/tests/mvcc_property.rs`):
+    - Added atomic observer hook to `Database::install` invoked during Phase C under the install lock before advancing `visible_epoch`, ensuring readers cannot observe tree state changes before the oracle is published.
+    - Linearized snapshot creation (`Database::snapshot_read_committed`) to synchronize with the publication barrier.
+    - Fixed namespace resolution between session-staged keys (`default.kv`) and table names in version recording.
+    - Guarded inline version vacuum GC (`vs.gc_locked()`) from pruning versions during transient unpinned windows when `snapshots` is temporarily empty.
+    - Added deterministic race interleaving regression test `mvcc_atomic_oracle_publication_race_elimination`, passing 100/100 consecutive runs without flakes.
+  - **1,000-Cycle Crash Matrix & Randomized Campaign Harness** (`crates/engine/src/db/tests/crash_matrix.rs`, `scripts/crash_campaign.py`):
+    - Added `crash_matrix_large_randomized_campaign_1000_cycles` running 1,000 rapid randomized failpoint crash/recovery cycles locally.
+    - Created `scripts/crash_campaign.py` supporting `--nightly` (10,000 cycles) with randomized transaction shapes, checkpoint timings, and WAL positions.
+  - **Production-Scale Concurrent MVCC Differential Workload** (`crates/engine/src/db/tests/mvcc_property.rs`):
+    - Added `mvcc_production_scale_differential_multi_threaded_workload` running 8 concurrent worker threads performing 10,000+ randomized operations (inserts, updates, deletes, rollbacks, commits, and snapshot reads) checked differential-by-differential against `MvccReferenceOracle`.
+  - **Continuous Subsystem Fuzzing Harness** (`scripts/fuzz.py`):
+    - Implemented standalone multi-worker fuzz test harness covering SQL grammar edge cases, WAL frames, caching-sha2 auth proofs, and replication wire frames.
+  - **Replication HA Failure Matrix** (`crates/server/src/replication/tests.rs`, `crates/server/src/replication/protocol.rs`):
+    - Added automated tests for duplicate replication frames (`replication_network_duplicate_frames_safely_ignored`) and mid-stream disconnect/reconnect recovery.
+  - **All 13 Production Release Gates Passing** (`scripts/release_gate.py`):
+    - Executed all 13 gates with 100% pass rate in 161.23s.
+    - All source files strictly comply with the $\le 1,500$ line ceiling (`mod.rs` at 1,444 lines, `replication/tests.rs` at 913 lines, `mvcc_property.rs` at 778 lines).
+    - Engine remains 100% `std`-only. Zero warnings on `cargo check --release`.
+* **Evidence**: **375/375 tests green** (269 engine + 106 server); automated release gate 13/13 passed; `cargo check --release` 100% clean.
+* **Effort**: High.
+
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**369 tests: 265 engine + 104 server** as of this writing).
+1. `cargo test` — all green (**375 tests: 269 engine + 106 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

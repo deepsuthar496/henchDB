@@ -188,7 +188,12 @@ pub struct Database {
     pub(crate) privs: RwLock<privilege::PrivilegeStore>,
     /// Configurable maximum snapshot age in milliseconds (0 = unlimited).
     pub(crate) max_snapshot_age_ms: AtomicU64,
+    /// Atomic commit observer for differential testing and external publication.
+    pub(crate) commit_observer: RwLock<Option<CommitObserver>>,
 }
+
+/// Callback invoked immediately prior to `visible_epoch` publication during commit install.
+pub type CommitObserver = Arc<dyn Fn(u64, &[(String, Vec<u8>, Option<Vec<Datum>>)]) + Send + Sync>;
 
 impl Database {
     pub fn set_max_snapshot_age(&self, dur: Option<Duration>) {
@@ -203,6 +208,11 @@ impl Database {
         } else {
             Some(Duration::from_millis(ms))
         }
+    }
+
+    /// Register an atomic commit observer invoked immediately prior to `visible_epoch` publication.
+    pub fn set_commit_observer(&self, observer: Option<CommitObserver>) {
+        *self.commit_observer.write().unwrap() = observer;
     }
 }
 
@@ -311,6 +321,7 @@ impl Database {
             archive_dir: Mutex::new(None),
             privs: RwLock::new(privilege::PrivilegeStore::default()),
             max_snapshot_age_ms: AtomicU64::new(0),
+            commit_observer: RwLock::new(None),
         })
     }
 
@@ -1113,7 +1124,17 @@ impl Database {
                     crate::failpoint!("during_multirow_install");
                 }
             }
+            if let Some(ref observer) = *self.commit_observer.read().unwrap() {
+                let mut items = Vec::with_capacity(staged.len());
+                for ((table, key), w) in &staged {
+                    items.push((table.clone(), key.clone(), w.row.clone()));
+                }
+                observer(commit_epoch, &items);
+            }
             self.visible_epoch.store(commit_epoch, Ordering::SeqCst);
+            if let Ok(mut vs) = self.versions.write() {
+                vs.gc_locked();
+            }
             *frontier = end;
             drop(frontier);
             self.install_cv.notify_all();

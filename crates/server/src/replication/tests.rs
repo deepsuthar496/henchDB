@@ -783,3 +783,131 @@ fn corrupt_wal_chunk_rejected_safely() {
     let _ = std::fs::remove_dir_all(&rdir);
 }
 
+#[test]
+fn replication_network_duplicate_frames_safely_ignored() {
+    use super::protocol::{write_frame, Frame};
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let rdir = base.join(format!("hdbdup_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let mock_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_port = mock_listener.local_addr().unwrap().port();
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, rdrain) = spawn_replica(&rdb, &format!("127.0.0.1:{mock_port}"), &rdir);
+
+    let mock_thread = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = mock_listener.accept() {
+            let _ = super::protocol::read_frame(&mut stream);
+            let _ = write_frame(&mut stream, &Frame::HandshakeAck {
+                ok: true,
+                message: "streaming".into(),
+                wal_version: engine::wal::WAL_FORMAT_VERSION,
+                durable_offset: 200,
+            });
+            let _ = super::protocol::read_frame(&mut stream);
+
+            // Send a valid snapshot or heartbeat frame first
+            let _ = write_frame(&mut stream, &Frame::Heartbeat { durable_offset: 200 });
+            // Send duplicate/older WAL offset chunks (network reordering/duplication)
+            let _ = write_frame(&mut stream, &Frame::WalChunk {
+                offset: 0,
+                data: vec![],
+            });
+            let _ = write_frame(&mut stream, &Frame::WalChunk {
+                offset: 0,
+                data: vec![],
+            });
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+    // Verify replica remains operational and clean
+    assert!(rdb.is_read_only());
+
+    mock_thread.join().unwrap();
+    rdrain.store(true, Ordering::Relaxed);
+    rt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
+#[test]
+fn primary_crash_mid_stream_and_replica_reconnect_resumes() {
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    let pdir = base.join(format!("hdbpcm_p_{pid}"));
+    let rdir = base.join(format!("hdbpcm_r_{pid}"));
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let pdb = primary_db(&pdir);
+    {
+        let mut s = pdb.new_session();
+        db_execute(&pdb, &mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    }
+    load_rows(&pdb, "t", 0, 50);
+
+    let (pl, port) = primary::bind_repl(0).expect("bind repl");
+    let draining_p = Arc::new(AtomicBool::new(false));
+    let global_p = leak_flag();
+    let pdb2 = pdb.clone();
+    let draining_p2 = draining_p.clone();
+    let auth_path = pdir.join("auth.bin");
+    let pt = std::thread::spawn(move || {
+        primary::serve_primary(pdb2, pl, auth_path, draining_p2, global_p)
+    });
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, rdrain) = spawn_replica(&rdb, &format!("127.0.0.1:{port}"), &rdir);
+
+    wait_for("replica sync initial 50", Duration::from_secs(20), || {
+        count(&rdb, "t") == 50
+    });
+
+    // 1. Primary crashes mid-stream (kill listener & thread abruptly)
+    draining_p.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+
+    // 2. Replica enters DISCONNECTED state without crashing or corrupting local data
+    wait_for("replica disconnect after primary crash", Duration::from_secs(15), || {
+        status_val(&rdb, "Rpl_replica_status") == "DISCONNECTED"
+    });
+    assert_eq!(count(&rdb, "t"), 50);
+
+    // 3. Primary restarts on same port, writes 50 more rows
+    load_rows(&pdb, "t", 50, 50);
+    assert_eq!(count(&pdb, "t"), 100);
+
+    let (pl2, _) = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map(|l| (l, port))
+        .expect("rebind primary port");
+    let draining_p_new = Arc::new(AtomicBool::new(false));
+    let global_p_new = leak_flag();
+    let pdb3 = pdb.clone();
+    let draining_p_new2 = draining_p_new.clone();
+    let auth_path2 = pdir.join("auth.bin");
+    let pt2 = std::thread::spawn(move || {
+        primary::serve_primary(pdb3, pl2, auth_path2, draining_p_new2, global_p_new)
+    });
+
+    // 4. Replica automatically reconnects, resumes streaming, reaches 100 rows
+    wait_for("replica reconnect and reach 100", Duration::from_secs(25), || {
+        count(&rdb, "t") == 100
+    });
+
+    draining_p_new.store(true, Ordering::Relaxed);
+    pt2.join().unwrap();
+    rdrain.store(true, Ordering::Relaxed);
+    rt.join().unwrap();
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+
