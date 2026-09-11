@@ -36,20 +36,32 @@ fn parse_create_and_insert() {
     )
     .unwrap();
     match s {
-        Statement::CreateTable { name, columns, foreign_keys } => {
+        Statement::CreateTable { name, columns, foreign_keys, if_not_exists } => {
             assert_eq!(name, "users");
             assert_eq!(columns.len(), 3);
             assert!(columns[0].primary_key);
             assert!(columns[1].not_null);
             assert!(!columns[2].not_null);
             assert!(foreign_keys.is_empty());
+            assert!(!if_not_exists);
         }
         other => panic!("wrong stmt {other:?}"),
     }
     let s = parse_sql("INSERT INTO users VALUES (1, 'ann', 2.5), (2, 'bob', -1.0)").unwrap();
     match s {
-        Statement::Insert { table, rows } => {
+        Statement::Insert { table, columns, rows } => {
             assert_eq!(table, "users");
+            assert!(columns.is_none());
+            assert_eq!(rows.len(), 2);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
+    let s = parse_sql("INSERT INTO users (id, name) VALUES (1, 'ann'), (2, 'bob')").unwrap();
+    match s {
+        Statement::Insert { table, columns, rows } => {
+            assert_eq!(table, "users");
+            assert_eq!(columns, Some(vec!["id".to_string(), "name".to_string()]));
             assert_eq!(rows.len(), 2);
         }
         other => panic!("wrong stmt {other:?}"),
@@ -88,6 +100,12 @@ fn parse_database_ddl_and_use() {
     assert_eq!(s, Statement::ShowEngineStatus);
 
     let s = parse_sql("SHOW ENGINE INNODB STATUS;").unwrap();
+    assert_eq!(s, Statement::ShowEngineStatus);
+
+    let s = parse_sql("SHOW ENGINE;").unwrap();
+    assert_eq!(s, Statement::ShowEngineStatus);
+
+    let s = parse_sql("SHOW ENGINES;").unwrap();
     assert_eq!(s, Statement::ShowEngineStatus);
 
     let s = parse_sql("SHOW PROCESSLIST;").unwrap();
@@ -130,6 +148,7 @@ fn parse_create_and_drop_index() {
             name: "idx_age".into(),
             table: "users".into(),
             column: "age".into(),
+            if_not_exists: false,
         }
     );
     let s = parse_sql("DROP INDEX idx_age ON users").unwrap();
@@ -138,6 +157,56 @@ fn parse_create_and_drop_index() {
         Statement::DropIndex {
             name: "idx_age".into(),
             table: "users".into(),
+            if_exists: false,
+        }
+    );
+}
+
+#[test]
+fn parse_if_exists_and_table_pk() {
+    let s = parse_sql("CREATE TABLE IF NOT EXISTS items (id INT, name TEXT, PRIMARY KEY (id))").unwrap();
+    match s {
+        Statement::CreateTable { name, columns, if_not_exists, .. } => {
+            assert_eq!(name, "items");
+            assert!(if_not_exists);
+            assert_eq!(columns.len(), 2);
+            assert!(columns[0].primary_key);
+            assert!(columns[0].not_null);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
+    let s2 = parse_sql("CREATE TABLE IF NOT EXISTS orders (oid BIGINT, CONSTRAINT pk_orders PRIMARY KEY (oid))").unwrap();
+    match s2 {
+        Statement::CreateTable { name, columns, if_not_exists, .. } => {
+            assert_eq!(name, "orders");
+            assert!(if_not_exists);
+            assert!(columns[0].primary_key);
+        }
+        other => panic!("wrong stmt {other:?}"),
+    }
+
+    let s3 = parse_sql("DROP TABLE IF EXISTS items").unwrap();
+    assert_eq!(s3, Statement::DropTable { name: "items".into(), if_exists: true });
+
+    let s4 = parse_sql("CREATE INDEX IF NOT EXISTS idx_name ON items (name)").unwrap();
+    assert_eq!(
+        s4,
+        Statement::CreateIndex {
+            name: "idx_name".into(),
+            table: "items".into(),
+            column: "name".into(),
+            if_not_exists: true,
+        }
+    );
+
+    let s5 = parse_sql("DROP INDEX IF EXISTS idx_name ON items").unwrap();
+    assert_eq!(
+        s5,
+        Statement::DropIndex {
+            name: "idx_name".into(),
+            table: "items".into(),
+            if_exists: true,
         }
     );
 }

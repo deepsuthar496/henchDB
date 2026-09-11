@@ -634,6 +634,10 @@ impl Table {
         self.indexes.read().unwrap().iter().map(|i| i.def.clone()).collect()
     }
 
+    pub fn has_index(&self, name: &str) -> bool {
+        self.indexes.read().unwrap().iter().any(|idx| idx.def.name == name)
+    }
+
     pub fn table_def(&self) -> TableDef {
         let mut def = self.def.clone();
         def.indexes = self.secondary_indexes();

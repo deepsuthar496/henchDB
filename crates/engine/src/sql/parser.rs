@@ -216,10 +216,10 @@ impl Parser {
                         None
                     };
                     Ok(Statement::ShowStatus { like })
-                } else if self.eat_kw("ENGINE") {
-                    // SHOW ENGINE STATUS | SHOW ENGINE INNODB STATUS
+                } else if self.eat_kw("ENGINE") || self.eat_kw("ENGINES") {
+                    // SHOW ENGINE [INNODB] [STATUS] | SHOW ENGINES
                     self.eat_kw("INNODB");
-                    self.expect_kw("STATUS")?;
+                    let _ = self.eat_kw("STATUS");
                     Ok(Statement::ShowEngineStatus)
                 } else if self.eat_kw("PROCESSLIST") {
                     Ok(Statement::ShowProcesslist)
@@ -486,19 +486,52 @@ impl Parser {
             let password = self.parse_password()?;
             Ok(Statement::CreateUser { name, if_not_exists, password })
         } else if self.eat_kw("TABLE") {
+            let if_not_exists = if self.eat_kw("IF") {
+                self.expect_kw("NOT")?;
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
             let name = self.expect_ident()?;
             self.expect_sym('(')?;
-            let mut columns = Vec::new();
+            let mut columns: Vec<ColumnSpec> = Vec::new();
             let mut foreign_keys = Vec::new();
             loop {
                 // Table constraint: [CONSTRAINT [name]] FOREIGN KEY (col)
                 // REFERENCES reftable(refcol) [ON DELETE action]
-                // [ON UPDATE action].
+                // [ON UPDATE action] or [CONSTRAINT [name]] PRIMARY KEY (col).
                 let mut constraint_name: Option<String> = None;
                 if self.eat_kw("CONSTRAINT") {
-                    if kw(self.peek()).as_deref() != Some("FOREIGN") {
+                    if kw(self.peek()).as_deref() != Some("FOREIGN")
+                        && kw(self.peek()).as_deref() != Some("PRIMARY")
+                    {
                         constraint_name = Some(self.expect_ident()?);
                     }
+                }
+                if self.eat_kw("PRIMARY") {
+                    self.expect_kw("KEY")?;
+                    self.expect_sym('(')?;
+                    let pk_col = self.expect_ident()?;
+                    self.expect_sym(')')?;
+                    let mut found = false;
+                    for col in &mut columns {
+                        if col.name.eq_ignore_ascii_case(&pk_col) {
+                            col.primary_key = true;
+                            col.not_null = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Err(Error::ParseError(format!(
+                            "PRIMARY KEY column '{pk_col}' not found in table definition"
+                        )));
+                    }
+                    if !self.eat_sym(',') {
+                        break;
+                    }
+                    continue;
                 }
                 if self.eat_kw("FOREIGN") {
                     self.expect_kw("KEY")?;
@@ -548,7 +581,7 @@ impl Parser {
                 }
                 if constraint_name.is_some() {
                     return Err(Error::ParseError(
-                        "CONSTRAINT must precede FOREIGN KEY".into(),
+                        "CONSTRAINT must precede FOREIGN KEY or PRIMARY KEY".into(),
                     ));
                 }
                 let cname = self.expect_ident()?;
@@ -594,15 +627,22 @@ impl Parser {
                 }
             }
             self.expect_sym(')')?;
-            Ok(Statement::CreateTable { name, columns, foreign_keys })
+            Ok(Statement::CreateTable { name, columns, foreign_keys, if_not_exists })
         } else if self.eat_kw("INDEX") {
+            let if_not_exists = if self.eat_kw("IF") {
+                self.expect_kw("NOT")?;
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
             let name = self.expect_ident()?;
             self.expect_kw("ON")?;
             let table = self.expect_ident()?;
             self.expect_sym('(')?;
             let column = self.expect_ident()?;
             self.expect_sym(')')?;
-            Ok(Statement::CreateIndex { name, table, column })
+            Ok(Statement::CreateIndex { name, table, column, if_not_exists })
         } else {
             Err(Error::ParseError(format!(
                 "expected DATABASE, TABLE, or INDEX after CREATE, got {:?}",
@@ -623,8 +663,14 @@ impl Parser {
             let name = self.expect_ident()?;
             Ok(Statement::DropDatabase { name, if_exists })
         } else if self.eat_kw("TABLE") {
+            let if_exists = if self.eat_kw("IF") {
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
             let name = self.expect_ident()?;
-            Ok(Statement::DropTable { name })
+            Ok(Statement::DropTable { name, if_exists })
         } else if self.eat_kw("USER") {
             let if_exists = if self.eat_kw("IF") {
                 self.expect_kw("EXISTS")?;
@@ -635,10 +681,16 @@ impl Parser {
             let name = self.parse_user_name()?;
             Ok(Statement::DropUser { name, if_exists })
         } else if self.eat_kw("INDEX") {
+            let if_exists = if self.eat_kw("IF") {
+                self.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
             let name = self.expect_ident()?;
             self.expect_kw("ON")?;
             let table = self.expect_ident()?;
-            Ok(Statement::DropIndex { name, table })
+            Ok(Statement::DropIndex { name, table, if_exists })
         } else {
             Err(Error::ParseError(format!(
                 "expected DATABASE, TABLE, USER, or INDEX after DROP, got {:?}",
@@ -651,6 +703,20 @@ impl Parser {
         self.pos += 1;
         self.expect_kw("INTO")?;
         let table = self.expect_ident()?;
+        let columns = if self.eat_sym('(') {
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_ident()?);
+                if self.eat_sym(',') {
+                    continue;
+                }
+                self.expect_sym(')')?;
+                break;
+            }
+            Some(cols)
+        } else {
+            None
+        };
         self.expect_kw("VALUES")?;
         let mut rows = Vec::new();
         loop {
@@ -670,7 +736,7 @@ impl Parser {
             }
             break;
         }
-        Ok(Statement::Insert { table, rows })
+        Ok(Statement::Insert { table, columns, rows })
     }
 
     fn parse_select(&mut self) -> Result<Statement> {

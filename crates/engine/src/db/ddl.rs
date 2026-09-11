@@ -85,8 +85,15 @@ impl Database {
         name: String,
         columns: Vec<crate::sql::ColumnSpec>,
         foreign_keys: Vec<crate::sql::ForeignKeySpec>,
+        if_not_exists: bool,
     ) -> Result<Output> {
         let key = if name.contains('.') { name.clone() } else { format!("{}.{name}", session.current_db) };
+        if if_not_exists {
+            let guard = self.tables.read().unwrap();
+            if guard.contains_key(&key) {
+                return Ok(Output::ok(format!("table '{name}' exists")));
+            }
+        }
         let mut pk_count = 0usize;
         let mut pk_idx = None;
         let mut auto_inc_count = 0usize;
@@ -150,6 +157,9 @@ impl Database {
         {
             let mut guard = self.tables.write().unwrap();
             if guard.contains_key(&key) {
+                if if_not_exists {
+                    return Ok(Output::ok(format!("table '{name}' exists")));
+                }
                 return Err(Error::TableExists(name));
             }
             table.set_pool(self.pool.clone());
@@ -164,13 +174,27 @@ impl Database {
         Ok(Output::ok(format!("table '{name}' created")))
     }
 
-    pub(super) fn exec_drop_table(&self, session: &Session, name: &str) -> Result<Output> {
+    pub(super) fn exec_drop_table(&self, session: &Session, name: &str, if_exists: bool) -> Result<Output> {
         let key = self.resolve_table_key(session, name);
+        {
+            let guard = self.tables.read().unwrap();
+            if !guard.contains_key(&key) {
+                if if_exists {
+                    return Ok(Output::ok("DROP TABLE"));
+                }
+                return Err(Error::TableNotFound(name.to_string()));
+            }
+        }
         // A referenced parent cannot be dropped (schema-level RESTRICT).
         self.fk_check_drop(&key, name)?;
         {
             let mut guard = self.tables.write().unwrap();
-            guard.remove(&key).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+            if guard.remove(&key).is_none() {
+                if if_exists {
+                    return Ok(Output::ok("DROP TABLE"));
+                }
+                return Err(Error::TableNotFound(name.to_string()));
+            }
         }
         self.purge_table_versions(&key);
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
@@ -190,9 +214,13 @@ impl Database {
         name: String,
         table_name: String,
         column: String,
+        if_not_exists: bool,
     ) -> Result<Output> {
         let table = self.table(session, &table_name)?;
         let key = self.resolve_table_key(session, &table_name);
+        if if_not_exists && table.has_index(&name) {
+            return Ok(Output::ok(format!("index '{name}' exists on '{table_name}'")));
+        }
         table.add_index(name.clone(), column.clone())?;
         let txn = self.next_txn.fetch_add(1, Ordering::Relaxed);
         self.wal_commit(vec![
@@ -207,9 +235,18 @@ impl Database {
         Ok(Output::ok(format!("index '{name}' created on '{table_name}'")))
     }
 
-    pub(super) fn exec_drop_index(&self, session: &Session, name: String, table_name: String) -> Result<Output> {
-        let table = self.table(session, &table_name)?;
+    pub(super) fn exec_drop_index(&self, session: &Session, name: String, table_name: String, if_exists: bool) -> Result<Output> {
+        let table = match self.table(session, &table_name) {
+            Ok(t) => t,
+            Err(Error::TableNotFound(_)) if if_exists => {
+                return Ok(Output::ok("DROP INDEX"));
+            }
+            Err(e) => return Err(e),
+        };
         let key = self.resolve_table_key(session, &table_name);
+        if if_exists && !table.has_index(&name) {
+            return Ok(Output::ok("DROP INDEX"));
+        }
         // FK columns keep their last covering index.
         self.fk_check_drop_index(&table, &name)?;
         table.drop_index(&name)?;

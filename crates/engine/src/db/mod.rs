@@ -652,15 +652,22 @@ impl Database {
                 Ok(Output::ok("BEGIN"))
             }
             Statement::Commit => {
-                let txn = session.txn.take().ok_or(Error::TxnNotActive)?;
+                let txn = match session.txn.take() {
+                    Some(t) => t,
+                    None => {
+                        self.snapshot_end(session);
+                        return Ok(Output::ok("COMMIT"));
+                    }
+                };
                 self.metrics.txn_end();
                 self.commit_txn(txn.id, txn.staged)?;
                 self.snapshot_end(session);
                 Ok(Output::ok("COMMIT"))
             }
             Statement::Rollback => {
-                session.txn.take().ok_or(Error::TxnNotActive)?;
-                self.metrics.txn_end();
+                if session.txn.take().is_some() {
+                    self.metrics.txn_end();
+                }
                 self.snapshot_end(session);
                 Ok(Output::ok("ROLLBACK"))
             }
@@ -884,11 +891,11 @@ impl Database {
             Statement::ExplainMemo { statement } => {
                 self.exec_explain_memo(session, &statement)
             }
-            Statement::CreateTable { name, columns, foreign_keys } => {
-                self.exec_create_table(session, name, columns, foreign_keys)
+            Statement::CreateTable { name, columns, foreign_keys, if_not_exists } => {
+                self.exec_create_table(session, name, columns, foreign_keys, if_not_exists)
             }
-            Statement::DropTable { name } => self.exec_drop_table(session, &name),
-            Statement::Insert { table, rows } => self.exec_insert(session, &table, rows),
+            Statement::DropTable { name, if_exists } => self.exec_drop_table(session, &name, if_exists),
+            Statement::Insert { table, columns, rows } => self.exec_insert(session, &table, columns.as_deref(), rows),
             Statement::Select {
                 items,
                 from,
@@ -906,11 +913,11 @@ impl Database {
             Statement::Delete { table, selection } => {
                 self.exec_delete(session, &table, selection)
             }
-            Statement::CreateIndex { name, table, column } => {
-                self.exec_create_index(session, name, table, column)
+            Statement::CreateIndex { name, table, column, if_not_exists } => {
+                self.exec_create_index(session, name, table, column, if_not_exists)
             }
-            Statement::DropIndex { name, table } => {
-                self.exec_drop_index(session, name, table)
+            Statement::DropIndex { name, table, if_exists } => {
+                self.exec_drop_index(session, name, table, if_exists)
             }
         }
     }
@@ -1124,6 +1131,7 @@ impl Database {
                     crate::failpoint!("during_multirow_install");
                 }
             }
+            self.visible_epoch.store(commit_epoch, Ordering::SeqCst);
             if let Some(ref observer) = *self.commit_observer.read().unwrap() {
                 let mut items = Vec::with_capacity(staged.len());
                 for ((table, key), w) in &staged {
@@ -1131,7 +1139,6 @@ impl Database {
                 }
                 observer(commit_epoch, &items);
             }
-            self.visible_epoch.store(commit_epoch, Ordering::SeqCst);
             if let Ok(mut vs) = self.versions.write() {
                 vs.gc_locked();
             }
@@ -1209,6 +1216,10 @@ impl Database {
         let ordered_points = matches!(
             choice.path,
             AccessPath::PkIn(_) | AccessPath::SecIn { .. }
+        );
+        let is_scan_path = matches!(
+            choice.path,
+            AccessPath::Range { .. } | AccessPath::FullScan
         );
         match choice.path {
             AccessPath::Point(lit) => {
@@ -1292,7 +1303,7 @@ impl Database {
         // Snapshot substitution for scan paths (point paths already went
         // through `visible_row`): rows created after the pin vanish, rows
         // deleted after it are restored from history.
-        if session.snapshot.is_some() {
+        if is_scan_path && session.snapshot.is_some() {
             let mut present: HashSet<Vec<u8>> = HashSet::new();
             let mut kept: Vec<(Vec<u8>, Vec<Datum>)> = Vec::with_capacity(rows.len());
             for (k, r) in rows {

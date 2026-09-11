@@ -27,6 +27,8 @@ mod mock_innodb;
 mod net;
 mod replication;
 mod wire;
+mod help;
+use help::*;
 #[cfg(test)]
 mod tests;
 
@@ -502,43 +504,110 @@ fn main() {
     let dir = arg_value(&args, "--dir").unwrap_or_else(|| "data".to_string());
     let result = match args.first().map(String::as_str) {
         Some("serve") => {
+            if has_help_flag(&args) {
+                print_serve_help();
+                return;
+            }
             let opts = ServerOpts::from_args(&args);
             serve(Path::new(&dir), opts)
         }
-        Some("passwd") => passwd_cmd(Path::new(&dir), &args),
-        Some("dump") => dump_cmd(Path::new(&dir), &args),
-        Some("restore") => restore_cmd(&args),
-        Some("promote") => promote_cmd(&args),
+        Some("passwd") => {
+            if has_help_flag(&args) {
+                print_passwd_help();
+                return;
+            }
+            passwd_cmd(Path::new(&dir), &args)
+        }
+        Some("dump") => {
+            if has_help_flag(&args) {
+                print_dump_help();
+                return;
+            }
+            dump_cmd(Path::new(&dir), &args)
+        }
+        Some("restore") => {
+            if has_help_flag(&args) {
+                print_restore_help();
+                return;
+            }
+            restore_cmd(&args)
+        }
+        Some("promote") => {
+            if has_help_flag(&args) {
+                print_promote_help();
+                return;
+            }
+            promote_cmd(&args)
+        }
         Some("gcbench") => {
+            if has_help_flag(&args) {
+                print_gcbench_help();
+                return;
+            }
             let threads: usize = arg_value(&args, "--threads")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(8);
             bench_gc(Path::new(&dir), threads, 2_000)
         }
-        Some("clientbench") => client_bench(&args),
+        Some("clientbench") => {
+            if has_help_flag(&args) {
+                print_clientbench_help();
+                return;
+            }
+            client_bench(&args)
+        }
         Some("benchmock") => {
+            if has_help_flag(&args) {
+                println!("usage: server benchmock [--threads <n>]");
+                return;
+            }
             let threads: usize = arg_value(&args, "--threads")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(4);
             bench_mock(threads, 100_000, 500_000)
         }
         Some("bench") => {
+            if has_help_flag(&args) {
+                print_bench_help();
+                return;
+            }
             let rows: u64 = arg_value(&args, "--rows")
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(50_000);
             bench(Path::new(&dir), rows)
         }
-        Some(other) if !other.starts_with('-') => {
-            eprintln!("unknown command '{other}'");
-            eprintln!("usage: server [serve|passwd|bench|dump|restore|promote] [--dir data] [--port 3307] [--rows 50000]");
-            eprintln!("  serve --max-connections 1024 --wait-timeout 28800 --threads <2xCPU> [--no-legacy] [--tls-cert cert.pem --tls-key key.pem] [--pg-port 5432|--no-pg] [--metrics-port 9100|--no-metrics] [--repl-port 3308|--no-repl] [--replica-of host:port [--repl-user root --repl-password pw]] [--read-only] [--wal-archive-dir <dir>]");
-            eprintln!("  passwd --user root --password <pw> [--plugin sha2|native]  (omit --password to read stdin)");
-            eprintln!("  dump [--dir data] [--out backup.hdb]  (offline: stop the server first; for online backup use BACKUP DATABASE TO '<path>')");
-            eprintln!("  restore --backup backup.hdb [--dir data] [--force] [--archive-dir <dir> [--target-time \"YYYY-MM-DD [HH:MM:SS]\" | --target-txn <id>]]");
-            eprintln!("  promote --dir data  (offline: stop the replica first; fences generation + enables writes)");
+        Some(cmd) if !cmd.starts_with('-') => {
+            if cmd == "help" {
+                print_main_help();
+                return;
+            }
+            eprintln!("unknown command '{cmd}'");
+            print_main_usage();
             std::process::exit(2);
         }
-        _ => shell(Path::new(&dir)),
+        _ => {
+            if has_help_flag(&args) {
+                print_main_help();
+                return;
+            }
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--dir" {
+                    if i + 1 < args.len() {
+                        i += 2;
+                    } else {
+                        eprintln!("missing argument for '--dir'");
+                        print_main_usage();
+                        std::process::exit(2);
+                    }
+                } else {
+                    eprintln!("unknown flag '{}'", args[i]);
+                    print_main_usage();
+                    std::process::exit(2);
+                }
+            }
+            shell(Path::new(&dir))
+        }
     };
     if let Err(e) = result {
         eprintln!("fatal: {e}");
@@ -841,8 +910,10 @@ fn shell(dir: &Path) -> engine::Result<()> {
 }
 
 fn print_output(out: &Output) {
-    if !out.message.is_empty() && out.rows.is_empty() {
-        println!("{}", out.message);
+    if out.columns.is_empty() {
+        if !out.message.is_empty() {
+            println!("{}", out.message);
+        }
         return;
     }
     let widths: Vec<usize> = out
@@ -1315,7 +1386,7 @@ pub(crate) fn legacy_step(
 }
 
 fn format_output(out: &Output) -> String {
-    if out.rows.is_empty() {
+    if out.columns.is_empty() {
         return format!("OK {}", out.message);
     }
     let mut s = String::from("OK\n");

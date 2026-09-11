@@ -52,6 +52,7 @@ enum SysView {
     PgType,
     PgAttribute,
     PgDatabase,
+    PgTables,
     Schemata,
     Tables,
     Columns,
@@ -64,6 +65,7 @@ fn sysview_kind(schema: &str, view: &str) -> Option<SysView> {
         ("pg_catalog", "pg_type") => Some(SysView::PgType),
         ("pg_catalog", "pg_attribute") => Some(SysView::PgAttribute),
         ("pg_catalog", "pg_database") => Some(SysView::PgDatabase),
+        ("pg_catalog", "pg_tables") => Some(SysView::PgTables),
         ("information_schema", "schemata") => Some(SysView::Schemata),
         ("information_schema", "tables") => Some(SysView::Tables),
         ("information_schema", "columns") => Some(SysView::Columns),
@@ -80,19 +82,33 @@ pub(crate) fn sysview_source(
     session: &Session,
     name: &str,
 ) -> Result<Option<Arc<Table>>> {
-    let Some((_, _, sl, vl)) = split_sysview(name) else {
-        return Ok(None);
-    };
-    if sl != "pg_catalog" && sl != "information_schema" {
-        return Ok(None);
+    if let Some((_, _, sl, vl)) = split_sysview(name) {
+        if sl != "pg_catalog" && sl != "information_schema" {
+            return Ok(None);
+        }
+        let kind = sysview_kind(&sl, &vl).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+        let (schema, rows) = build_view(db, session, kind);
+        let table = Arc::new(Table::new_ephemeral(format!("{sl}.{vl}"), schema));
+        for (i, row) in rows.iter().enumerate() {
+            table.append_ephemeral(i as u64, row)?;
+        }
+        return Ok(Some(table));
     }
-    let kind = sysview_kind(&sl, &vl).ok_or_else(|| Error::TableNotFound(name.to_string()))?;
-    let (schema, rows) = build_view(db, session, kind);
-    let table = Arc::new(Table::new_ephemeral(format!("{sl}.{vl}"), schema));
-    for (i, row) in rows.iter().enumerate() {
-        table.append_ephemeral(i as u64, row)?;
+
+    // Bare view name resolution (e.g. `SELECT * FROM pg_tables`)
+    let lower = name.to_ascii_lowercase();
+    if let Some(kind) = sysview_kind("pg_catalog", &lower).or_else(|| sysview_kind("information_schema", &lower)) {
+        if db.table(session, name).is_err() {
+            let (schema, rows) = build_view(db, session, kind);
+            let table = Arc::new(Table::new_ephemeral(format!("pg_catalog.{lower}"), schema));
+            for (i, row) in rows.iter().enumerate() {
+                table.append_ephemeral(i as u64, row)?;
+            }
+            return Ok(Some(table));
+        }
     }
-    Ok(Some(table))
+
+    Ok(None)
 }
 
 /// Zero-argument system functions (`SELECT version()`). `None` = not a
@@ -271,6 +287,36 @@ fn build_view(db: &Database, session: &Session, kind: SysView) -> (Schema, Vec<V
                 .enumerate()
                 .map(|(i, name)| vec![Datum::Int(BASE_OID + i as i64), Datum::Text(name)])
                 .collect();
+            (schema, rows)
+        }
+        SysView::PgTables => {
+            let schema = Schema {
+                columns: vec![
+                    col("schemaname", ColumnType::Text),
+                    col("tablename", ColumnType::Text),
+                    col("tableowner", ColumnType::Text),
+                    col("tablespace", ColumnType::Text),
+                    col("hasindexes", ColumnType::Bool),
+                    col("hasrules", ColumnType::Bool),
+                    col("hastriggers", ColumnType::Bool),
+                    col("rowsecurity", ColumnType::Bool),
+                ],
+                pk_idx: 1,
+            };
+            let mut rows = Vec::new();
+            for (_d, name, t) in live_tables(db) {
+                let has_idx = !t.def.indexes.is_empty() || true; // tables have primary key btree index
+                rows.push(vec![
+                    Datum::Text("public".into()),
+                    Datum::Text(name),
+                    Datum::Text("root".into()),
+                    Datum::Null,
+                    Datum::Bool(has_idx),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                    Datum::Bool(false),
+                ]);
+            }
             (schema, rows)
         }
         SysView::Schemata => {

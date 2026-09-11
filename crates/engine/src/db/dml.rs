@@ -21,23 +21,75 @@ impl Database {
         &self,
         session: &mut Session,
         table: &str,
+        columns: Option<&[String]>,
         rows: Vec<Vec<Expr>>,
     ) -> Result<Output> {
         let table_arc = self.table(session, table)?;
         let table_key = self.resolve_table_key(session, table);
-        let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
-        for row_exprs in rows {
-            let mut row = Vec::with_capacity(row_exprs.len());
-            for e in row_exprs {
-                match e {
-                    Expr::Literal(d) => row.push(d),
-                    other => {
-                        return Err(Error::NotSupported(format!(
-                            "INSERT values must be literals, got {other:?}"
-                        )))
+        let schema = table_arc.schema();
+
+        let col_indices = if let Some(cols) = columns {
+            let mut indices = Vec::with_capacity(cols.len());
+            let mut seen = std::collections::HashSet::new();
+            for col_name in cols {
+                if !seen.insert(col_name) {
+                    return Err(Error::ExecutionError(format!(
+                        "duplicate column '{col_name}' in INSERT"
+                    )));
+                }
+                match schema.index_of(col_name) {
+                    Some(idx) => indices.push(idx),
+                    None => {
+                        return Err(Error::ExecutionError(format!(
+                            "unknown column '{col_name}' in table '{table}'"
+                        )));
                     }
                 }
             }
+            Some(indices)
+        } else {
+            None
+        };
+
+        let mut staged: HashMap<(String, Vec<u8>), StagedWrite> = HashMap::new();
+        for row_exprs in rows {
+            let mut row = if let Some(ref indices) = col_indices {
+                if row_exprs.len() != indices.len() {
+                    return Err(Error::ColumnCountMismatch {
+                        expected: indices.len(),
+                        got: row_exprs.len(),
+                    });
+                }
+                let mut full_row: Vec<Datum> = schema
+                    .columns
+                    .iter()
+                    .map(|c| c.default_value.clone().unwrap_or(Datum::Null))
+                    .collect();
+                for (&idx, e) in indices.iter().zip(row_exprs) {
+                    match e {
+                        Expr::Literal(d) => full_row[idx] = d,
+                        other => {
+                            return Err(Error::NotSupported(format!(
+                                "INSERT values must be literals, got {other:?}"
+                            )))
+                        }
+                    }
+                }
+                full_row
+            } else {
+                let mut row = Vec::with_capacity(row_exprs.len());
+                for e in row_exprs {
+                    match e {
+                        Expr::Literal(d) => row.push(d),
+                        other => {
+                            return Err(Error::NotSupported(format!(
+                                "INSERT values must be literals, got {other:?}"
+                            )))
+                        }
+                    }
+                }
+                row
+            };
             // Fill AUTO_INCREMENT (NULL trigger) before validation, so NULL
             // never reaches the NOT NULL check on the key column.
             table_arc.assign_auto_inc(&mut row)?;
@@ -214,11 +266,11 @@ impl Database {
             }
             self.record_install(table, &key, Some(&enc), commit_epoch)?;
             table.apply_raw(&key, &enc)?;
+            self.visible_epoch.store(commit_epoch, std::sync::atomic::Ordering::SeqCst);
             if let Some(ref observer) = *self.commit_observer.read().unwrap() {
                 let decoded_row = table.decode_stored(&enc).ok();
                 observer(commit_epoch, &[(table_name.to_string(), key.clone(), decoded_row)]);
             }
-            self.visible_epoch.store(commit_epoch, std::sync::atomic::Ordering::SeqCst);
             if let Ok(mut vs) = self.versions.write() {
                 vs.gc_locked();
             }

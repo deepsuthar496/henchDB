@@ -305,7 +305,7 @@ pub(crate) fn enforce(db: &Database, session: &Session, stmt: &Statement) -> Res
             Ok(())
         }
         Statement::CreateTable { name, .. } => require_db_or_table(db, session, name, Privilege::Create),
-        Statement::DropTable { name } => require_db_or_table(db, session, name, Privilege::Drop),
+        Statement::DropTable { name, .. } => require_db_or_table(db, session, name, Privilege::Drop),
         Statement::CreateIndex { table, .. } => {
             require_db_or_table(db, session, table, Privilege::Create)
         }

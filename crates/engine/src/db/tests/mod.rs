@@ -671,3 +671,103 @@ fn show_status_counts_and_filters() {
     assert!(text.contains("btree_splits_total"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_if_exists_ddl_and_noop_commit_rollback() {
+    let dir = std::env::temp_dir().join(format!("hdb_if_exists_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    // 1. MySQL compatibility: COMMIT and ROLLBACK without active txn succeed as no-op
+    assert!(db.execute(&mut s, "COMMIT").is_ok());
+    assert!(db.execute(&mut s, "ROLLBACK").is_ok());
+
+    // 2. Table-level PRIMARY KEY constraint
+    let out = db.execute(&mut s, "CREATE TABLE t_pk (id INT, val TEXT, PRIMARY KEY (id))");
+    assert!(out.is_ok(), "failed table-level PK: {out:?}");
+
+    // 3. CREATE TABLE IF NOT EXISTS
+    let out = db.execute(&mut s, "CREATE TABLE IF NOT EXISTS t_pk (id INT PRIMARY KEY, val TEXT)");
+    assert!(out.is_ok());
+    assert!(out.unwrap().message.contains("exists"));
+
+    // 4. CREATE INDEX IF NOT EXISTS
+    assert!(db.execute(&mut s, "CREATE INDEX IF NOT EXISTS idx_val ON t_pk (val)").is_ok());
+    let out = db.execute(&mut s, "CREATE INDEX IF NOT EXISTS idx_val ON t_pk (val)");
+    assert!(out.is_ok());
+    assert!(out.unwrap().message.contains("exists"));
+
+    // 5. DROP INDEX IF EXISTS
+    assert!(db.execute(&mut s, "DROP INDEX IF EXISTS idx_val ON t_pk").is_ok());
+    assert!(db.execute(&mut s, "DROP INDEX IF EXISTS idx_val ON t_pk").is_ok());
+    assert!(db.execute(&mut s, "DROP INDEX IF EXISTS non_existent ON non_existent_table").is_ok());
+
+    // 6. DROP TABLE IF EXISTS
+    assert!(db.execute(&mut s, "DROP TABLE IF EXISTS t_pk").is_ok());
+    assert!(db.execute(&mut s, "DROP TABLE IF EXISTS t_pk").is_ok());
+    assert!(db.execute(&mut s, "DROP TABLE IF EXISTS non_existent_tbl").is_ok());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_collist_insert_pg_tables_and_show_engine() {
+    let dir = std::env::temp_dir().join(format!("hdb_dml_pg_show_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    // 1. Column-list INSERT
+    db.execute(&mut s, "CREATE TABLE users (id INT PRIMARY KEY, username TEXT, points INT DEFAULT 50)").unwrap();
+
+    // Normal column-list insert
+    let res = db.execute(&mut s, "INSERT INTO users (id, username, points) VALUES (1, 'alice', 100)");
+    assert!(res.is_ok(), "failed collist insert: {res:?}");
+
+    // Reordered column list
+    let res = db.execute(&mut s, "INSERT INTO users (username, points, id) VALUES ('bob', 200, 2)");
+    assert!(res.is_ok(), "failed reordered insert: {res:?}");
+
+    // Subset with default value
+    let res = db.execute(&mut s, "INSERT INTO users (id, username) VALUES (3, 'charlie')");
+    assert!(res.is_ok(), "failed subset insert: {res:?}");
+
+    // Check rows
+    let out = db.execute(&mut s, "SELECT id, username, points FROM users ORDER BY id ASC").unwrap();
+    assert_eq!(out.rows.len(), 3);
+    assert_eq!(out.rows[0], vec![Datum::Int(1), Datum::Text("alice".into()), Datum::Int(100)]);
+    assert_eq!(out.rows[1], vec![Datum::Int(2), Datum::Text("bob".into()), Datum::Int(200)]);
+    assert_eq!(out.rows[2], vec![Datum::Int(3), Datum::Text("charlie".into()), Datum::Int(50)]);
+
+    // Column count mismatch error
+    let res = db.execute(&mut s, "INSERT INTO users (id, username) VALUES (4, 'david', 300)");
+    assert!(res.is_err());
+
+    // Unknown column error
+    let res = db.execute(&mut s, "INSERT INTO users (id, unknown_col) VALUES (5, 'bad')");
+    assert!(res.is_err());
+
+    // 2. pg_catalog.pg_tables and pg_tables
+    let out1 = db.execute(&mut s, "SELECT tablename, schemaname, hasindexes FROM pg_catalog.pg_tables").unwrap();
+    assert!(!out1.rows.is_empty(), "pg_catalog.pg_tables should list tables");
+    assert_eq!(out1.rows[0][0], Datum::Text("users".into()));
+    assert_eq!(out1.rows[0][1], Datum::Text("public".into()));
+    assert_eq!(out1.rows[0][2], Datum::Bool(true));
+
+    let out2 = db.execute(&mut s, "SELECT tablename FROM pg_tables").unwrap();
+    assert_eq!(out2.rows.len(), out1.rows.len());
+
+    // 3. SHOW ENGINE / SHOW ENGINES
+    let out_se = db.execute(&mut s, "SHOW ENGINE").unwrap();
+    assert_eq!(out_se.columns, vec!["Type", "Name", "Status"]);
+    let out_ses = db.execute(&mut s, "SHOW ENGINES").unwrap();
+    assert_eq!(out_ses.columns, vec!["Type", "Name", "Status"]);
+
+    // 4. SHOW PROCESSLIST
+    let out_pl = db.execute(&mut s, "SHOW PROCESSLIST").unwrap();
+    assert_eq!(out_pl.columns, vec!["Id", "User", "Host", "db", "Command", "Time", "State", "Info"]);
+    assert!(out_pl.rows.is_empty());
+
+    let _ = fs::remove_dir_all(&dir);
+}

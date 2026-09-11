@@ -297,12 +297,15 @@ pub enum Statement {
         name: String,
         columns: Vec<ColumnSpec>,
         foreign_keys: Vec<ForeignKeySpec>,
+        if_not_exists: bool,
     },
     DropTable {
         name: String,
+        if_exists: bool,
     },
     Insert {
         table: String,
+        columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     },
     Select {
@@ -354,10 +357,12 @@ pub enum Statement {
         name: String,
         table: String,
         column: String,
+        if_not_exists: bool,
     },
     DropIndex {
         name: String,
         table: String,
+        if_exists: bool,
     },
     SetVariable {
         name: String,

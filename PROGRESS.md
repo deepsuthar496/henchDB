@@ -766,10 +766,68 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 * **Evidence**: **375/375 tests green** (269 engine + 106 server); automated release gate 13/13 passed; `cargo check --release` 100% clean.
 * **Effort**: High.
 
+### 2026-09-11 — MySQL & ORM Compatibility (No-Op COMMIT/ROLLBACK, IF [NOT] EXISTS, Table PK), CLI Help Safety & USAGE Guide
+* **Context**:
+  Address AI test suite feedback and real-world client driver / ORM compatibility issues:
+  1. MySQL compatibility: `COMMIT` and `ROLLBACK` outside active transaction must return no-op success instead of error 1105 (`no active transaction`), fixing pymysql, SQLAlchemy, and ORMs.
+  2. DDL enhancements: Support `IF NOT EXISTS` / `IF EXISTS` on `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`, plus table-level `PRIMARY KEY (col)` constraints.
+  3. CLI safety: Subcommands (`bench`, `dump`, `passwd`, `serve`, etc.) must respond to `--help` cleanly without side effects; root binary must reject unknown flags with exit code 2 rather than launching the REPL.
+  4. Complete documentation: Publish [`docs/USAGE.md`](docs/USAGE.md) covering deployment, configuration, drivers, SQL reference, and operations.
+* **Delivered**:
+  - **No-Op Autocommit COMMIT / ROLLBACK** (`crates/engine/src/db/mod.rs`):
+    - When `session.txn` is `None`, `COMMIT` and `ROLLBACK` cleanly end any open statement snapshot and return `Ok(Output::ok("COMMIT"))` / `Ok(Output::ok("ROLLBACK"))`.
+    - Eliminates error 1105 for connection pools and ORMs (e.g. SQLAlchemy, pymysql) that issue precautionary commits/rollbacks upon connection checkout/checkin.
+  - **DDL Syntax Extensions** (`crates/engine/src/sql/ast.rs`, `crates/engine/src/sql/parser.rs`, `crates/engine/src/table.rs`, `crates/engine/src/db/ddl.rs`, `crates/engine/src/db/mod.rs`, `crates/engine/src/db/privilege.rs`):
+    - Supported `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF EXISTS` (no-op success if table exists/does not exist).
+    - Supported `CREATE INDEX IF NOT EXISTS` and `DROP INDEX IF EXISTS`.
+    - Supported table-level `PRIMARY KEY (col)` and `CONSTRAINT <name> PRIMARY KEY (col)` syntax in `CREATE TABLE`.
+    - Added comprehensive parser and execution tests in `crates/engine/src/sql/tests.rs` and `crates/engine/src/db/tests/mod.rs`.
+  - **CLI Help Subsystem & Flag Validation** (`crates/server/src/help.rs`, `crates/server/src/main.rs`):
+    - Modularized CLI help into `crates/server/src/help.rs` (`print_root_help()`, `print_subcommand_help()`).
+    - Early interception of `--help` and `-h` across all subcommands (`serve`, `bench`, `dump`, `passwd`, `gcbench`, `restore`, `promote`, `check`, `benchmock`), preventing unintended benchmark execution, dump file creation, or missing-flag errors.
+    - Root binary flag validator: unknown flags (e.g. `server.exe --badflag`) print error usage and exit with code 2.
+  - **Comprehensive Production & User Guide** ([`docs/USAGE.md`](docs/USAGE.md)):
+    - Documented single-binary portable deployment, directory layout, network port defaults (3307 MySQL, 5432 PG, 9090 Prometheus).
+    - Added driver connection guides and copy-paste code snippets for MySQL CLI, pymysql, SQLAlchemy, psql, pg8000.
+    - Documented complete SQL syntax, transaction lifecycle, RBAC, replication, backups, and observability endpoints.
+  - All source files strictly comply with the $\le 1,500$ line ceiling rule (`parser.rs` at 1,405 lines, `db/mod.rs` at 1,376 lines, `server/main.rs` at 1,440 lines). Engine remains 100% `std`-only.
+* **Evidence**: **377/377 tests green** (271 engine + 106 server); `cargo build --release` 100% clean; verified CLI `--help` and flag handling live.
+* **Effort**: Medium.
+
+---
+
+### 2026-09-11 — Column-List INSERT Support, pg_catalog.pg_tables System View, SHOW ENGINE/PROCESSLIST Compatibility & Documentation Synchronization
+* **Context**:
+  Address test validation feedback and documentation reconciliation:
+  1. Column-list INSERT: `INSERT INTO <table> (<col1>, <col2>, ...) VALUES (...)` failed with parse error expecting `VALUES`. Users and ORMs require specifying column subsets and custom column orderings with default-filling.
+  2. Missing `pg_catalog.pg_tables`: Introspection queries for `pg_tables` failed with relation not found.
+  3. `SHOW ENGINE`: Executing `SHOW ENGINE` or `SHOW ENGINES` failed requiring `STATUS`.
+  4. `SHOW PROCESSLIST`: Table header rendering was skipped when row list was empty.
+  5. Documentation & CLI synchronization: Fix port defaults (metrics port 9100, repl port 3308), add `gcbench`/`clientbench` to main help, and sync on-disk file layout (`snapshot.bin`, `wal.log`, `pages.bin`, `auth.bin`).
+  6. Clean `DROP TABLE IF EXISTS`: Return clean `DROP TABLE` without noisy "table does not exist" message.
+* **Delivered**:
+  - **Column-List INSERT Support** (`crates/engine/src/sql/ast.rs`, `crates/engine/src/sql/parser.rs`, `crates/engine/src/db/dml.rs`, `crates/engine/src/db/mod.rs`):
+    - Added `columns: Option<Vec<String>>` to `Statement::Insert` AST and parsed optional `(col1, col2, ...)` before `VALUES`.
+    - In `exec_insert`, mapped values to table schema indices by name, filling omitted columns with default values / NULL, validating types, nullability, auto-increments, and detecting duplicate or unknown columns.
+  - **`pg_catalog.pg_tables` & `pg_tables` Virtual System View** (`crates/engine/src/db/sysviews.rs`):
+    - Added `SysView::PgTables` exposing `schemaname`, `tablename`, `tableowner`, `tablespace`, `hasindexes`, `hasrules`, `hastriggers`, `rowsecurity`.
+    - Enabled bare view resolution so both `SELECT * FROM pg_catalog.pg_tables` and `SELECT * FROM pg_tables` succeed seamlessly.
+  - **`SHOW ENGINE` / `SHOW ENGINES` Grammar** (`crates/engine/src/sql/parser.rs`):
+    - Supported `SHOW ENGINE`, `SHOW ENGINES`, `SHOW ENGINE STATUS`, and `SHOW ENGINE INNODB STATUS`.
+  - **`SHOW PROCESSLIST` & Empty Table Formatting** (`crates/engine/src/db/diag.rs`, `crates/server/src/main.rs`):
+    - Fixed `print_output` and `format_output` to retain column headers even when row sets are empty.
+  - **Clean `DROP TABLE / INDEX IF EXISTS`** (`crates/engine/src/db/ddl.rs`):
+    - Returns clean `Output::ok("DROP TABLE")` / `Output::ok("DROP INDEX")` when relations do not exist.
+  - **CLI Help & USAGE.md Synchronization** (`crates/server/src/help.rs`, `crates/server/src/main.rs`, `docs/USAGE.md`):
+    - Included `gcbench` and `clientbench` with full help formatters.
+    - Synchronized all default ports (MySQL: 3307, PostgreSQL: 5432, Metrics: 9100, Replication: 3308) and on-disk files (`snapshot.bin`, `wal.log`, `pages.bin`, `auth.bin`).
+* **Evidence**: **378/378 tests green** (272 engine + 106 server); `cargo build --release` 100% clean; verified live through interactive CLI shell.
+* **Effort**: Medium.
+
 ---
 
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**375 tests: 269 engine + 106 server** as of this writing).
+1. `cargo test` — all green (**378 tests: 272 engine + 106 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.
