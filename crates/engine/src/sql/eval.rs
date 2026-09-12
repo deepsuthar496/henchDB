@@ -64,6 +64,23 @@ pub fn eval_with(expr: &Expr, resolve: &mut dyn FnMut(&str) -> Result<Datum>) ->
             let matched = like_match(&text, pattern);
             Ok(if *negated { !matched } else { matched })
         }
+        Expr::Column(name) => {
+            let d = resolve(name)?;
+            match d {
+                Datum::Bool(b) => Ok(b),
+                Datum::Int(i) => Ok(i != 0),
+                Datum::Float(f) => Ok(f != 0.0),
+                Datum::Null => Ok(false),
+                _ => Ok(false),
+            }
+        }
+        Expr::Literal(d) => match d {
+            Datum::Bool(b) => Ok(*b),
+            Datum::Int(i) => Ok(*i != 0),
+            Datum::Float(f) => Ok(*f != 0.0),
+            Datum::Null => Ok(false),
+            _ => Ok(false),
+        },
         other => Err(Error::NotSupported(format!(
             "cannot evaluate {other:?} as a predicate"
         ))),
@@ -129,8 +146,12 @@ pub fn like_match(text: &str, pattern: &str) -> bool {
     go(&t, &p, &mut HashMap::new(), 0, 0)
 }
 
-pub(crate) fn coerce_pair(l: Datum, r: Datum) -> (Datum, Datum) {
+pub fn coerce_pair(l: Datum, r: Datum) -> (Datum, Datum) {
     match (l, r) {
+        (Datum::Bool(b), Datum::Int(i)) => (Datum::Int(if b { 1 } else { 0 }), Datum::Int(i)),
+        (Datum::Int(i), Datum::Bool(b)) => (Datum::Int(i), Datum::Int(if b { 1 } else { 0 })),
+        (Datum::Bool(b), Datum::Float(f)) => (Datum::Float(if b { 1.0 } else { 0.0 }), Datum::Float(f)),
+        (Datum::Float(f), Datum::Bool(b)) => (Datum::Float(f), Datum::Float(if b { 1.0 } else { 0.0 })),
         (Datum::Int(a), Datum::Float(b)) => (Datum::Float(a as f64), Datum::Float(b)),
         (Datum::Float(a), Datum::Int(b)) => (Datum::Float(a), Datum::Float(b as f64)),
         (Datum::DateTime(a), Datum::Text(b)) => {

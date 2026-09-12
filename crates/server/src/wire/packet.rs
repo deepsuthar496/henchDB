@@ -198,17 +198,21 @@ pub fn frame_payload(payload: &[u8], seq: u8) -> Vec<u8> {
 // OK / ERR / EOF
 // ---------------------------------------------------------------------------
 
-pub fn ok_payload(affected: u64, message: &str) -> Vec<u8> {
+pub fn ok_payload_with_status(affected: u64, message: &str, status: u16) -> Vec<u8> {
     let mut p = Vec::with_capacity(16 + message.len());
     p.push(0x00);
     enc_lenenc_int(&mut p, affected);
     enc_lenenc_int(&mut p, 0); // last insert id
-    p.extend_from_slice(&STATUS_AUTOCOMMIT.to_le_bytes());
+    p.extend_from_slice(&status.to_le_bytes());
     p.extend_from_slice(&0u16.to_le_bytes());
     if !message.is_empty() {
         p.extend_from_slice(message.as_bytes());
     }
     p
+}
+
+pub fn ok_payload(affected: u64, message: &str) -> Vec<u8> {
+    ok_payload_with_status(affected, message, STATUS_AUTOCOMMIT)
 }
 
 pub fn err_payload(code: u16, sqlstate: &str, message: &str) -> Vec<u8> {
@@ -225,8 +229,14 @@ pub fn err_payload(code: u16, sqlstate: &str, message: &str) -> Vec<u8> {
     p
 }
 
+pub fn eof_payload_with_status(status: u16) -> Vec<u8> {
+    let mut p = vec![0xFE, 0x00, 0x00];
+    p.extend_from_slice(&status.to_le_bytes());
+    p
+}
+
 pub fn eof_payload() -> Vec<u8> {
-    vec![0xFE, 0x00, 0x00, 0x02, 0x00]
+    eof_payload_with_status(STATUS_AUTOCOMMIT)
 }
 
 pub fn mysql_error_for(e: &engine::Error) -> (u16, &'static str) {

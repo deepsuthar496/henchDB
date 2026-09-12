@@ -43,6 +43,7 @@ pub(crate) mod dml;
 pub(crate) mod explain;
 pub(crate) mod fk;
 pub(crate) mod join;
+pub(crate) mod lock;
 pub(crate) mod memo;
 pub(crate) mod mvcc;
 pub(crate) mod plan;
@@ -100,6 +101,7 @@ pub struct Session {
     /// row frames, uncorrelated fold cache). Per-statement scope: cleared
     /// at the top of `execute`, managed by `db/subquery.rs`.
     pub(crate) subq: subquery::SubqueryState,
+    pub autocommit: bool,
 }
 
 impl Session {
@@ -124,6 +126,7 @@ impl Default for Session {
             snapshot: None,
             mem_tracker: QueryMemoryTracker::default(),
             subq: subquery::SubqueryState::default(),
+            autocommit: true,
         }
     }
 }
@@ -190,6 +193,8 @@ pub struct Database {
     pub(crate) max_snapshot_age_ms: AtomicU64,
     /// Atomic commit observer for differential testing and external publication.
     pub(crate) commit_observer: RwLock<Option<CommitObserver>>,
+    /// Process-level directory lock guard (server.lock).
+    pub(crate) _dir_lock: Option<lock::DirLock>,
 }
 
 /// Callback invoked immediately prior to `visible_epoch` publication during commit install.
@@ -242,6 +247,8 @@ impl Database {
     pub fn open(dir: &Path) -> Result<Database> {
         let t0 = std::time::Instant::now();
         fs::create_dir_all(dir)?;
+        let dir_lock = lock::acquire_dir_lock(dir)?;
+        lock::sweep_tmp_files(dir);
         let epoch = crate::epoch::EpochManager::new();
         let pool = Arc::new(BufferPool::open(&dir.join("pages.bin"), DEFAULT_POOL_FRAMES, epoch.clone())?);
         let wal = Wal::open(&dir.join("wal.log"))?;
@@ -322,6 +329,7 @@ impl Database {
             privs: RwLock::new(privilege::PrivilegeStore::default()),
             max_snapshot_age_ms: AtomicU64::new(0),
             commit_observer: RwLock::new(None),
+            _dir_lock: Some(dir_lock),
         })
     }
 
@@ -731,7 +739,33 @@ impl Database {
                     stats.databases, stats.tables, stats.rows, stats.bytes_written
                 )))
             }
+            Statement::Archive { dir } => {
+                let meta = self.archive_now(dir.as_deref().map(std::path::Path::new))?;
+                match meta {
+                    Some(m) => Ok(Output::ok(format!(
+                        "archived segment {} (offsets {}..{})",
+                        m.index, m.start_offset, m.end_offset
+                    ))),
+                    None => Ok(Output::ok("nothing to archive")),
+                }
+            }
             Statement::SetVariable { name, value } => {
+                let norm = name.trim_start_matches('@').to_ascii_lowercase();
+                if norm == "autocommit" || norm == "session.autocommit" || norm == "global.autocommit" {
+                    let enabled = match &value {
+                        Datum::Int(n) => *n != 0,
+                        Datum::Bool(b) => *b,
+                        Datum::Text(s) => matches!(s.to_ascii_uppercase().as_str(), "1" | "ON" | "TRUE"),
+                        _ => false,
+                    };
+                    if enabled && !session.autocommit {
+                        if let Some(txn) = session.txn.take() {
+                            self.metrics.txn_end();
+                            self.commit_txn(txn.id, txn.staged)?;
+                        }
+                    }
+                    session.autocommit = enabled;
+                }
                 if name.eq_ignore_ascii_case("transaction_isolation")
                     || name.eq_ignore_ascii_case("tx_isolation")
                 {
@@ -958,7 +992,7 @@ impl Database {
     /// run it through the install sequencer so WAL offsets stay contiguous
     /// from the sequencer's point of view. Used by DDL, whose "install" is
     /// the catalog update that already happened.
-    fn wal_commit(&self, records: Vec<Record>) -> Result<()> {
+    pub(crate) fn wal_commit(&self, records: Vec<Record>) -> Result<()> {
         let (start, end, n) = {
             let _guard = self.acquire_commit_lock();
             // DDL builds its Commit without a timestamp; stamp it here so
@@ -997,6 +1031,12 @@ impl Database {
         _table: &str,
         staged: HashMap<(String, Vec<u8>), StagedWrite>,
     ) -> Result<()> {
+        if !session.autocommit && session.txn.is_none() {
+            let id = self.next_txn.fetch_add(1, Ordering::Relaxed);
+            session.txn = Some(ActiveTxn { id, staged });
+            self.metrics.txn_begin();
+            return Ok(());
+        }
         match &mut session.txn {
             Some(txn) => {
                 txn.staged.extend(staged);
@@ -1131,7 +1171,6 @@ impl Database {
                     crate::failpoint!("during_multirow_install");
                 }
             }
-            self.visible_epoch.store(commit_epoch, Ordering::SeqCst);
             if let Some(ref observer) = *self.commit_observer.read().unwrap() {
                 let mut items = Vec::with_capacity(staged.len());
                 for ((table, key), w) in &staged {
@@ -1139,6 +1178,7 @@ impl Database {
                 }
                 observer(commit_epoch, &items);
             }
+            self.visible_epoch.store(commit_epoch, Ordering::SeqCst);
             if let Ok(mut vs) = self.versions.write() {
                 vs.gc_locked();
             }
@@ -1408,9 +1448,7 @@ fn apply_records(
 ) -> Result<()> {
     for rec in batch {
         match rec {
-            Record::CreateDatabase { name, .. } => {
-                databases.insert(name);
-            }
+            Record::CreateDatabase { name, .. } => { databases.insert(name); }
             Record::DropDatabase { name, .. } => {
                 databases.remove(&name);
                 let prefix = format!("{name}.");
@@ -1424,28 +1462,18 @@ fn apply_records(
                     tables.insert(t.def.name.clone(), t);
                 }
             }
-            Record::DropTable { name, .. } => {
-                tables.remove(&name);
-            }
+            Record::DropTable { name, .. } => { tables.remove(&name); }
             Record::Put { table, key, row, .. } => {
-                if let Some(t) = tables.get(&table) {
-                    t.apply_raw(&key, &row)?;
-                }
+                if let Some(t) = tables.get(&table) { t.apply_raw(&key, &row)?; }
             }
             Record::Delete { table, key, .. } => {
-                if let Some(t) = tables.get(&table) {
-                    t.remove_raw(&key);
-                }
+                if let Some(t) = tables.get(&table) { t.remove_raw(&key); }
             }
             Record::CreateIndex { table, name, column, .. } => {
-                if let Some(t) = tables.get(&table) {
-                    let _ = t.add_index(name, column);
-                }
+                if let Some(t) = tables.get(&table) { let _ = t.add_index(name, column); }
             }
             Record::DropIndex { table, name, .. } => {
-                if let Some(t) = tables.get(&table) {
-                    let _ = t.drop_index(&name);
-                }
+                if let Some(t) = tables.get(&table) { let _ = t.drop_index(&name); }
             }
             Record::Commit { .. } => {}
         }

@@ -288,6 +288,7 @@ python bench_strict.py 3
 | 2026-09-09 | **Priority 18: Direct Raw-to-Columnar Storage Sourcing & Zero-Allocation Batch Scans** (`db/batch.rs`, `btree.rs`, `db/tests/batch.rs`, `wal/shard.rs`): (1) **Zero-Allocation Direct Decoding**: added `push_raw_row` in `ColumnBatch` decoding row bytes from slotted pages / B+ tree leaves directly into typed columnar buffers (I64, F64, Bool, DateTime, packed String with chunked offsets) with zero intermediate `Vec<Datum>` or `Datum::Text(String)` allocations; unprojected columns skipped in O(1) by raw wire offset inspection without decoding or memory copies; (2) **Zero-Copy Leaf Scan Streaming**: implemented `BTree::scan_leaves<F>` walking B+ tree leaves via optimistic lock coupling (OLC) version validation and epoch-based reclamation (`pin_op`), streaming `(&keys, &vals)` leaf-by-leaf without materializing tree nodes or copying keys; (3) **Seamless Transaction & Snapshot Isolation Parity**: `scan_batch_morsels` checks for staged uncommitted writes (transaction overlay) or active MVCC snapshots; when active, transparently falls back to `visible_rows` via `push_datum_row`, ensuring 100% semantic parity with all transactional and snapshot isolation guarantees; in autocommit scans, executes direct raw leaf streaming; (4) **1,500-Line Ceiling Rule & Zero-Dependency Invariant**: `db/batch.rs` (1,443 lines) and `btree.rs` (1,235 lines) remain strictly under the 1,500-line ceiling, `engine` remains std-only; (5) **Tests** (+3): parity test against scalar decode across all types/nulls, 2,500-row multi-morsel raw batch scan verifying global & grouped aggregates across multiple B+ tree leaves, and concurrent snapshot isolation regression test | 269/269 green (185 engine + 84 server), release zero warnings |
 | 2026-09-09 | **Priority 19: Cascades Memo Query Optimizer & Equivalence Classes** (`db/memo.rs`, `db/explain.rs`, `sql/{ast,parser,tests}.rs`, `db/tests/memo.rs`): (1) **Memo Architecture**: Memo container with Equivalence Classes (`Group`) and logical operator deduplication (`LogicalOp`) via hash-consing; logical property derivation (`LogicalProperties`: cardinality, schemas, output columns); (2) **Transformation Rules**: Join Commutativity ($A \bowtie B \equiv B \bowtie A$), Join Associativity ($(A \bowtie B) \bowtie C \equiv A \bowtie (B \bowtie C)$), Predicate Pushdown through Inner Joins (decomposing WHERE conjunctions and routing single-table filters to child groups while preserving residual join predicates); (3) **Implementation Rules**: TableScan, IndexScan (PK point/range/IN, secondary seek/IN), Vectorized BatchScan (`ColumnBatch`), HashJoin (costing Left vs Right build by cardinality), NestedLoopJoin, BatchAggregate, ScalarAggregate; (4) **Branch-and-Bound Cost Search**: Cost-limited search pruning suboptimal subtrees early, with bounded recursion depth protecting OLTP latency; best physical plan extraction (`extract_best_plan`) and formatted tree display (`format_tree`); (5) **SQL Integration**: `EXPLAIN MEMO SELECT ...` statement parsed and executed, rendering physical plan trees and memo metrics; (6) **Tests** (+6): group deduplication, commutativity, associativity, predicate pushdown, hash join build selection, and SQL explain memo integration | 275/275 green (191 engine + 84 server), release zero warnings |
 | 2026-09-09 | **Priority 20: MVCC Multi-Version Snapshot Isolation & Version Buffers** (`db/mvcc.rs`, `db/{mod,dml}.rs`, `sql/{ast,parser,tests}.rs`, `db/tests/mvcc.rs`): (1) **Isolation Levels & SQL**: `IsolationLevel` (`ReadCommitted`, `RepeatableRead` [default], `Serializable`); `BEGIN [TRANSACTION] [ISOLATION LEVEL ...]`, `START TRANSACTION [ISOLATION LEVEL ...] [WITH CONSISTENT SNAPSHOT] [READ ONLY|READ WRITE]`; `SET [SESSION|GLOBAL] TRANSACTION ISOLATION LEVEL ...` and `SET [SESSION] transaction_isolation / tx_isolation = '...'`; (2) **MVCC Version Buffer**: In-memory version chains (`Chain`) supporting lock-free time-travel lookups without blocking concurrent writers or snapshot readers; (3) **Multi-Version Snapshot Isolation**: `RepeatableRead` transactions automatically pin a snapshot on first read (`SELECT`); `ReadCommitted` creates statement-scoped snapshots (`snapshot_pin_statement` / `snapshot_end_statement`) observing only commits finalized before statement execution; (4) **Atomic Multi-Row Commit Visibility**: `visible_epoch: AtomicU64` advanced only after Phase C finishes installing all rows into the B+ tree; `record_commit_batch` records multi-row writes under a single version buffer write lock; eliminating partial commit visibility; (5) **Zero-Cost Aborts & Safe GC**: Instant aborts discard uncommitted staged writes; `gc_locked` prunes historical versions to zero memory when active snapshots complete; (6) **1,500-Line Ceiling Rule & Zero-Dependency Invariant**: all files <= 1,446 lines, engine strictly `std`-only; (7) **Tests** (+6): default begin repeatable read, atomic multi-row commit visibility, read committed statement-scoped isolation, secondary index time-travel, vectorized batch aggregate snapshot isolation, and session/variable configuration | 281/281 green (197 engine + 84 server), release zero warnings |
+| 2026-09-11 | **MySQL Wire Sequence Synchronization, Multi-Statement Governance, Replica Local WAL Persistence, Session Autocommit Staging, and WAL Archiving SQL Automation** (`crates/server/src/wire/{mod,stmt,packet,constants,canned,tests}.rs`, `crates/server/src/bench.rs`, `crates/server/src/replication/{replica,tests}.rs`, `crates/engine/src/db/{mod,replica,dml}.rs`, `crates/engine/src/sql/{ast,parser}.rs`, `crates/engine/src/archive.rs`, `crates/engine/src/db/tests/txn.rs`): (1) **MySQL Multi-Statement & Sequence Sync**: Enforced capability checks rejecting unnegotiated multi-statement queries with error code 1064; updated packet encoders to set `SERVER_MORE_RESULTS_EXISTS` (0x0008), `STATUS_AUTOCOMMIT` (0x0002), and `SERVER_STATUS_IN_TRANS` (0x0001) until the final statement, eliminating driver desynchronization (`Packet sequence number wrong - got 6 expected 1`); (2) **Replica WAL Durability & Offline Promotion**: Pushed `Commit` records to replica batches and wired `Database::wal_commit` in `apply_replica_batch` so all streamed transactions are appended and fsynced to the replica's local WAL; stopped replicas promoted via `server promote --dir <dir>` recover all data without loss; (3) **Per-Session Autocommit Governance**: Added `Session.autocommit: bool` (default true); parser parses `SET [@@][session.|global.]autocommit = 0/1/ON/OFF/TRUE/FALSE`; when autocommit is false, DML implicitly opens and stages in `ActiveTxn` in memory without writing to WAL until explicit `COMMIT` (or dropping on `ROLLBACK` / disconnect / crash); (4) **Continuous WAL Archiving & `ARCHIVE` SQL**: Implemented `ARCHIVE [TO '<dir>']` SQL statement and `Database::archive_now()`; ensured `wal.wait_durable(wal.next_offset())` syncs WAL to current head before segment emission; formatted archive segment files as `.hdba` while accepting both `.hdba` and `.hdbw` during recovery and replay; (5) **Modularization & Ceiling Compliance**: Extracted server bench subcommands (`bench_gc`, `bench_mock`, `client_bench`) into `crates/server/src/bench.rs` (1,255 lines in `main.rs`, 1,489 in `db/mod.rs`, 1,495 in `parser.rs`), zero external dependencies in `crates/engine`; (6) **Tests** (+4): multi-statement status flags, replica local WAL persistence with offline promotion, session autocommit staging and restart recovery, ARCHIVE SQL command and `.hdba` segment generation | 382/382 green (274 engine + 108 server), `cargo check/build --release` zero warnings |
 
 
 ---
@@ -826,8 +827,78 @@ With v1.0 feature completeness achieved across single-node OLTP, concurrency, du
 
 ---
 
+### 2026-09-11 — Exclusive Process-Level Directory Locking (`server.lock`), Startup Orphan `.tmp` Sweeping & Commit Observer Ordering
+* **Context**:
+  Address multi-process concurrency safety and crash residue cleanup:
+  1. Concurrent embedded access prevention: Prevent concurrent embedded operations (e.g. embedded shell CLI or concurrent embedded CHECKPOINT) against a directory held by a live server instance, avoiding split-brain and races on `snapshot.bin.tmp`.
+  2. Startup temporary file sweep: Ensure orphaned `.tmp` and `.tmp.` files (e.g. `snapshot.bin.tmp`, `snapshot.tmp`, `pages.bin.tmp`) left from abrupt crashes are cleanly swept upon opening the database.
+  3. Commit observer synchronization: Ensure `visible_epoch` publication occurs strictly after the commit observer receives mutations, preventing race conditions with test oracles.
+* **Delivered**:
+  - **Exclusive OS Directory Lock (`server.lock`)** (`crates/engine/src/db/lock.rs`, `crates/engine/src/db/mod.rs`):
+    - Added `DirLock` acquiring exclusive non-shared access to `server.lock` via Windows kernel file sharing mode `share_mode(0)` (with portable fallback for non-Windows platforms).
+    - When a second process attempts to open a locked directory, returns clean `Error::InvalidOperation("directory is locked by a live server process; use wire connection (e.g. wire CHECKPOINT)")`.
+    - Lock handle is held in `Database._dir_lock` and automatically released by the OS upon process drop or abrupt termination (`kill -9`), guaranteeing zero stale lock files preventing restart.
+  - **Startup Temporary File Sweep** (`crates/engine/src/db/lock.rs`, `crates/engine/src/db/mod.rs`):
+    - Added `sweep_tmp_files(dir)` in `Database::open(dir)` scanning directory entries and deleting any `.tmp` or `.tmp.` files left from interrupted checkpoints or writes before loading snapshots or replaying WAL.
+  - **Commit Observer Ordering Alignment** (`crates/engine/src/db/mod.rs`, `crates/engine/src/db/dml.rs`):
+    - Ensured `commit_observer` callback runs immediately prior to `visible_epoch.store(commit_epoch, SeqCst)`.
+  - **Storage Integrity & Concurrency Verification** (`crates/engine/src/db/tests/storage_integrity.rs`):
+    - Added `test_sweep_orphan_tmp_files_on_open` verifying orphan `.tmp` deletion upon open.
+    - Added `test_server_dir_lock_prevents_concurrent_open` verifying exclusive directory locking and second-process rejection.
+* **Evidence**: **384/384 tests green** (276 engine + 108 server); `cargo build --release` 100% clean; zero warnings.
+* **Effort**: Medium.
+
+---
+
+### 2026-09-11 — MySQL Wire Boolean Encoding (0/1 TINYINT) for pymysql & Driver Compatibility
+* **Context**:
+  Querying tables or views with boolean columns (e.g. `SELECT * FROM pg_catalog.pg_tables` with `hasindexes`, `hasrules`, `hastriggers`, `rowsecurity`, or user tables with `BOOL` columns) over the MySQL wire broke Python MySQL drivers (such as `pymysql`) with `ValueError: invalid literal for int() with base 10: 'true'`.
+  - Cause: Result columns containing `Datum::Bool` were inferred as integer `TYPE_LONGLONG` in `result_column_types`, but text protocol rows in `row_payload` formatted `Datum::Bool` as `"true"` / `"false"` via `.to_string()`. Because `pymysql`'s type converter for integer fields parses values via `int(val)`, receiving `"true"` resulted in an immediate `ValueError`.
+* **Delivered**:
+  - **Result Column Type Inference for Booleans** (`crates/server/src/wire/stmt.rs`):
+    - In `result_column_types`, differentiated `has_bool` from `has_int`, correctly inferring `TYPE_TINY` (0x01) for boolean columns while maintaining numeric promotion (promoting to `TYPE_LONGLONG` when mixed with integers, and `TYPE_DOUBLE` when mixed with floats).
+  - **Column Definition Packet Sizing** (`crates/server/src/wire/stmt.rs`):
+    - In `column_def_payload`, set `col_len` to 1 for `TYPE_TINY` columns, matching standard MySQL `TINYINT(1)` / `BOOLEAN` field metadata.
+  - **Text Protocol Row Encoding** (`crates/server/src/wire/stmt.rs`):
+    - In `row_payload`, explicitly formatted `Datum::Bool(b)` as `"1"` if `*b` else `"0"`, conforming to MySQL text wire protocol standards where boolean literals and expressions evaluate to `1` / `0`.
+  - **Binary Protocol Row Fallback** (`crates/server/src/wire/stmt.rs`):
+    - Handled `(Datum::Bool(b), TYPE_VAR_STRING)` in `binary_row_payload` to consistently write `"1"` or `"0"`.
+  - **Verification & Live Driver Testing** (`crates/server/src/wire/tests.rs`):
+    - Added unit tests: `bool_row_encodes_0_and_1_on_mysql_wire`, `column_def_tiny_has_len_1`, `result_column_types_infers_tiny_for_bool`, and `test_pg_tables_bool_wire_encoding`.
+    - Verified live with Python `pymysql` over TCP: `SELECT * FROM pg_catalog.pg_tables` and `SELECT * FROM users` returning clean tuples `(1, 0, 0, 0)` with type code `1` (`FIELD_TYPE.TINY`) without error.
+* **Evidence**: **388/388 tests green** (276 engine + 112 server); `cargo build --release` 100% clean; verified live with `pymysql`.
+* **Effort**: Low–Medium.
+
+### 2026-09-11 — Bool <-> Int Coercion in Equality & WHERE, SELECT 1=1 Evaluation & Batch Filter Coercion
+* **Context**:
+  1. Comparing boolean columns against numeric integers (e.g. `WHERE f = 1`, `WHERE f = 0`, or prepared `f = ?` with `1`/`0`/`True`/`False`) returned empty result sets even when `WHERE f = true` matched. MySQL and client drivers (`pymysql`, ORMs) treat boolean as `TINYINT(1)` and expect `true == 1` and `false == 0`.
+  2. `SELECT 1=1` returned `(('1=1',),)` as a raw text string label rather than evaluating the comparison expression to integer `1`.
+  3. Batch query execution (`crates/engine/src/db/batch.rs`) failed predicate matrix matching against scalar execution when comparing boolean columns with numeric literals (`b = 1`), because vectorized comparison `cmp_pvals` did not coerce `PVal::B` with `PVal::I` / `PVal::F`.
+* **Delivered**:
+  - **`SELECT 1=1` / `1=0` Literal Comparison Evaluation**:
+    - `crates/server/src/wire/canned.rs`: Added expression evaluation in `eval_bare_literal_session` for comparison operators (`=`, `==`, `!=`, `<>`), evaluating operand literals with coercion and returning `Datum::Int(1)` or `Datum::Int(0)`.
+    - `crates/engine/src/sql/parser.rs`: Added literal comparison parsing in `parse_select_body` for `=` and `!=`, emitting `SelectItem::Literal(Datum::Int(1/0))`. Compacted cast arms to maintain line ceiling.
+  - **Bool <-> Int / Numeric Schema Coercion & Normalization**:
+    - `crates/engine/src/types.rs`: Updated `ColumnType::accepts` so `ColumnType::Bool` accepts `Datum::Int`, and numeric types accept `Datum::Bool`.
+    - `crates/engine/src/table.rs`: Updated `validate_row` to normalize `Datum::Int(v)` to `Datum::Bool(v != 0)` for `ColumnType::Bool`, and `Datum::Bool` to `Datum::Int(1/0)` for integer columns.
+    - `crates/engine/src/db/plan.rs`: Updated `coerce_for_col` to coerce integer values to booleans and vice-versa during point/range plan key coercion.
+  - **SQL Evaluator Coercion & Truthiness**:
+    - `crates/engine/src/sql/eval.rs`: Added `(Datum::Bool, Datum::Int)` -> `(Datum::Int, Datum::Int)` and `(Datum::Bool, Datum::Float)` -> `(Datum::Float, Datum::Float)` coercion in `coerce_pair`.
+    - Added truthiness evaluation for `Expr::Column` and `Expr::Literal` in `eval_with` (`WHERE active`, `WHERE NOT active`, `WHERE 1`).
+  - **Vectorized Batch Filter Coercion & Predicates** (`crates/engine/src/db/batch.rs`):
+    - Added `(PVal::B, PVal::I)` and `(PVal::B, PVal::F)` comparison arms in `cmp_pvals` and `in_match`, ensuring vectorized morsel filters match scalar evaluation bit-for-bit.
+    - Added `Expr::Column` and `Expr::Literal` truthiness evaluation in `eval_node`.
+  - **Verification & Test Coverage**:
+    - Added comprehensive engine tests in `crates/engine/src/db/tests/mod.rs` covering `WHERE f = 1`, `WHERE f = 0`, `WHERE f = true`, `WHERE f = false`, `WHERE active` truthiness, and `SELECT 1=1`, `SELECT 1=0`.
+    - Added wire-level prepared statement tests in `crates/server/src/wire/tests.rs` for `f = ?` with `1`, `0`, `true`, `false`.
+    - Verified all 277 engine tests and 112 server tests pass green.
+* **Evidence**: **389/389 tests green** (277 engine + 112 server); `cargo build --release` zero warnings; live pymysql tests verified.
+* **Effort**: Low–Medium.
+
+---
+
 ### Verification Checklist for Any Future Changes
-1. `cargo test` — all green (**378 tests: 272 engine + 106 server** as of this writing).
+1. `cargo test` — all green (**389 tests: 277 engine + 112 server** as of this writing).
 2. `cargo build --release` with **zero warnings**.
 3. Respect the **1,500-line file ceiling rule** (`AGENTS.md` §9).
 4. Run `bench_strict.py` (50,000 rows, 1c & 8c) to verify no throughput regression.

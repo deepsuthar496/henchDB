@@ -130,6 +130,23 @@ fn null_row_encodes_fb() {
 }
 
 #[test]
+fn bool_row_encodes_0_and_1_on_mysql_wire() {
+    let p = row_payload(&[Datum::Bool(true), Datum::Bool(false)]);
+    // Each lenenc string is 1 byte length prefix (1) followed by '1' or '0'
+    assert_eq!(p, vec![1, b'1', 1, b'0']);
+}
+
+#[test]
+fn column_def_tiny_has_len_1() {
+    let p = column_def_payload("hasindexes", TYPE_TINY);
+    assert!(p.windows(10).any(|w| w == b"hasindexes"));
+    // Layout from end: filler (2B), decimals (1B), flags (2B), col_type (1B), col_len (4B)
+    assert_eq!(p[p.len() - 6], TYPE_TINY);
+    let len_bytes = &p[p.len() - 10..p.len() - 6];
+    assert_eq!(u32::from_le_bytes(len_bytes.try_into().unwrap()), 1);
+}
+
+#[test]
 fn canned_setup_statements() {
     assert!(canned_output("SET NAMES utf8mb4").unwrap().columns.is_empty());
     assert!(canned_output("USE main").unwrap().columns.is_empty());
@@ -143,6 +160,13 @@ fn canned_select_at_and_bare() {
     let o = canned_output("SELECT @@version").unwrap();
     assert_eq!(o.rows.len(), 1);
     let o = canned_output("SELECT 1").unwrap();
+    assert_eq!(o.rows[0][0], Datum::Int(1));
+    let o = canned_output("SELECT 1=1").unwrap();
+    assert_eq!(o.rows[0][0], Datum::Int(1));
+    assert_eq!(o.columns[0], "1=1");
+    let o = canned_output("SELECT 1 = 0").unwrap();
+    assert_eq!(o.rows[0][0], Datum::Int(0));
+    let o = canned_output("SELECT 1 != 0").unwrap();
     assert_eq!(o.rows[0][0], Datum::Int(1));
     let o = canned_output("SELECT 'hi', NULL, 2.5").unwrap();
     assert_eq!(o.rows[0][0], Datum::Text("hi".into()));
@@ -325,6 +349,22 @@ fn numeric_promotion_infers_double() {
         message: "OK".into(),
     };
     assert_eq!(result_column_types(&out), vec![TYPE_DOUBLE]);
+}
+
+#[test]
+fn result_column_types_infers_tiny_for_bool() {
+    let out = Output {
+        columns: vec!["hasindexes".into(), "hasrules".into(), "mixed_int".into(), "mixed_float".into()],
+        rows: vec![
+            vec![Datum::Bool(true), Datum::Bool(false), Datum::Bool(true), Datum::Bool(false)],
+            vec![Datum::Bool(false), Datum::Null, Datum::Int(42), Datum::Float(3.14)],
+        ],
+        message: "OK".into(),
+    };
+    assert_eq!(
+        result_column_types(&out),
+        vec![TYPE_TINY, TYPE_TINY, TYPE_LONGLONG, TYPE_DOUBLE]
+    );
 }
 
 #[test]
@@ -666,4 +706,78 @@ fn mysql_establish_auth_switch_roundtrip() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_multi_statements_more_results_flag_and_split() {
+    use super::canned::split_statements;
+    use super::stmt::write_output;
+    use super::constants::SERVER_MORE_RESULTS_EXISTS;
+    use engine::Output;
+
+    let batch = split_statements("INSERT INTO t VALUES (1); SELECT 2;");
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0], "INSERT INTO t VALUES (1)");
+    assert_eq!(batch[1], "SELECT 2");
+
+    // Verify write_output with more_results sets SERVER_MORE_RESULTS_EXISTS bit
+    let mut buf = Vec::new();
+    let mut seq = 0u8;
+    let ok_out = Output {
+        columns: vec![],
+        rows: vec![],
+        message: "1 row inserted".into(),
+    };
+    write_output(&mut buf, &mut seq, &ok_out, true, false, true, false, true).unwrap();
+
+    // Packet format: [3 len][1 seq][1 0x00 OK][affected][last_insert_id][2 status]
+    assert_eq!(buf[4], 0x00); // OK header
+    // status is at bytes 7..9 for affected=1, insert_id=0 (lenenc ints: 1 byte each)
+    let status = u16::from_le_bytes([buf[7], buf[8]]);
+    assert_ne!(status & SERVER_MORE_RESULTS_EXISTS, 0);
+
+    // Final statement: more_results = false
+    buf.clear();
+    seq = 0;
+    write_output(&mut buf, &mut seq, &ok_out, true, false, false, false, true).unwrap();
+    let status_last = u16::from_le_bytes([buf[7], buf[8]]);
+    assert_eq!(status_last & SERVER_MORE_RESULTS_EXISTS, 0);
+}
+
+#[test]
+fn test_pg_tables_bool_wire_encoding() {
+    use super::stmt::write_output;
+    use engine::{Datum, Output};
+
+    let out = Output {
+        columns: vec![
+            "schemaname".into(),
+            "tablename".into(),
+            "tableowner".into(),
+            "tablespace".into(),
+            "hasindexes".into(),
+            "hasrules".into(),
+            "hastriggers".into(),
+            "rowsecurity".into(),
+        ],
+        rows: vec![vec![
+            Datum::Text("public".into()),
+            Datum::Text("users".into()),
+            Datum::Text("root".into()),
+            Datum::Null,
+            Datum::Bool(true),
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Bool(false),
+        ]],
+        message: "OK".into(),
+    };
+
+    let mut buf = Vec::new();
+    let mut seq = 0u8;
+    write_output(&mut buf, &mut seq, &out, false, false, false, false, true).unwrap();
+
+    // Verify wire contains '1' and '0' for bool fields, never 'true' or 'false'
+    assert!(!buf.windows(4).any(|w| w == b"true"));
+    assert!(!buf.windows(5).any(|w| w == b"false"));
 }

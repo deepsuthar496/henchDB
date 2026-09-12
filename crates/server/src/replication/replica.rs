@@ -238,7 +238,8 @@ fn stream_once(
                 for rec in records {
                     let txn = txn_of(&rec);
                     if matches!(rec, engine::wal::Record::Commit { .. }) {
-                        if let Some(batch) = pending.remove(&txn) {
+                        if let Some(mut batch) = pending.remove(&txn) {
+                            batch.push(rec);
                             db.apply_replica_batch(batch)
                                 .map_err(|e| CodecError(format!("apply: {e}")))?;
                         }

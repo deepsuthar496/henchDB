@@ -319,6 +319,7 @@ pub(crate) fn enforce(db: &Database, session: &Session, stmt: &Statement) -> Res
         | Statement::Revoke { .. }
         | Statement::Promote
         | Statement::Backup { .. }
+        | Statement::Archive { .. }
         | Statement::Checkpoint => require_admin(db, session, stmt_admin_command(stmt)),
         Statement::ShowGrants { for_user } => {
             if session.user == SUPERUSER {
@@ -406,6 +407,7 @@ fn stmt_admin_command(stmt: &Statement) -> &'static str {
         Statement::Revoke { .. } => "REVOKE",
         Statement::Promote => "PROMOTE",
         Statement::Backup { .. } => "BACKUP",
+        Statement::Archive { .. } => "ARCHIVE",
         Statement::Checkpoint => "CHECKPOINT",
         _ => "ADMIN",
     }

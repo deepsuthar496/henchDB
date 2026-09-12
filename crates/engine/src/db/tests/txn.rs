@@ -375,3 +375,104 @@ fn checkpoint_waves_and_archive_chain_under_load() {
     assert_eq!(commits, total as u64 + 1);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn session_autocommit_flag_stages_and_persists() {
+    let dir = std::env::temp_dir().join(format!("hdb_autocommit_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+
+    // autocommit defaults to true
+    assert!(s.autocommit);
+
+    // Disable autocommit via SQL: SET autocommit = 0
+    db.execute(&mut s, "SET autocommit = 0").unwrap();
+    assert!(!s.autocommit);
+
+    // DML without explicit BEGIN: stages implicitly
+    db.execute(&mut s, "INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute(&mut s, "INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(s.in_transaction());
+
+    // Reading within session sees staged data
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(2));
+
+    // Another session does not see uncommitted data
+    let mut s2 = db.new_session();
+    let out2 = db.execute(&mut s2, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out2.rows[0][0], Datum::Int(0));
+
+    // Restarting without commit discards the staged data
+    drop(s);
+    drop(s2);
+    drop(db);
+
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(0));
+
+    // Disable autocommit via @@session.autocommit = OFF
+    db.execute(&mut s, "SET @@session.autocommit = OFF").unwrap();
+    assert!(!s.autocommit);
+
+    db.execute(&mut s, "INSERT INTO t VALUES (100, 200)").unwrap();
+    assert!(s.in_transaction());
+
+    // Explicit COMMIT commits the staged data to WAL
+    db.execute(&mut s, "COMMIT").unwrap();
+    assert!(!s.in_transaction());
+
+    drop(s);
+    drop(db);
+
+    // Reopen: committed row is preserved across restart
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(1));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn archive_sql_command_creates_valid_hdba_segments() {
+    use crate::archive::list_segments;
+    let dir = std::env::temp_dir().join(format!("hdb_sql_archive_{}", std::process::id()));
+    let adir = dir.join("archive");
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    for i in 1..=50 {
+        db.execute(&mut s, &format!("INSERT INTO t VALUES ({i}, 'val_{i}')")).unwrap();
+    }
+
+    // ARCHIVE TO '<adir>'
+    let adir_str = adir.to_str().unwrap().replace('\\', "/");
+    let out = db.execute(&mut s, &format!("ARCHIVE TO '{adir_str}'")).unwrap();
+    assert!(out.message.contains("archived segment 1"));
+
+    let segs = list_segments(&adir).unwrap();
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].meta.index, 1);
+    assert!(segs[0].path.to_str().unwrap().ends_with(".hdba"));
+
+    // More inserts and subsequent ARCHIVE
+    for i in 51..=100 {
+        db.execute(&mut s, &format!("INSERT INTO t VALUES ({i}, 'val_{i}')")).unwrap();
+    }
+    let out2 = db.execute(&mut s, "ARCHIVE").unwrap();
+    assert!(out2.message.contains("archived segment 2"));
+
+    let segs2 = list_segments(&adir).unwrap();
+    assert_eq!(segs2.len(), 2);
+    assert_eq!(segs2[1].meta.index, 2);
+    assert_eq!(segs2[1].meta.start_offset, segs2[0].meta.end_offset);
+
+    let _ = fs::remove_dir_all(&dir);
+}

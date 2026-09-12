@@ -50,6 +50,8 @@ mod tests;
 #[cfg(test)]
 mod fuzz;
 
+#[cfg(test)]
+#[allow(unused_imports)]
 pub use canned::canned_output;
 pub use constants::SERVER_CAPS;
 
@@ -76,16 +78,35 @@ fn execute_statements<W: std::io::Write>(
     deprecate_eof: bool,
     binary: bool,
 ) -> std::io::Result<()> {
-    for stmt in stmts {
+    for (i, stmt) in stmts.iter().enumerate() {
         let stmt = normalize_dialect(stmt.trim());
         if stmt.is_empty() {
             continue;
         }
+        let more_results = i + 1 < stmts.len();
         match db.execute(session, stmt) {
-            Ok(out) => write_output(writer, seq, &out, deprecate_eof, binary)?,
+            Ok(out) => write_output(
+                writer,
+                seq,
+                &out,
+                deprecate_eof,
+                binary,
+                more_results,
+                session.in_transaction(),
+                session.autocommit,
+            )?,
             Err(e) => {
-                if let Some(canned) = canned_output(stmt) {
-                    write_output(writer, seq, &canned, deprecate_eof, binary)?;
+                if let Some(canned) = canned::canned_output_session(stmt, session.autocommit) {
+                    write_output(
+                        writer,
+                        seq,
+                        &canned,
+                        deprecate_eof,
+                        binary,
+                        more_results,
+                        session.in_transaction(),
+                        session.autocommit,
+                    )?;
                 } else {
                     write_err(writer, seq, &e)?;
                     break;
@@ -157,6 +178,7 @@ pub(crate) struct MysqlSession {
     stmts: HashMap<u32, Prepared>,
     next_stmt_id: u32,
     deprecate_eof: bool,
+    client_multi_statements: bool,
     authed_user: String,
     peer: String,
     proc: ProcGuard,
@@ -263,6 +285,10 @@ pub(crate) fn mysql_establish(
     let deprecate_eof = hs
         .as_ref()
         .map(|h| h.caps & SERVER_CAPS & CAP_DEPRECATE_EOF != 0)
+        .unwrap_or(false);
+    let client_multi_statements = hs
+        .as_ref()
+        .map(|h| h.caps & CAP_MULTI_STATEMENTS != 0)
         .unwrap_or(false);
     sseq = cseq.wrapping_add(1);
     // -- Admission + authentication, before any OK. --
@@ -372,6 +398,7 @@ pub(crate) fn mysql_establish(
         stmts,
         next_stmt_id,
         deprecate_eof,
+        client_multi_statements,
         authed_user,
         peer: peer.to_string(),
         proc,
@@ -505,6 +532,10 @@ pub(crate) fn mysql_step(
                 // resultset/OK per statement.
                 let batch = split_statements(sql);
                 let batch = if batch.is_empty() { vec![sql.to_string()] } else { batch };
+                if batch.len() > 1 && !m.client_multi_statements {
+                    write_err_msg(reader.get_mut(), &mut out_seq, 1064, "You have an error in your SQL syntax; multi-statements not enabled")?;
+                    return Ok(Idle);
+                }
                 db.note_command(proc.id(), &session.current_db, "Query", batch.first().map(String::as_str).unwrap_or(sql));
                 let v0 = db.privilege_version();
                 execute_statements(&db, session, &batch, reader.get_mut(), &mut out_seq, deprecate_eof, false)?;

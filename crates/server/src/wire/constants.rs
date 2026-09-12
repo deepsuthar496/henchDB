@@ -8,7 +8,9 @@ pub const SERVER_VERSION_PREFIX: &str = "8.0.46";
 /// verified in `auth.rs`, never with cleartext.
 pub const AUTH_PLUGIN: &str = "caching_sha2_password";
 pub const CHARSET_UTF8MB4: u8 = 255;
+pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 pub const STATUS_AUTOCOMMIT: u16 = 0x0002;
+pub const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
 
 // Capability flags advertised to clients (subset of CLIENT_*).
 pub const CAP_LONG_PASSWORD: u32 = 0x0000_0001;

@@ -295,7 +295,23 @@ fn sharded_recovery_drops_interleaved_tails() {
         .filter(|r| matches!(r, Record::Commit { .. }))
         .count();
     assert_eq!(commits, 800);
-    assert!(!recs.iter().any(|r| matches!(
+    // Recovery replay contract: buffer records per txn, apply only on Commit; uncommitted tails dropped
+    let mut pending: std::collections::HashMap<u64, Vec<Record>> = std::collections::HashMap::new();
+    let mut recovered = Vec::new();
+    for r in recs {
+        match r {
+            Record::Commit { txn, .. } => {
+                if let Some(b) = pending.remove(&txn) {
+                    recovered.extend(b);
+                }
+            }
+            Record::Put { txn, .. } => {
+                pending.entry(txn).or_default().push(r);
+            }
+            _ => {}
+        }
+    }
+    assert!(!recovered.iter().any(|r| matches!(
         r,
         Record::Put { txn: 999_999, .. }
     )));

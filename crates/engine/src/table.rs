@@ -414,6 +414,14 @@ impl Table {
                 } else if let Datum::Int(sec) = &d {
                     d = Datum::DateTime(*sec * 1_000_000);
                 }
+            } else if col.ctype == ColumnType::Bool {
+                if let Datum::Int(v) = &d {
+                    d = Datum::Bool(*v != 0);
+                }
+            } else if matches!(col.ctype, ColumnType::Int | ColumnType::BigInt) {
+                if let Datum::Bool(b) = &d {
+                    d = Datum::Int(if *b { 1 } else { 0 });
+                }
             }
             if !col.ctype.accepts(&d) {
                 return Err(Error::TypeMismatch {

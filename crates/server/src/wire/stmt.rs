@@ -8,8 +8,8 @@ use engine::{Datum, Output};
 
 use super::constants::*;
 use super::packet::{
-    enc_lenenc_int, enc_lenenc_str3, eof_payload, err_payload, ok_payload, read_le,
-    read_lenenc_bytes, write_packet,
+    enc_lenenc_int, enc_lenenc_str3, eof_payload_with_status, err_payload,
+    ok_payload_with_status, read_le, read_lenenc_bytes, write_packet,
 };
 
 // ---------------------------------------------------------------------------
@@ -17,8 +17,9 @@ use super::packet::{
 // ---------------------------------------------------------------------------
 
 /// Per-column wire types for a result set, with numeric promotion: any
-/// Float in a column makes it DOUBLE, else any Int/Bool makes it LONGLONG,
-/// else VAR_STRING. Deterministic across text and binary encodings.
+/// Float in a column makes it DOUBLE, else any Int makes it LONGLONG,
+/// else any Bool makes it TINY, else VAR_STRING. Deterministic across text
+/// and binary encodings.
 pub fn result_column_types(out: &Output) -> Vec<u8> {
     out.columns
         .iter()
@@ -26,6 +27,7 @@ pub fn result_column_types(out: &Output) -> Vec<u8> {
         .map(|(i, _)| {
             let mut has_float = false;
             let mut has_int = false;
+            let mut has_bool = false;
             for r in &out.rows {
                 match &r[i] {
                     Datum::Null => {}
@@ -33,7 +35,8 @@ pub fn result_column_types(out: &Output) -> Vec<u8> {
                         has_float = true;
                         break;
                     }
-                    Datum::Int(_) | Datum::Bool(_) => has_int = true,
+                    Datum::Int(_) => has_int = true,
+                    Datum::Bool(_) => has_bool = true,
                     Datum::DateTime(_) => return TYPE_DATETIME,
                     Datum::Text(_) => return TYPE_VAR_STRING,
                 }
@@ -42,6 +45,8 @@ pub fn result_column_types(out: &Output) -> Vec<u8> {
                 TYPE_DOUBLE
             } else if has_int {
                 TYPE_LONGLONG
+            } else if has_bool {
+                TYPE_TINY
             } else {
                 TYPE_VAR_STRING
             }
@@ -70,7 +75,8 @@ pub fn column_def_payload(name: &str, col_type: u8) -> Vec<u8> {
     enc_lenenc_str3(&mut p, "");
     enc_lenenc_int(&mut p, 0x0C);
     p.extend_from_slice(&33u16.to_le_bytes()); // charset utf8_general_ci
-    p.extend_from_slice(&1024u32.to_le_bytes()); // column length
+    let col_len: u32 = if col_type == TYPE_TINY { 1 } else { 1024 };
+    p.extend_from_slice(&col_len.to_le_bytes()); // column length
     p.push(col_type);
     p.extend_from_slice(&0u16.to_le_bytes()); // flags
     p.push(0); // decimals
@@ -83,6 +89,7 @@ pub fn row_payload(row: &[Datum]) -> Vec<u8> {
     for d in row {
         match d {
             Datum::Null => p.push(0xFB),
+            Datum::Bool(b) => enc_lenenc_str3(&mut p, if *b { "1" } else { "0" }),
             other => enc_lenenc_str3(&mut p, &other.to_string()),
         }
     }
@@ -107,6 +114,7 @@ pub fn binary_row_payload(row: &[Datum], types: &[u8]) -> Result<Vec<u8>, String
             (Datum::Bool(b), TYPE_TINY) => p.push(*b as u8),
             (Datum::Bool(b), TYPE_LONGLONG) => p.extend_from_slice(&(*b as i64).to_le_bytes()),
             (Datum::Bool(b), TYPE_DOUBLE) => p.extend_from_slice(&(*b as u8 as f64).to_le_bytes()),
+            (Datum::Bool(b), TYPE_VAR_STRING) => enc_lenenc_str3(&mut p, if *b { "1" } else { "0" }),
             (Datum::Int(v), TYPE_LONGLONG) => p.extend_from_slice(&v.to_le_bytes()),
             (Datum::Int(v), TYPE_DOUBLE) => p.extend_from_slice(&(*v as f64).to_le_bytes()),
             (Datum::Float(v), TYPE_DOUBLE) => p.extend_from_slice(&v.to_le_bytes()),
@@ -132,11 +140,10 @@ pub fn binary_row_payload(row: &[Datum], types: &[u8]) -> Result<Vec<u8>, String
     Ok(p)
 }
 
-pub fn parse_affected(message: &str) -> u64 {
-    message
-        .split_whitespace()
+fn parse_affected(msg: &str) -> u64 {
+    msg.split_whitespace()
         .next()
-        .and_then(|t| t.parse::<u64>().ok())
+        .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
 
@@ -146,9 +153,23 @@ pub fn write_output<W: Write>(
     out: &Output,
     deprecate_eof: bool,
     binary: bool,
+    more_results: bool,
+    in_trans: bool,
+    autocommit: bool,
 ) -> std::io::Result<()> {
+    let mut status: u16 = 0;
+    if autocommit {
+        status |= STATUS_AUTOCOMMIT;
+    }
+    if in_trans {
+        status |= SERVER_STATUS_IN_TRANS;
+    }
+    if more_results {
+        status |= SERVER_MORE_RESULTS_EXISTS;
+    }
+
     if out.columns.is_empty() {
-        let p = ok_payload(parse_affected(&out.message), &out.message);
+        let p = ok_payload_with_status(parse_affected(&out.message), &out.message, status);
         write_packet(writer, &p, seq)?;
         writer.flush()?;
         return Ok(());
@@ -189,15 +210,15 @@ pub fn write_output<W: Write>(
             write_packet(writer, d, seq)?;
         }
         if !deprecate_eof {
-            write_packet(writer, &eof_payload(), seq)?;
+            write_packet(writer, &eof_payload_with_status(status), seq)?;
         }
         for r in &rows {
             write_packet(writer, r, seq)?;
         }
         if deprecate_eof {
-            write_packet(writer, &ok_payload(0, ""), seq)?;
+            write_packet(writer, &ok_payload_with_status(0, "", status), seq)?;
         } else {
-            write_packet(writer, &eof_payload(), seq)?;
+            write_packet(writer, &eof_payload_with_status(status), seq)?;
         }
         writer.flush()?;
         return Ok(());
@@ -207,18 +228,18 @@ pub fn write_output<W: Write>(
         write_packet(writer, d, seq)?;
     }
     if !deprecate_eof {
-        write_packet(writer, &eof_payload(), seq)?;
+        write_packet(writer, &eof_payload_with_status(status), seq)?;
     }
     for row in &out.rows {
         write_packet(writer, &row_payload(row), seq)?;
     }
     if deprecate_eof {
-        let p = ok_payload(0, "");
+        let p = ok_payload_with_status(0, "", status);
         // OK-as-EOF: server must set 0xFE semantics via caps; minimal OK works
         // for clients that skip the trailing EOF.
         write_packet(writer, &p, seq)?;
     } else {
-        write_packet(writer, &eof_payload(), seq)?;
+        write_packet(writer, &eof_payload_with_status(status), seq)?;
     }
     writer.flush()?;
     Ok(())

@@ -578,6 +578,10 @@ fn cmp_pvals(l: &PVal<'_>, r: &PVal<'_>) -> std::cmp::Ordering {
         (PVal::I(a), PVal::F(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
         (PVal::F(a), PVal::I(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
         (PVal::B(a), PVal::B(b)) => a.cmp(b),
+        (PVal::B(a), PVal::I(b)) => (if *a { 1i64 } else { 0i64 }).cmp(b),
+        (PVal::I(a), PVal::B(b)) => a.cmp(&(if *b { 1i64 } else { 0i64 })),
+        (PVal::B(a), PVal::F(b)) => (if *a { 1.0f64 } else { 0.0f64 }).partial_cmp(b).unwrap_or(Ordering::Equal),
+        (PVal::F(a), PVal::B(b)) => a.partial_cmp(&(if *b { 1.0f64 } else { 0.0f64 })).unwrap_or(Ordering::Equal),
         (PVal::D(a), PVal::D(b)) => a.cmp(b),
         (PVal::S(a), PVal::S(b)) => a.cmp(b),
         (PVal::D(a), PVal::S(b)) => match parse_datetime_str(b) {
@@ -624,6 +628,10 @@ fn in_match(t: &PVal<'_>, values: &[Datum]) -> bool {
             (PVal::I(a), Datum::Float(b)) => (*a as f64) == *b,
             (PVal::F(a), Datum::Int(b)) => *a == (*b as f64),
             (PVal::B(a), Datum::Bool(b)) => a == b,
+            (PVal::B(a), Datum::Int(b)) => (if *a { 1 } else { 0 }) == *b,
+            (PVal::I(a), Datum::Bool(b)) => *a == (if *b { 1 } else { 0 }),
+            (PVal::B(a), Datum::Float(b)) => (if *a { 1.0 } else { 0.0 }) == *b,
+            (PVal::F(a), Datum::Bool(b)) => *a == (if *b { 1.0 } else { 0.0 }),
             (PVal::D(a), Datum::DateTime(b)) => a == b,
             (PVal::S(a), Datum::Text(b)) => *a == b.as_str(),
             (PVal::D(a), Datum::Text(b)) => match parse_datetime_str(b) {
@@ -780,6 +788,33 @@ fn eval_node(
             }
             Some(Tri { t, e })
         }
+        Expr::Column(_) => {
+            let mut t = Vec::new();
+            let mut e = Vec::new();
+            for &i in input {
+                match operand(batch, col_of, expr, i as usize)? {
+                    None => e.push(i),
+                    Some(PVal::Null) => {}
+                    Some(PVal::B(b)) => { if b { t.push(i); } }
+                    Some(PVal::I(n)) => { if n != 0 { t.push(i); } }
+                    Some(PVal::F(f)) => { if f != 0.0 { t.push(i); } }
+                    Some(_) => {}
+                }
+            }
+            Some(Tri { t, e })
+        }
+        Expr::Literal(d) => {
+            let truthy = match d {
+                Datum::Bool(b) => *b,
+                Datum::Int(n) => *n != 0,
+                Datum::Float(f) => *f != 0.0,
+                _ => false,
+            };
+            Some(Tri {
+                t: if truthy { input.to_vec() } else { Vec::new() },
+                e: Vec::new(),
+            })
+        }
         _ => None,
     }
 }
@@ -821,6 +856,10 @@ fn cval_as_pval(v: &CVal) -> PVal<'_> {
 /// attempts a parse, everything else passes through unchanged.
 fn coerce_vals<'a>(t: &'a PVal<'a>, bound: &'a PVal<'a>) -> (CVal, CVal) {
     match (t, bound) {
+        (PVal::B(a), PVal::I(b)) => (CVal::I(if *a { 1 } else { 0 }), CVal::I(*b)),
+        (PVal::I(a), PVal::B(b)) => (CVal::I(*a), CVal::I(if *b { 1 } else { 0 })),
+        (PVal::B(a), PVal::F(b)) => (CVal::F(if *a { 1.0 } else { 0.0 }), CVal::F(*b)),
+        (PVal::F(a), PVal::B(b)) => (CVal::F(*a), CVal::F(if *b { 1.0 } else { 0.0 })),
         (PVal::I(a), PVal::F(b)) => (CVal::F(*a as f64), CVal::F(*b)),
         (PVal::F(a), PVal::I(b)) => (CVal::F(*a), CVal::F(*b as f64)),
         (PVal::D(a), PVal::S(b)) => match parse_datetime_str(b) {

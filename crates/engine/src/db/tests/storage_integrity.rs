@@ -261,3 +261,82 @@ fn concurrent_storage_integrity_with_ddl() {
     assert!(ddl_checks >= 5, "Completed concurrent DDL checks");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_sweep_orphan_tmp_files_on_open() {
+    let dir = std::env::temp_dir().join(format!("hdb_tmp_sweep_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    // Create orphaned temporary files simulating crashed checkpoints, dumps, or page flushes
+    let snap_bin_tmp = dir.join("snapshot.bin.tmp");
+    let snap_tmp = dir.join("snapshot.tmp");
+    let pages_tmp = dir.join("pages.bin.tmp");
+    let custom_tmp = dir.join(".wal_00000000_00000001.tmp.9999");
+    fs::write(&snap_bin_tmp, b"orphan snapshot.bin.tmp 8B content").unwrap();
+    fs::write(&snap_tmp, b"orphan snapshot.tmp content").unwrap();
+    fs::write(&pages_tmp, b"orphan pages.bin.tmp content").unwrap();
+    fs::write(&custom_tmp, b"orphan .tmp. content").unwrap();
+
+    assert!(snap_bin_tmp.exists());
+    assert!(snap_tmp.exists());
+    assert!(pages_tmp.exists());
+    assert!(custom_tmp.exists());
+
+    // Opening database must sweep all orphan .tmp files
+    let db = Database::open(&dir).unwrap();
+
+    assert!(!snap_bin_tmp.exists(), "snapshot.bin.tmp must be swept on open");
+    assert!(!snap_tmp.exists(), "snapshot.tmp must be swept on open");
+    assert!(!pages_tmp.exists(), "pages.bin.tmp must be swept on open");
+    assert!(!custom_tmp.exists(), "orphan .tmp. files must be swept on open");
+
+    // Operations succeed normally
+    let mut s = db.new_session();
+    db.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY);").unwrap();
+    db.execute(&mut s, "INSERT INTO t VALUES (1);").unwrap();
+    let out = db.execute(&mut s, "SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(1));
+
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_server_dir_lock_prevents_concurrent_open() {
+    let dir = std::env::temp_dir().join(format!("hdb_dir_lock_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let db1 = Database::open(&dir).unwrap();
+    assert!(dir.join("server.lock").exists());
+
+    #[cfg(windows)]
+    {
+        // Second process / handle attempting to open the same directory concurrently
+        let res = Database::open(&dir);
+        match res {
+            Err(Error::InvalidOperation(msg)) => {
+                assert!(
+                    msg.contains("directory is locked by a live server process"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            Err(e) => panic!("expected Error::InvalidOperation with lock rejection, got: {e:?}"),
+            Ok(_) => panic!("expected lock rejection error, got Ok"),
+        }
+    }
+
+    // Dropping the first database releases the OS kernel lock on server.lock
+    drop(db1);
+
+    // Now opening the directory succeeds
+    let db2 = Database::open(&dir).expect("should succeed after first database is dropped");
+    let mut s = db2.new_session();
+    db2.execute(&mut s, "CREATE TABLE t (id INT PRIMARY KEY);").unwrap();
+    let out = db2.execute(&mut s, "SELECT COUNT(*) FROM t;").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(0));
+
+    drop(db2);
+    let _ = fs::remove_dir_all(&dir);
+}

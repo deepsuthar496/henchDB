@@ -911,3 +911,68 @@ fn primary_crash_mid_stream_and_replica_reconnect_resumes() {
     let _ = std::fs::remove_dir_all(&rdir);
 }
 
+#[test]
+fn replica_persists_to_local_wal_and_offline_promotion_preserves_data() {
+    let pdir = std::env::temp_dir().join(format!("hdbrepl_prom_p_{}", std::process::id()));
+    let rdir = std::env::temp_dir().join(format!("hdbrepl_prom_r_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+
+    let pdb = primary_db(&pdir);
+    let mut ps = pdb.new_session();
+    pdb.execute(&mut ps, "CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    load_rows(&pdb, "t", 0, 30);
+
+    let (pl, port) = primary::bind_repl(0).expect("bind repl");
+    let draining_p = Arc::new(AtomicBool::new(false));
+    let global_p = leak_flag();
+    let pdb2 = pdb.clone();
+    let draining_p2 = draining_p.clone();
+    let auth_path = pdir.join("auth.bin");
+    let pt = std::thread::spawn(move || {
+        primary::serve_primary(pdb2, pl, auth_path, draining_p2, global_p)
+    });
+
+    let rdb = Arc::new(Database::open(&rdir).unwrap());
+    rdb.set_read_only(true);
+    let (rt, rdrain) = spawn_replica(&rdb, &format!("127.0.0.1:{port}"), &rdir);
+
+    wait_for("replica catches up to 30", Duration::from_secs(15), || {
+        count(&rdb, "t") == 30
+    });
+
+    // Stream 20 more rows via replication
+    load_rows(&pdb, "t", 30, 20);
+    wait_for("replica streams 20 more rows", Duration::from_secs(15), || {
+        count(&rdb, "t") == 50
+    });
+
+    // Stop replica thread
+    rdrain.store(true, Ordering::Relaxed);
+    rt.join().unwrap();
+    draining_p.store(true, Ordering::Relaxed);
+    pt.join().unwrap();
+
+    drop(rdb);
+    drop(pdb);
+
+    // Promote offline: open rdir directly without running server
+    let promoted_db = Database::open(&rdir).unwrap();
+    assert_eq!(count(&promoted_db, "t"), 50);
+    promoted_db.promote_offline().unwrap();
+
+    // Now write to promoted node as primary
+    let mut s = promoted_db.new_session();
+    promoted_db.execute(&mut s, "INSERT INTO t VALUES (999, 999)").unwrap();
+    assert_eq!(count(&promoted_db, "t"), 51);
+
+    drop(promoted_db);
+
+    // Reopen promoted directory to verify durability across restart
+    let reopened = Database::open(&rdir).unwrap();
+    assert_eq!(count(&reopened, "t"), 51);
+
+    let _ = std::fs::remove_dir_all(&pdir);
+    let _ = std::fs::remove_dir_all(&rdir);
+}
+

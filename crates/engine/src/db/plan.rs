@@ -47,6 +47,10 @@ fn coerce_for_col(ctype: ColumnType, lit: &Datum) -> Option<Datum> {
             Some(Datum::Text(v.clone()))
         }
         (ColumnType::Bool, Datum::Bool(v)) => Some(Datum::Bool(*v)),
+        (ColumnType::Bool, Datum::Int(v)) => Some(Datum::Bool(*v != 0)),
+        (ColumnType::Int, Datum::Bool(v)) | (ColumnType::BigInt, Datum::Bool(v)) => {
+            Some(Datum::Int(if *v { 1 } else { 0 }))
+        }
         (ColumnType::Int, Datum::Float(v)) | (ColumnType::BigInt, Datum::Float(v)) => {
             if v.fract() == 0.0 {
                 Some(Datum::Int(*v as i64))

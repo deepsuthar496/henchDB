@@ -771,3 +771,61 @@ fn test_collist_insert_pg_tables_and_show_engine() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_bool_int_coercion_and_select_1_eq_1() {
+    let dir = std::env::temp_dir().join(format!("hdb_bool_coerce_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let db = Database::open(&dir).unwrap();
+    let mut s = db.new_session();
+
+    db.execute(&mut s, "CREATE TABLE t_bool (id INT PRIMARY KEY, active BOOL)").unwrap();
+
+    // Verify inserting true/false and 1/0 into BOOL column works
+    db.execute(&mut s, "INSERT INTO t_bool VALUES (1, true), (2, false), (3, 1), (4, 0)").unwrap();
+
+    // WHERE active = true
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE active = true ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(1)], vec![Datum::Int(3)]]);
+
+    // WHERE active = 1 (coercion)
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE active = 1 ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(1)], vec![Datum::Int(3)]]);
+
+    // WHERE 1 = active (reverse operand coercion)
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE 1 = active ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(1)], vec![Datum::Int(3)]]);
+
+    // WHERE active = false
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE active = false ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(2)], vec![Datum::Int(4)]]);
+
+    // WHERE active = 0 (coercion)
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE active = 0 ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(2)], vec![Datum::Int(4)]]);
+
+    // WHERE active (truthiness)
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE active ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(1)], vec![Datum::Int(3)]]);
+
+    // WHERE NOT active (truthiness)
+    let out = db.execute(&mut s, "SELECT id FROM t_bool WHERE NOT active ORDER BY id").unwrap();
+    assert_eq!(out.rows, vec![vec![Datum::Int(2)], vec![Datum::Int(4)]]);
+
+    // UPDATE with 0
+    db.execute(&mut s, "UPDATE t_bool SET active = 0 WHERE id = 1").unwrap();
+    let out = db.execute(&mut s, "SELECT active FROM t_bool WHERE id = 1").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Bool(false));
+
+    // SELECT 1=1, 1=0, 1!=0
+    let out = db.execute(&mut s, "SELECT 1=1").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(1));
+
+    let out = db.execute(&mut s, "SELECT 1 = 0").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(0));
+
+    let out = db.execute(&mut s, "SELECT 1 != 0").unwrap();
+    assert_eq!(out.rows[0][0], Datum::Int(1));
+
+    let _ = fs::remove_dir_all(&dir);
+}

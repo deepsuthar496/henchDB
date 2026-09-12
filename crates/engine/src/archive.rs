@@ -51,8 +51,21 @@ impl crate::db::Database {
         let Some(adir) = self.archive_dir.lock().unwrap().clone() else {
             return Ok(()); // archiving disabled
         };
+        self.wal.wait_durable(self.wal.next_offset())?;
         archive_live_prefix(&self.wal, &adir, WAL_FORMAT_VERSION)?;
         Ok(())
+    }
+
+    /// Archive the live durable WAL prefix now, optionally configuring `dir`.
+    pub fn archive_now(&self, dir: Option<&Path>) -> Result<Option<SegmentMeta>> {
+        if let Some(d) = dir {
+            self.set_archive_dir(d)?;
+        }
+        let Some(adir) = self.archive_dir.lock().unwrap().clone() else {
+            return Err(Error::InvalidOperation("archive directory not configured".into()));
+        };
+        self.wal.wait_durable(self.wal.next_offset())?;
+        archive_live_prefix(&self.wal, &adir, WAL_FORMAT_VERSION)
     }
 }
 
@@ -96,7 +109,7 @@ pub struct SegmentRef {
 
 /// Archive file name for `(generation, index)`; sorts in replay order.
 pub fn segment_filename(generation: u64, index: u64) -> String {
-    format!("wal_{generation:08x}_{index:08x}.hdbw")
+    format!("wal_{generation:08x}_{index:08x}.hdba")
 }
 
 /// Parse an archive file name back into `(generation, index)`.
@@ -104,7 +117,8 @@ pub fn parse_segment_filename(name: &str) -> Option<(u64, u64)> {
     if name.len() > MAX_FILENAME_LEN {
         return None;
     }
-    let rest = name.strip_prefix("wal_")?.strip_suffix(".hdbw")?;
+    let rest = name.strip_prefix("wal_")?;
+    let rest = rest.strip_suffix(".hdba").or_else(|| rest.strip_suffix(".hdbw"))?;
     let (gen, idx) = rest.split_once('_')?;
     if gen.len() != 8 || idx.len() != 8 {
         return None;
@@ -493,18 +507,26 @@ mod tests {
 
     #[test]
     fn filename_roundtrip_and_rejects() {
-        assert_eq!(segment_filename(0, 1), "wal_00000000_00000001.hdbw");
+        assert_eq!(segment_filename(0, 1), "wal_00000000_00000001.hdba");
+        assert_eq!(
+            parse_segment_filename("wal_00000000_00000001.hdba"),
+            Some((0, 1))
+        );
         assert_eq!(
             parse_segment_filename("wal_00000000_00000001.hdbw"),
             Some((0, 1))
         );
         assert_eq!(
+            parse_segment_filename("wal_ffffffff_0000000a.hdba"),
+            Some((0xffff_ffff, 10))
+        );
+        assert_eq!(
             parse_segment_filename("wal_ffffffff_0000000a.hdbw"),
             Some((0xffff_ffff, 10))
         );
-        assert_eq!(parse_segment_filename("wal_1.hdbw"), None);
+        assert_eq!(parse_segment_filename("wal_1.hdba"), None);
         assert_eq!(parse_segment_filename("wal_00000000_00000001.tmp"), None);
-        assert_eq!(parse_segment_filename("other.hdbw"), None);
+        assert_eq!(parse_segment_filename("other.hdba"), None);
     }
 
     #[test]

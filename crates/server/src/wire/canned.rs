@@ -13,7 +13,12 @@ pub fn strip_trailing_semicolon(s: &str) -> &str {
     t
 }
 
+#[allow(dead_code)]
 pub fn canned_var_value(name: &str) -> &str {
+    canned_var_value_session(name, true)
+}
+
+pub fn canned_var_value_session(name: &str, autocommit: bool) -> &str {
     match name.to_ascii_lowercase().as_str() {
         "@@version" | "@@global.version" | "@@session.version" => SERVER_VERSION_PREFIX,
         "@@version_comment" | "@@global.version_comment" => PRODUCT_NAME,
@@ -21,7 +26,9 @@ pub fn canned_var_value(name: &str) -> &str {
         "@@character_set_client" | "@@character_set_connection" | "@@character_set_results" => {
             "utf8mb4"
         }
-        "@@autocommit" => "1",
+        "@@autocommit" | "@@session.autocommit" | "@@global.autocommit" => {
+            if autocommit { "1" } else { "0" }
+        }
         "@@transaction_isolation" | "@@tx_isolation" => "REPEATABLE-READ",
         "@@lower_case_table_names" => "0",
         "@@sql_mode" => "",
@@ -143,7 +150,7 @@ pub fn column_alias(expr: &str) -> String {
     t.to_string()
 }
 
-pub fn eval_bare_literal(expr: &str) -> Datum {
+pub fn eval_bare_literal_session(expr: &str, autocommit: bool) -> Datum {
     let t = expr.trim();
     if t.eq_ignore_ascii_case("null") {
         return Datum::Null;
@@ -159,6 +166,30 @@ pub fn eval_bare_literal(expr: &str) -> Datum {
     {
         let inner = &t[1..t.len() - 1].replace("''", "'");
         return Datum::Text(inner.clone());
+    }
+    if let Some((l, r)) = t.split_once("!=") {
+        let dl = eval_bare_literal_session(l, autocommit);
+        let dr = eval_bare_literal_session(r, autocommit);
+        let (dl, dr) = engine::sql::coerce_pair(dl, dr);
+        return Datum::Int(if dl != dr { 1 } else { 0 });
+    }
+    if let Some((l, r)) = t.split_once("<>") {
+        let dl = eval_bare_literal_session(l, autocommit);
+        let dr = eval_bare_literal_session(r, autocommit);
+        let (dl, dr) = engine::sql::coerce_pair(dl, dr);
+        return Datum::Int(if dl != dr { 1 } else { 0 });
+    }
+    if let Some((l, r)) = t.split_once("==") {
+        let dl = eval_bare_literal_session(l, autocommit);
+        let dr = eval_bare_literal_session(r, autocommit);
+        let (dl, dr) = engine::sql::coerce_pair(dl, dr);
+        return Datum::Int(if dl == dr { 1 } else { 0 });
+    }
+    if let Some((l, r)) = t.split_once('=') {
+        let dl = eval_bare_literal_session(l, autocommit);
+        let dr = eval_bare_literal_session(r, autocommit);
+        let (dl, dr) = engine::sql::coerce_pair(dl, dr);
+        return Datum::Int(if dl == dr { 1 } else { 0 });
     }
     if let Ok(n) = t.parse::<i64>() {
         return Datum::Int(n);
@@ -183,13 +214,23 @@ pub fn eval_bare_literal(expr: &str) -> Datum {
         return Datum::Int(0);
     }
     if t.starts_with("@@") {
-        return Datum::Text(canned_var_value(t).to_string());
+        return Datum::Text(canned_var_value_session(t, autocommit).to_string());
     }
     Datum::Text(t.to_string())
 }
 
-/// Bare `SELECT <literals>` without FROM (drivers send `SELECT 1`, `SELECT @@x`).
+#[allow(dead_code)]
+pub fn eval_bare_literal(token: &str) -> Datum {
+    eval_bare_literal_session(token, true)
+}
+
+#[allow(dead_code)]
 pub fn bare_select_output(list: &str) -> Option<Output> {
+    bare_select_output_session(list, true)
+}
+
+/// Bare `SELECT <literals>` without FROM (drivers send `SELECT 1`, `SELECT @@x`).
+pub fn bare_select_output_session(list: &str, autocommit: bool) -> Option<Output> {
     if list.trim().is_empty() {
         return None;
     }
@@ -208,7 +249,7 @@ pub fn bare_select_output(list: &str) -> Option<Output> {
             } else {
                 p.trim()
             };
-            eval_bare_literal(expr)
+            eval_bare_literal_session(expr, autocommit)
         })
         .collect();
     Some(Output {
@@ -257,9 +298,14 @@ pub fn info_schema_fallback(sql: &str) -> Option<Output> {
     })
 }
 
+#[allow(dead_code)]
+pub fn canned_output(sql: &str) -> Option<Output> {
+    canned_output_session(sql, true)
+}
+
 /// Canned responses for MySQL-dialect introspection. Returns None when the
 /// engine itself should answer (or error).
-pub fn canned_output(sql: &str) -> Option<Output> {
+pub fn canned_output_session(sql: &str, autocommit: bool) -> Option<Output> {
     let t = strip_trailing_semicolon(sql);
     if t.is_empty() {
         return Some(ok_msg("OK"));
@@ -303,7 +349,7 @@ pub fn canned_output(sql: &str) -> Option<Output> {
                 ],
                 vec![
                     Datum::Text("autocommit".into()),
-                    Datum::Text("ON".into()),
+                    Datum::Text(if autocommit { "ON".into() } else { "OFF".into() }),
                 ],
                 vec![
                     Datum::Text("transaction_isolation".into()),
@@ -394,14 +440,14 @@ pub fn canned_output(sql: &str) -> Option<Output> {
             if let Some(i) = list.to_ascii_lowercase().find(" from ") {
                 list = list[..i].trim();
             }
-            return bare_select_output(strip_trailing_limit(list));
+            return bare_select_output_session(strip_trailing_limit(list), autocommit);
         }
         return info_schema_fallback(t);
     }
     // Bare SELECT without FROM.
     if low_trim.starts_with("select ") && !low_trim.contains(" from ") {
         let list = strip_trailing_limit(t[6..].trim());
-        return bare_select_output(list);
+        return bare_select_output_session(list, autocommit);
     }
     None
 }

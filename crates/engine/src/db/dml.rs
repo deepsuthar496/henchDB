@@ -266,11 +266,11 @@ impl Database {
             }
             self.record_install(table, &key, Some(&enc), commit_epoch)?;
             table.apply_raw(&key, &enc)?;
-            self.visible_epoch.store(commit_epoch, std::sync::atomic::Ordering::SeqCst);
             if let Some(ref observer) = *self.commit_observer.read().unwrap() {
                 let decoded_row = table.decode_stored(&enc).ok();
                 observer(commit_epoch, &[(table_name.to_string(), key.clone(), decoded_row)]);
             }
+            self.visible_epoch.store(commit_epoch, std::sync::atomic::Ordering::SeqCst);
             if let Ok(mut vs) = self.versions.write() {
                 vs.gc_locked();
             }
@@ -312,7 +312,7 @@ impl Database {
         let fk_involved =
             !table_arc.def.foreign_keys.is_empty() || self.fk_is_referenced(&table_key);
         let has_sub = selection.as_ref().is_some_and(subquery::has_subquery);
-        if session.txn.is_none() && !fk_involved && !has_sub {
+        if session.autocommit && session.txn.is_none() && !fk_involved && !has_sub {
             if let Ok(AccessPath::Point(lit)) = access_path(&table_arc, selection.as_ref()) {
                 let key = encode_key(&lit)?;
                 if let Some(raw) = table_arc.tree().get(&key) {

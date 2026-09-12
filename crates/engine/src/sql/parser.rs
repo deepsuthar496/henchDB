@@ -257,6 +257,18 @@ impl Parser {
                     ))),
                 }
             }
+            Some("ARCHIVE") => {
+                self.pos += 1;
+                let dir = if self.eat_kw("TO") || matches!(self.peek(), Token::Str(_)) {
+                    match self.parse_literal_operand()? {
+                        Datum::Text(p) => Some(p),
+                        other => return Err(Error::ParseError(format!("ARCHIVE path must be string, got {other:?}"))),
+                    }
+                } else {
+                    None
+                };
+                Ok(Statement::Archive { dir })
+            }
             Some("SET") => {
                 self.pos += 1;
                 let is_session = self.eat_kw("SESSION");
@@ -270,14 +282,27 @@ impl Parser {
                     let val = self.parse_literal_operand()?;
                     Ok(Statement::SetVariable { name: "names".into(), value: val })
                 } else {
-                    let name = if self.eat_sym('@') {
+                    let mut name = if self.eat_sym('@') {
                         self.eat_sym('@');
                         self.expect_ident()?
                     } else {
                         self.expect_ident()?
                     };
+                    if self.eat_sym('.') {
+                        name = format!("{name}.{}", self.expect_ident()?);
+                    }
                     self.expect_sym('=')?;
-                    let value = self.parse_literal_operand()?;
+                    let value = match self.peek() {
+                        Token::Ident(s) if s.eq_ignore_ascii_case("ON") => {
+                            self.pos += 1;
+                            Datum::Text("ON".into())
+                        }
+                        Token::Ident(s) if s.eq_ignore_ascii_case("OFF") => {
+                            self.pos += 1;
+                            Datum::Text("OFF".into())
+                        }
+                        _ => self.parse_literal_operand()?,
+                    };
                     Ok(Statement::SetVariable { name, value })
                 }
             }
@@ -863,13 +888,26 @@ impl Parser {
                 || (self.peek() == &Token::Sym('-')
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))))
             {
-                match self.parse_operand()? {
-                    Expr::Literal(d) => items.push(SelectItem::Literal(d)),
-                    other => {
-                        return Err(Error::ParseError(format!(
-                            "expected literal in projection, got {other:?}"
-                        )))
-                    }
+                let left = match self.parse_operand()? {
+                    Expr::Literal(d) => d,
+                    other => return Err(Error::ParseError(format!("expected literal in projection, got {other:?}"))),
+                };
+                if self.eat_sym('=') {
+                    let right = match self.parse_operand()? {
+                        Expr::Literal(d) => d,
+                        other => return Err(Error::ParseError(format!("expected literal after '=', got {other:?}"))),
+                    };
+                    let (l, r) = crate::sql::eval::coerce_pair(left, right);
+                    items.push(SelectItem::Literal(Datum::Int(if l == r { 1 } else { 0 })));
+                } else if self.eat_sym('≠') {
+                    let right = match self.parse_operand()? {
+                        Expr::Literal(d) => d,
+                        other => return Err(Error::ParseError(format!("expected literal after '!=', got {other:?}"))),
+                    };
+                    let (l, r) = crate::sql::eval::coerce_pair(left, right);
+                    items.push(SelectItem::Literal(Datum::Int(if l != r { 1 } else { 0 })));
+                } else {
+                    items.push(SelectItem::Literal(left));
                 }
             } else {
                 items.push(SelectItem::Column(self.parse_col_ref()?));
@@ -1428,11 +1466,7 @@ fn coerce_literal(d: &Datum, t: &str, target: &str) -> Result<Datum> {
                 Error::ParseError(format!("cannot cast '{s}' to '::{target}'"))
             })?,
             Datum::Null => Datum::Null,
-            Datum::DateTime(_) => {
-                return Err(Error::ParseError(format!(
-                    "cannot cast {d:?} to '::{target}'"
-                )))
-            }
+            Datum::DateTime(_) => return Err(Error::ParseError(format!("cannot cast {d:?} to '::{target}'"))),
         },
         "BOOL" | "BOOLEAN" => match d {
             Datum::Bool(b) => Datum::Bool(*b),
@@ -1440,18 +1474,10 @@ fn coerce_literal(d: &Datum, t: &str, target: &str) -> Result<Datum> {
             Datum::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
                 "true" | "t" | "1" => Datum::Bool(true),
                 "false" | "f" | "0" => Datum::Bool(false),
-                _ => {
-                    return Err(Error::ParseError(format!(
-                        "cannot cast '{s}' to '::{target}'"
-                    )))
-                }
+                _ => return Err(Error::ParseError(format!("cannot cast '{s}' to '::{target}'"))),
             },
             Datum::Null => Datum::Null,
-            Datum::Float(_) | Datum::DateTime(_) => {
-                return Err(Error::ParseError(format!(
-                    "cannot cast {d:?} to '::{target}'"
-                )))
-            }
+            Datum::Float(_) | Datum::DateTime(_) => return Err(Error::ParseError(format!("cannot cast {d:?} to '::{target}'"))),
         },
         _ => match d {
             Datum::Float(f) => Datum::Float(*f),
@@ -1460,11 +1486,7 @@ fn coerce_literal(d: &Datum, t: &str, target: &str) -> Result<Datum> {
                 Error::ParseError(format!("cannot cast '{s}' to '::{target}'"))
             })?,
             Datum::Null => Datum::Null,
-            Datum::Bool(_) | Datum::DateTime(_) => {
-                return Err(Error::ParseError(format!(
-                    "cannot cast {d:?} to '::{target}'"
-                )))
-            }
+            Datum::Bool(_) | Datum::DateTime(_) => return Err(Error::ParseError(format!("cannot cast {d:?} to '::{target}'"))),
         },
     })
 }

@@ -353,6 +353,9 @@ pub enum Statement {
     Backup {
         path: String,
     },
+    Archive {
+        dir: Option<String>,
+    },
     CreateIndex {
         name: String,
         table: String,

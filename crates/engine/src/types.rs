@@ -215,12 +215,14 @@ impl ColumnType {
 
     pub fn accepts(&self, d: &Datum) -> bool {
         match self {
-            ColumnType::Int | ColumnType::BigInt => matches!(d, Datum::Int(_) | Datum::Null),
+            ColumnType::Int | ColumnType::BigInt => {
+                matches!(d, Datum::Int(_) | Datum::Bool(_) | Datum::Null)
+            }
             ColumnType::Float | ColumnType::Double => {
-                matches!(d, Datum::Int(_) | Datum::Float(_) | Datum::Null)
+                matches!(d, Datum::Int(_) | Datum::Float(_) | Datum::Bool(_) | Datum::Null)
             }
             ColumnType::Text | ColumnType::VarChar => matches!(d, Datum::Text(_) | Datum::Null),
-            ColumnType::Bool => matches!(d, Datum::Bool(_) | Datum::Null),
+            ColumnType::Bool => matches!(d, Datum::Bool(_) | Datum::Int(_) | Datum::Null),
             ColumnType::DateTime | ColumnType::Timestamp => {
                 matches!(d, Datum::DateTime(_) | Datum::Text(_) | Datum::Int(_) | Datum::Null)
             }

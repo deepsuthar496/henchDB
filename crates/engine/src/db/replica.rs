@@ -112,6 +112,7 @@ pub(crate) fn is_write_statement(sql: &str) -> bool {
             | "BACKUP"
             | "CHECKPOINT"
             | "ANALYZE"
+            | "ARCHIVE"
     )
 }
 
@@ -155,53 +156,77 @@ impl Database {
     /// Apply one committed transaction's records from the primary's WAL.
     /// Idempotent for redos: Puts overwrite, Deletes remove, DDL guards on
     /// existence like the open-time replay path.
+    /// Persists the batch to local WAL so offline promotion recovers all streamed data.
     pub fn apply_replica_batch(&self, batch: Vec<Record>) -> Result<()> {
         crate::failpoint!("during_replica_apply");
-        let mut dbs = self.databases.write().unwrap();
-        let mut tables = self.tables.write().unwrap();
-        for rec in batch {
-            match rec {
-                Record::CreateDatabase { name, .. } => {
-                    dbs.insert(name);
-                }
-                Record::DropDatabase { name, .. } => {
-                    dbs.remove(&name);
-                    let prefix = format!("{name}.");
-                    tables.retain(|k, _| !k.starts_with(&prefix));
-                }
-                Record::CreateTable { def, .. } => {
-                    if !tables.contains_key(&def.name) {
-                        let t = Arc::new(Table::new(def));
-                        t.set_pool(self.pool.clone());
-                        t.set_epoch_manager(self.epoch.clone());
-                        tables.insert(t.def.name.clone(), t);
-                    }
-                }
-                Record::DropTable { name, .. } => {
-                    tables.remove(&name);
-                }
-                Record::Put { table, key, row, .. } => {
-                    if let Some(t) = tables.get(&table) {
-                        t.apply_raw(&key, &row)?;
-                    }
-                }
-                Record::Delete { table, key, .. } => {
-                    if let Some(t) = tables.get(&table) {
-                        t.remove_raw(&key);
-                    }
-                }
-                Record::CreateIndex { table, name, column, .. } => {
-                    if let Some(t) = tables.get(&table) {
-                        let _ = t.add_index(name, column);
-                    }
-                }
-                Record::DropIndex { table, name, .. } => {
-                    if let Some(t) = tables.get(&table) {
-                        let _ = t.drop_index(&name);
-                    }
-                }
-                Record::Commit { .. } => {}
+        let has_commit = batch.iter().any(|r| matches!(r, Record::Commit { .. }));
+        let mut wal_batch = batch.clone();
+        if !has_commit {
+            if let Some(last) = batch.last() {
+                let txn = match last {
+                    Record::CreateDatabase { txn, .. }
+                    | Record::DropDatabase { txn, .. }
+                    | Record::CreateTable { txn, .. }
+                    | Record::DropTable { txn, .. }
+                    | Record::Put { txn, .. }
+                    | Record::Delete { txn, .. }
+                    | Record::CreateIndex { txn, .. }
+                    | Record::DropIndex { txn, .. }
+                    | Record::Commit { txn, .. } => *txn,
+                };
+                wal_batch.push(Record::Commit { txn, ts: None });
             }
+        }
+        {
+            let mut dbs = self.databases.write().unwrap();
+            let mut tables = self.tables.write().unwrap();
+            for rec in batch {
+                match rec {
+                    Record::CreateDatabase { name, .. } => {
+                        dbs.insert(name);
+                    }
+                    Record::DropDatabase { name, .. } => {
+                        dbs.remove(&name);
+                        let prefix = format!("{name}.");
+                        tables.retain(|k, _| !k.starts_with(&prefix));
+                    }
+                    Record::CreateTable { def, .. } => {
+                        if !tables.contains_key(&def.name) {
+                            let t = Arc::new(Table::new(def));
+                            t.set_pool(self.pool.clone());
+                            t.set_epoch_manager(self.epoch.clone());
+                            tables.insert(t.def.name.clone(), t);
+                        }
+                    }
+                    Record::DropTable { name, .. } => {
+                        tables.remove(&name);
+                    }
+                    Record::Put { table, key, row, .. } => {
+                        if let Some(t) = tables.get(&table) {
+                            t.apply_raw(&key, &row)?;
+                        }
+                    }
+                    Record::Delete { table, key, .. } => {
+                        if let Some(t) = tables.get(&table) {
+                            t.remove_raw(&key);
+                        }
+                    }
+                    Record::CreateIndex { table, name, column, .. } => {
+                        if let Some(t) = tables.get(&table) {
+                            let _ = t.add_index(name, column);
+                        }
+                    }
+                    Record::DropIndex { table, name, .. } => {
+                        if let Some(t) = tables.get(&table) {
+                            let _ = t.drop_index(&name);
+                        }
+                    }
+                    Record::Commit { .. } => {}
+                }
+            }
+        }
+        if !wal_batch.is_empty() {
+            self.wal_commit(wal_batch)?;
         }
         Ok(())
     }
