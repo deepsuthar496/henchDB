@@ -1,0 +1,9 @@
+{
+  "insert_rows_per_sec": 12500.0,
+  "point_select_qps": 350000.0,
+  "range_scan_rows_per_sec": 50000.0,
+  "update_qps": 600.0,
+  "aggregate_rows_per_sec": 800000.0,
+  "checkpoint_secs": 0.40,
+  "recovery_secs": 0.85
+}

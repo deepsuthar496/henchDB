@@ -8,7 +8,7 @@ pub(crate) fn banner() {
 }
 pub(crate) fn print_main_usage() {
     eprintln!("usage: server [COMMAND] [--dir <data_dir>]");
-    eprintln!("Commands: serve, bench, gcbench, clientbench, passwd, dump, restore, promote");
+    eprintln!("Commands: serve, bench, soak, largedb, gcbench, clientbench, passwd, dump, restore, promote");
     eprintln!("Run 'server <command> --help' for command-specific options.");
 }
 pub(crate) fn print_main_help() {
@@ -19,6 +19,8 @@ pub(crate) fn print_main_help() {
     println!("  (no command)   Start interactive embedded SQL shell (default)");
     println!("  serve          Run TCP database server (MySQL & PostgreSQL wire protocols)");
     println!("  bench          Run in-process OLTP micro-benchmark");
+    println!("  soak           Run multi-threaded long-duration concurrency soak test");
+    println!("  largedb        Run large-database lifecycle validation and recovery audit");
     println!("  gcbench        Run group-commit and version GC micro-benchmark");
     println!("  clientbench    Run multi-threaded TCP client benchmark");
     println!("  passwd         Set or update user authentication password");

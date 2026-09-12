@@ -31,6 +31,10 @@ mod help;
 use help::*;
 mod bench;
 use bench::{bench_gc, bench_mock, client_bench};
+mod soak;
+use soak::{run_soak, SoakOpts};
+mod largedb;
+use largedb::{run_largedb, LargeDbOpts};
 #[cfg(test)]
 mod tests;
 
@@ -577,6 +581,22 @@ fn main() {
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(50_000);
             bench(Path::new(&dir), rows)
+        }
+        Some("soak") => {
+            if has_help_flag(&args) {
+                println!("usage: server soak [--dir <path>] [--duration <secs>] [--threads <n>] [--check-interval <secs>]");
+                return;
+            }
+            let opts = SoakOpts::from_args(&args);
+            run_soak(opts)
+        }
+        Some("largedb") => {
+            if has_help_flag(&args) {
+                println!("usage: server largedb [--dir <path>] [--rows <n>] [--batch <n>] [--churn <pct>] [--skip-restore]");
+                return;
+            }
+            let opts = LargeDbOpts::from_args(&args);
+            run_largedb(opts)
         }
         Some(cmd) if !cmd.starts_with('-') => {
             if cmd == "help" {
@@ -1248,8 +1268,46 @@ fn bench(dir: &Path, rows: u64) -> engine::Result<()> {
         scanned as f64 / scan_secs
     );
 
+    // Update throughput (autocommit point updates hitting OLC fast path).
+    let updates = 2_000u64.min(rows);
+    let t_upd = Instant::now();
+    for i in 0..updates {
+        let mut s = db.new_session();
+        let k = i * 11 % rows;
+        db.execute(&mut s, &format!("UPDATE bench SET v = {} WHERE id = {k}", i * 3))?;
+    }
+    let upd_secs = t_upd.elapsed().as_secs_f64();
+    println!(
+        "update: {updates} queries in {:.3}s = {:.0} q/s",
+        upd_secs,
+        updates as f64 / upd_secs
+    );
+
+    // Aggregate throughput.
+    let agg_runs = 10u64;
+    let t_agg = Instant::now();
+    for _ in 0..agg_runs {
+        let mut s = db.new_session();
+        db.execute(&mut s, "SELECT SUM(v), MIN(v), MAX(v) FROM bench")?;
+    }
+    let agg_secs = t_agg.elapsed().as_secs_f64();
+    println!(
+        "aggregate: {agg_runs} queries over {rows} rows in {:.3}s = {:.0} rows/s",
+        agg_secs,
+        (agg_runs * rows) as f64 / agg_secs
+    );
+
     let t3 = Instant::now();
     db.checkpoint()?;
-    println!("checkpoint: {:.3}s", t3.elapsed().as_secs_f64());
+    let chk_secs = t3.elapsed().as_secs_f64();
+    println!("checkpoint: {:.3}s", chk_secs);
+
+    drop(s);
+    drop(db);
+    let t4 = Instant::now();
+    let _reopened = Database::open(dir)?;
+    let rec_secs = t4.elapsed().as_secs_f64();
+    println!("recovery: {:.3}s", rec_secs);
+
     Ok(())
 }

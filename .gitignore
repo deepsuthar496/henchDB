@@ -21,3 +21,4 @@ data/
 postgres_data/
 research.md
 *.py
+*.exe

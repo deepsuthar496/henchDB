@@ -1,4 +1,4 @@
-name: CI & Reliability Gate
+name: CI & Protected Release Gate
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [ main, master ]
   schedule:
-    - cron: '0 2 * * *' # Nightly reliability pipeline (§6.2)
+    - cron: '0 2 * * *' # Nightly reliability pipeline
   workflow_dispatch:
 
 jobs:
@@ -47,8 +47,68 @@ jobs:
           fi
         shell: bash
 
-  nightly-reliability:
-    name: Nightly Reliability Matrix (EBR, Crash, MVCC, Repl)
+  release-gate:
+    name: Protected Production Release Gate / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [pr-checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Execute Full Release Gate Pipeline (16 Mandatory Gates)
+        run: python scripts/release_gate.py
+
+  memory-sanitizers:
+    name: Memory Sanitizers (ASan, UBSan, TSan)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Run AddressSanitizer & UndefinedBehaviorSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+        run: cargo test -p engine ebr_stress crash_matrix --target x86_64-unknown-linux-gnu
+
+      - name: Run ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+        run: cargo test -p engine ebr_stress --target x86_64-unknown-linux-gnu
+
+  miri-verification:
+    name: Miri Memory Safety Verification
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly Rust & Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Verify EBR Epoch Reclamation Under Miri
+        run: cargo miri test -p engine --lib epoch -- --nocapture
+
+  nightly-deep-validation:
+    name: Nightly Scale & Soak Validation (Large-DB, Perf, Soak)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
@@ -57,24 +117,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run EBR Concurrency Stress (Seed 1)
-        env:
-          HENCHDB_STRESS_SEED: 123456789
-        run: cargo test -p engine --lib db::tests::ebr_stress -- --nocapture
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Run EBR Concurrency Stress (Seed 2)
-        env:
-          HENCHDB_STRESS_SEED: 987654321
-        run: cargo test -p engine --lib db::tests::ebr_stress -- --nocapture
+      - name: Build Release Binary
+        run: cargo build --release
 
-      - name: Run Automated Crash Matrix
-        run: cargo test -p engine --lib db::tests::crash_matrix -- --nocapture
+      - name: Run Large-Database Qualification
+        run: python scripts/largedb.py --rows 50000 --batch 2000
 
-      - name: Run MVCC Property Oracle
-        run: cargo test -p engine --lib db::tests::mvcc_property -- --nocapture
+      - name: Run Performance Regression Benchmark
+        run: python scripts/perf_gate.py --rows 25000
 
-      - name: Run Replication & Disaster Recovery Failure Matrix
-        run: cargo test -p server --bin server replication::tests -- --nocapture
+      - name: Run Continuous Concurrency Soak (5m Nightly Qualification)
+        run: python scripts/soak.py --duration 300 --threads 8
 
       - name: Upload Failure Artifacts
         if: failure()
